@@ -4,6 +4,10 @@ A macOS **Quick Look**–style file previewer for KDE Plasma. Select a file in
 Dolphin, press **Space**, and a floating dark preview panel appears. Press
 Space again (or Esc) to dismiss it.
 
+Multi-select works too: select **several files**, trigger QuickView, and
+**← / →** pages through them — the title shows your position (e.g. `2/5`),
+just like Quick Look on a multi-file selection.
+
 ## What it previews
 
 | Type                | How                                        |
