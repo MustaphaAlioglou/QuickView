@@ -23,12 +23,12 @@ import logging
 import logging.handlers
 import os
 import shutil
-import subprocess
 import sys
 from collections import OrderedDict
 
 from PySide6.QtCore import (
-    Qt, QUrl, QSize, QTimer, QFileInfo, QMimeDatabase, QStandardPaths,
+    Qt, QUrl, QSize, QProcess, QTimer, QFileInfo, QMimeDatabase,
+    QStandardPaths,
 )
 from PySide6.QtGui import (
     QAction, QFont, QGuiApplication, QImage, QImageReader, QKeySequence,
@@ -172,20 +172,22 @@ def clear_cache():
 _warned_no_bwrap = False
 
 
-def render_image(path: str, max_w: int, max_h: int) -> bytes | None:
-    """Decode an image out of process; returns PNG bytes or None.
+def build_render_command(path: str, max_w: int, max_h: int) -> list | None:
+    """Command line that decodes an image out of process (None = refused).
 
-    The daemon never parses an untrusted file itself: render.py runs under
-    bubblewrap with read-only /usr + this app dir + the single target file,
-    no network (--unshare-all) and no writes — the PNG comes back on stdout
-    and the *daemon* writes the cache. Without bwrap we refuse, unless
-    QUICKVIEW_ALLOW_UNSANDBOXED=1 (still out of process, NOT sandboxed).
+    The daemon never decodes untrusted *static images* in-process (animated
+    GIFs, PDFs and audio/video are different — see the README): render.py
+    runs under bubblewrap with read-only /usr + this app dir + the single
+    target file, no network (--unshare-all) and no writes — the PNG comes
+    back on stdout and the *daemon* writes the cache. Without bwrap we
+    refuse, unless QUICKVIEW_ALLOW_UNSANDBOXED=1 (still out of process,
+    NOT sandboxed).
     """
     global _warned_no_bwrap
     helper = [sys.executable, RENDER_HELPER, path, str(max_w), str(max_h)]
     bwrap = shutil.which("bwrap")
     if bwrap:
-        cmd = [
+        return [
             bwrap,
             "--ro-bind", "/usr", "/usr",
             "--symlink", "usr/lib", "/lib",
@@ -206,28 +208,15 @@ def render_image(path: str, max_w: int, max_h: int) -> bytes | None:
             "--setenv", "XDG_RUNTIME_DIR", "/tmp",
             "--",
         ] + helper
-    elif os.environ.get("QUICKVIEW_ALLOW_UNSANDBOXED") == "1":
-        cmd = helper
-    else:
-        if not _warned_no_bwrap:
-            _warned_no_bwrap = True
-            log.warning(
-                "bwrap not found — refusing to decode untrusted files "
-                "(install bubblewrap, or set QUICKVIEW_ALLOW_UNSANDBOXED=1 "
-                "to accept the risk)"
-            )
-        return None
-    try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=20)
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        log.warning("render helper failed to run: %s", exc)
-        return None
-    if proc.returncode == 0 and proc.stdout[:4] == PNG_MAGIC:
-        return proc.stdout
-    log.warning(
-        "render helper failed (rc=%s): %s", proc.returncode,
-        proc.stderr.decode("utf-8", errors="replace").strip()[:500],
-    )
+    if os.environ.get("QUICKVIEW_ALLOW_UNSANDBOXED") == "1":
+        return helper
+    if not _warned_no_bwrap:
+        _warned_no_bwrap = True
+        log.warning(
+            "bwrap not found — refusing to decode untrusted files "
+            "(install bubblewrap, or set QUICKVIEW_ALLOW_UNSANDBOXED=1 "
+            "to accept the risk)"
+        )
     return None
 
 
@@ -290,6 +279,7 @@ class QuickView(QWidget):
         self.player = None
         self.audio_out = None
         self._mem_cache = OrderedDict()
+        self._render_proc = None
 
         self.panel = QFrame(self)
         self.panel.setObjectName("panel")
@@ -393,7 +383,14 @@ class QuickView(QWidget):
             geo.y() + (geo.height() - self.height()) // 2,
         )
 
+    def _cancel_render(self):
+        proc = self._render_proc
+        self._render_proc = None
+        if proc is not None and proc.state() != QProcess.ProcessState.NotRunning:
+            proc.kill()
+
     def clear_content(self):
+        self._cancel_render()
         if self.player is not None:
             self.player.stop()
             self.player.deleteLater()
@@ -501,32 +498,76 @@ class QuickView(QWidget):
         hit = self._mem_cache.get(key)
         if hit is not None:
             self._mem_cache.move_to_end(key)
-            pix, dims = hit
             log.debug("memory cache hit: %s", path)
-        else:
-            png = cache_read(key)
-            if png is not None:
-                log.debug("disk cache hit: %s", path)
-            else:
-                png = render_image(path, max_w, max_h)
-                if png is None:
-                    # Decode refused (no bwrap) or failed — metadata card.
-                    self.show_fallback(
-                        path, self.mime_db.mimeTypeForFile(path).name()
-                    )
-                    return
+            self._display_image(path, *hit)
+            return
+
+        png = cache_read(key)
+        if png is not None:
+            log.debug("disk cache hit: %s", path)
+            self._show_png(path, key, png)
+            return
+
+        cmd = build_render_command(path, max_w, max_h)
+        if cmd is None:
+            # Decode refused (no bwrap) — metadata card.
+            self.show_fallback(path, self.mime_db.mimeTypeForFile(path).name())
+            return
+
+        # Decode asynchronously: a slow or hostile file must not freeze the
+        # event loop — keys, the close button and the daemon socket stay
+        # live while the sandboxed helper works.
+        self.show_message("Loading preview…")
+        proc = QProcess(self)
+        self._render_proc = proc
+        watchdog = QTimer(proc)
+        watchdog.setSingleShot(True)
+        watchdog.timeout.connect(proc.kill)
+
+        def finished(code, _status):
+            stale = self._render_proc is not proc
+            if not stale:
+                self._render_proc = None
+            png = bytes(proc.readAllStandardOutput())
+            err = bytes(proc.readAllStandardError()).decode(
+                "utf-8", errors="replace"
+            )
+            proc.deleteLater()
+            if stale or path != self.current_path:
+                return  # the user moved on while we rendered
+            if code == 0 and png[:4] == PNG_MAGIC:
                 log.debug("rendered: %s", path)
                 cache_write(key, png)
-            img = QImage.fromData(png)
-            if img.isNull():
-                self.show_fallback(path, "image")
-                return
-            dims = img.text("QuickView:OrigSize") or f"{img.width()}×{img.height()}"
-            pix = QPixmap.fromImage(img)
-            self._mem_cache[key] = (pix, dims)
-            while len(self._mem_cache) > MEM_CACHE_ENTRIES:
-                self._mem_cache.popitem(last=False)
+                self._show_png(path, key, png)
+            else:
+                log.warning(
+                    "render helper failed (rc=%s): %s",
+                    code, err.strip()[:500],
+                )
+                self.clear_content()
+                self.show_fallback(
+                    path, self.mime_db.mimeTypeForFile(path).name()
+                )
 
+        proc.finished.connect(finished)
+        proc.start(cmd[0], cmd[1:])
+        watchdog.start(20000)
+
+    def _show_png(self, path: str, key: str, png: bytes):
+        img = QImage.fromData(png)
+        if img.isNull():
+            self.clear_content()
+            self.show_fallback(path, "image")
+            return
+        dims = img.text("QuickView:OrigSize") or f"{img.width()}×{img.height()}"
+        pix = QPixmap.fromImage(img)
+        self._mem_cache[key] = (pix, dims)
+        while len(self._mem_cache) > MEM_CACHE_ENTRIES:
+            self._mem_cache.popitem(last=False)
+        self._display_image(path, pix, dims)
+
+    def _display_image(self, path: str, pix: QPixmap, dims: str):
+        self.clear_content()
         label = QLabel()
         label.setAlignment(Qt.AlignCenter)
         label.setPixmap(pix)
@@ -744,6 +785,22 @@ def main():
         paths.append(os.path.abspath(raw))
     if not paths and not daemon:
         print(__doc__)
+        return 1
+
+    # Fail with a clear message instead of letting QApplication abort —
+    # e.g. the systemd unit started before the session env was imported,
+    # or `systemctl --user start` from an SSH login. RestartSec in the
+    # unit paces the retries so this can't trip the start limit.
+    if not (
+        os.environ.get("DISPLAY")
+        or os.environ.get("WAYLAND_DISPLAY")
+        or os.environ.get("QT_QPA_PLATFORM")
+    ):
+        print(
+            "quickview: no DISPLAY or WAYLAND_DISPLAY — graphical session "
+            "not up yet?",
+            file=sys.stderr,
+        )
         return 1
 
     app = QApplication(sys.argv)

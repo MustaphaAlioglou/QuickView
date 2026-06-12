@@ -3,13 +3,15 @@
 set -e
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-chmod +x "$DIR/bin/quickview" "$DIR/quickview-servicemenu.desktop"
+chmod +x "$DIR/bin/quickview"
 
-# Dolphin context-menu entry ("Quick Look"). KDE requires the .desktop
-# file in servicemenus to carry the executable bit.
+# Dolphin context-menu entry ("Quick Look"), rendered from the template so
+# the repo can live at any path. KDE requires the .desktop file in
+# servicemenus to carry the executable bit.
 mkdir -p "$HOME/.local/share/kio/servicemenus"
-ln -sf "$DIR/quickview-servicemenu.desktop" \
-       "$HOME/.local/share/kio/servicemenus/quickview-servicemenu.desktop"
+sed "s|@DIR@|$DIR|" "$DIR/quickview-servicemenu.desktop" \
+    > "$HOME/.local/share/kio/servicemenus/quickview-servicemenu.desktop"
+chmod +x "$HOME/.local/share/kio/servicemenus/quickview-servicemenu.desktop"
 
 # Command on PATH (handy for terminal use: `quickview somefile`).
 mkdir -p "$HOME/.local/bin"
@@ -23,10 +25,13 @@ if command -v systemctl >/dev/null 2>&1; then
     cat > "$HOME/.config/systemd/user/quickview.service" <<EOF
 [Unit]
 Description=QuickView resident previewer (warm daemon for instant previews)
+After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 ExecStart=$DIR/bin/quickview --daemon
 Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=graphical-session.target

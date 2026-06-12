@@ -7,4 +7,4 @@ X-KDE-Priority=TopLevel
 [Desktop Action QuickView]
 Name=Quick Look
 Icon=document-preview
-Exec=/home/jontronl/Desktop/quickview/bin/quickview %U
+Exec=@DIR@/bin/quickview %U

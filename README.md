@@ -43,19 +43,27 @@ Clear it with `quickview --clear-cache`.
 
 ## Sandboxed rendering
 
-The daemon never decodes an untrusted image itself. On a cache miss it runs
-`render.py` under **bubblewrap** with read-only access to `/usr`, this app
-folder, and the single target file — no network (`--unshare-all`), no write
-access; the PNG streams back over stdout and the daemon writes the cache. A
-malformed file can only crash the throwaway helper.
+**Static images** (PNG, JPEG, WebP, SVG, …) are never decoded by the daemon
+itself. On a cache miss it runs `render.py` under **bubblewrap** with
+read-only access to `/usr`, this app folder, and the single target file —
+no network (`--unshare-all`), no write access; the PNG streams back over
+stdout and the daemon writes the cache. A malformed image can only crash
+the throwaway helper. The render also runs asynchronously, so a slow or
+hostile file can't freeze the window or the daemon socket.
 
 If `bwrap` is not installed, images fall back to the metadata card
 (secure by default). Override at your own risk with
 `QUICKVIEW_ALLOW_UNSANDBOXED=1` (out-of-process but **not** sandboxed).
 
-Animated GIFs, audio/video and text stay in-process, same as the C++
-version: live playback can't be handed to a throwaway process, and text is
-plain file I/O capped at 1 MiB.
+**Not sandboxed** — these are parsed in-process by the daemon, so treat
+files from untrusted sources accordingly:
+
+- animated GIFs (`QMovie`) and audio/video (`QMediaPlayer`) — live playback
+  can't be handed to a throwaway process (same trade-off as the C++ version)
+- PDFs (`QtPdf`) — unlike the C++ version, which sandboxes a first-page
+  render, this app keeps the interactive scrollable viewer, and that means
+  the PDF parser runs in-process
+- text/code — plain file I/O capped at 1 MiB, no binary parser involved
 
 ## Logging & crash diagnostics
 
