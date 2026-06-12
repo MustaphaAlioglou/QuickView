@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Service
+MimeType=all/all;
+Actions=QuickView;
+X-KDE-Priority=TopLevel
+
+[Desktop Action QuickView]
+Name=Quick Look
+Icon=document-preview
+Exec=/home/jontronl/Desktop/quickview/bin/quickview %U

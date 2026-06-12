@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Launcher for QuickView — uses the project's own virtualenv.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PY="$DIR/.venv/bin/python"
+
+# Fast path: if the daemon is already running, just hand it the path
+# (~40 ms, no Qt startup). Falls back to a full launch otherwise.
+if [ $# -gt 0 ] && "$PY" "$DIR/client.py" "$@"; then
+    exit 0
+fi
+exec "$PY" "$DIR/quickview.py" "$@"
