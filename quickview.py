@@ -26,12 +26,14 @@ import shutil
 import sys
 from collections import OrderedDict
 
+import ipc
+
 from PySide6.QtCore import (
     Qt, QUrl, QSize, QProcess, QTimer, QFileInfo, QMimeDatabase,
     QStandardPaths,
 )
 from PySide6.QtGui import (
-    QAction, QFont, QGuiApplication, QImage, QImageReader, QKeySequence,
+    QAction, QFont, QGuiApplication, QImage, QKeySequence,
     QMovie, QPainter, QPixmap, QShortcut, QColor, QDesktopServices,
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
@@ -41,7 +43,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget, QGraphicsDropShadowEffect,
 )
 
-SOCKET_NAME = f"quickview-{os.getuid()}"
+SOCKET_PATH = ipc.socket_path()
 TEXT_PREVIEW_LIMIT = 1024 * 1024  # 1 MiB
 
 TEXT_EXTENSIONS = {
@@ -61,7 +63,10 @@ CACHE_DIR = os.path.join(
     "quickview", "previews",
 )
 CACHE_CAP_BYTES = 256 * 1024 * 1024
-MEM_CACHE_ENTRIES = 16
+# The memory tier holds screen-sized pixmaps (~25 MB each on a 4K display),
+# so it must be bounded by bytes, not entry count, in a process that never
+# exits.
+MEM_CACHE_BYTES = 96 * 1024 * 1024
 
 DATA_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
@@ -114,25 +119,51 @@ def cache_read(key: str) -> bytes | None:
     try:
         with open(fp, "rb") as fh:
             data = fh.read()
-        os.utime(fp)  # freshen so the pruner drops oldest-viewed first
-        return data
     except OSError:
         return None
+    try:
+        os.utime(fp)  # freshen so the pruner drops oldest-viewed first
+    except OSError:
+        pass  # the data is already read — a failed freshen is no reason to drop it
+    return data
+
+
+def cache_remove(key: str):
+    try:
+        os.unlink(os.path.join(CACHE_DIR, key))
+    except OSError:
+        pass
+
+
+# Rescanning the whole cache dir on every write is O(entries); amortize by
+# pruning only after enough new bytes have accumulated to matter. Starting
+# at the threshold forces one prune on the first write of a session, which
+# also cleans up an over-cap cache left behind by a previous run.
+_PRUNE_EVERY_BYTES = CACHE_CAP_BYTES // 8
+_unpruned_bytes = _PRUNE_EVERY_BYTES
 
 
 def cache_write(key: str, png: bytes):
+    global _unpruned_bytes
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
         tmp = os.path.join(CACHE_DIR, f".{key}.tmp")
         with open(tmp, "wb") as fh:
             fh.write(png)
         os.replace(tmp, os.path.join(CACHE_DIR, key))
-        prune_cache()
     except OSError as exc:
         log.warning("cache write failed: %s", exc)
+        return
+    _unpruned_bytes += len(png)
+    # Reset the counter only after a successful prune — zeroing it before a
+    # prune that fails would suppress the next attempt until another
+    # _PRUNE_EVERY_BYTES of writes accumulates, leaving an over-cap cache
+    # in place for hours on a cache-hit-heavy workload.
+    if _unpruned_bytes >= _PRUNE_EVERY_BYTES and prune_cache():
+        _unpruned_bytes = 0
 
 
-def prune_cache():
+def prune_cache() -> bool:
     entries, total = [], 0
     try:
         with os.scandir(CACHE_DIR) as it:
@@ -141,8 +172,9 @@ def prune_cache():
                     st = e.stat()
                     entries.append((st.st_mtime, st.st_size, e.path))
                     total += st.st_size
-    except OSError:
-        return
+    except OSError as exc:
+        log.warning("cache prune failed: %s", exc)
+        return False
     entries.sort()
     for _mtime, size, fp in entries:
         if total <= CACHE_CAP_BYTES:
@@ -152,6 +184,7 @@ def prune_cache():
             total -= size
         except OSError:
             pass
+    return True
 
 
 def clear_cache():
@@ -225,7 +258,6 @@ def human_size(n: int) -> str:
         if n < 1024 or unit == "TB":
             return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
         n /= 1024
-    return f"{n} B"
 
 
 class TitleBar(QWidget):
@@ -278,7 +310,7 @@ class QuickView(QWidget):
         self.movie = None
         self.player = None
         self.audio_out = None
-        self._mem_cache = OrderedDict()
+        self._mem_cache = OrderedDict()  # key -> (pixmap, dims, nbytes)
         self._render_proc = None
 
         self.panel = QFrame(self)
@@ -393,6 +425,10 @@ class QuickView(QWidget):
         self._cancel_render()
         if self.player is not None:
             self.player.stop()
+            # The media pipeline keeps emitting positionChanged after stop();
+            # sever every connection so a queued emission can't reach the
+            # slider/label lambdas after deleteLater destroys their widgets.
+            self.player.disconnect()
             self.player.deleteLater()
             self.player = None
             self.audio_out = None
@@ -461,13 +497,21 @@ class QuickView(QWidget):
         else:
             mime = self.mime_db.mimeTypeForFile(path).name()
             ext = os.path.splitext(path)[1].lower()
-            if mime == "image/gif":
+            # This routing is the sandbox enforcement point. Every branch
+            # below either decodes out of process (show_image), reads plain
+            # bytes (text/fallback), or uses an in-process parser — GIF
+            # (QMovie), PDF (QtPdf), media (QtMultimedia) — which only
+            # `inprocess` permits. With QUICKVIEW_STRICT_SANDBOX=1 a GIF
+            # falls through to the sandboxed still-image path and PDF/media
+            # fall through to the metadata card.
+            inprocess = os.environ.get("QUICKVIEW_STRICT_SANDBOX") != "1"
+            if mime == "image/gif" and inprocess:
                 self.show_gif(path)
             elif mime.startswith("image/"):
                 self.show_image(path)
-            elif mime == "application/pdf":
+            elif mime == "application/pdf" and inprocess:
                 self.show_pdf(path)
-            elif mime.startswith(("video/", "audio/")):
+            elif mime.startswith(("video/", "audio/")) and inprocess:
                 self.show_media(path, video=mime.startswith("video/"))
             elif mime.startswith("text/") or ext in TEXT_EXTENSIONS:
                 self.show_text(path)
@@ -499,14 +543,22 @@ class QuickView(QWidget):
         if hit is not None:
             self._mem_cache.move_to_end(key)
             log.debug("memory cache hit: %s", path)
-            self._display_image(path, *hit)
+            pix, dims, _nbytes = hit
+            self._display_image(path, pix, dims)
             return
 
         png = cache_read(key)
         if png is not None:
-            log.debug("disk cache hit: %s", path)
-            self._show_png(path, key, png)
-            return
+            img = QImage.fromData(png)
+            if not img.isNull():
+                log.debug("disk cache hit: %s", path)
+                self._show_decoded(path, key, img)
+                return
+            # A bad entry would otherwise be served on every view until the
+            # source file's mtime changes — drop it and fall through to a
+            # fresh render.
+            log.warning("dropping corrupt cache entry for %s", path)
+            cache_remove(key)
 
         cmd = build_render_command(path, max_w, max_h)
         if cmd is None:
@@ -535,10 +587,18 @@ class QuickView(QWidget):
             proc.deleteLater()
             if stale or path != self.current_path:
                 return  # the user moved on while we rendered
-            if code == 0 and png[:4] == PNG_MAGIC:
+            img = (
+                QImage.fromData(png)
+                if code == 0 and png[:4] == PNG_MAGIC
+                else QImage()
+            )
+            if not img.isNull():
                 log.debug("rendered: %s", path)
+                # Persist only after the full decode succeeds — a truncated
+                # blob behind a valid magic must not become a sticky cache
+                # entry.
                 cache_write(key, png)
-                self._show_png(path, key, png)
+                self._show_decoded(path, key, img)
             else:
                 log.warning(
                     "render helper failed (rc=%s): %s",
@@ -553,16 +613,21 @@ class QuickView(QWidget):
         proc.start(cmd[0], cmd[1:])
         watchdog.start(20000)
 
-    def _show_png(self, path: str, key: str, png: bytes):
-        img = QImage.fromData(png)
-        if img.isNull():
-            self.clear_content()
-            self.show_fallback(path, "image")
-            return
+    def _show_decoded(self, path: str, key: str, img: QImage):
+        """Display a successfully decoded preview and remember its pixmap."""
         dims = img.text("QuickView:OrigSize") or f"{img.width()}×{img.height()}"
         pix = QPixmap.fromImage(img)
-        self._mem_cache[key] = (pix, dims)
-        while len(self._mem_cache) > MEM_CACHE_ENTRIES:
+        nbytes = pix.width() * pix.height() * max(pix.depth(), 1) // 8
+        self._mem_cache.pop(key, None)
+        self._mem_cache[key] = (pix, dims, nbytes)
+        # The byte total is recomputed from the stored entries rather than
+        # tracked in a separate counter: the cache holds a few dozen entries
+        # at most, and derived state can't drift in a process that never
+        # exits.
+        while (
+            sum(nb for *_, nb in self._mem_cache.values()) > MEM_CACHE_BYTES
+            and len(self._mem_cache) > 1
+        ):
             self._mem_cache.popitem(last=False)
         self._display_image(path, pix, dims)
 
@@ -592,9 +657,12 @@ class QuickView(QWidget):
         from PySide6.QtPdf import QPdfDocument
         from PySide6.QtPdfWidgets import QPdfView
 
-        doc = QPdfDocument(self)
-        doc.load(path)
         view = QPdfView()
+        # Parent the document to the view, not the window: clear_content()
+        # deletes the view, and the loaded document must go with it instead
+        # of accumulating on the long-lived daemon window.
+        doc = QPdfDocument(view)
+        doc.load(path)
         view.setDocument(doc)
         view.setPageMode(QPdfView.PageMode.MultiPage)
         view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
@@ -613,13 +681,17 @@ class QuickView(QWidget):
         lay.setContentsMargins(0, 0, 0, 8)
         lay.setSpacing(6)
 
-        self.player = QMediaPlayer(self)
+        # The closures below capture `player` directly: clear_content() nulls
+        # self.player while late signal emissions may still be in flight, and
+        # an AttributeError on None is not an acceptable way to find out.
+        player = QMediaPlayer(self)
+        self.player = player
         self.audio_out = QAudioOutput(self)
-        self.player.setAudioOutput(self.audio_out)
+        player.setAudioOutput(self.audio_out)
 
         if video:
             surface = QVideoWidget()
-            self.player.setVideoOutput(surface)
+            player.setVideoOutput(surface)
             lay.addWidget(surface, 1)
         else:
             icon = self.icon_provider.icon(QFileInfo(path))
@@ -645,24 +717,24 @@ class QuickView(QWidget):
             return f"{s // 60}:{s % 60:02d}"
 
         def toggle():
-            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-                self.player.pause()
+            if player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                player.pause()
                 play_btn.setText("▶")
             else:
-                self.player.play()
+                player.play()
                 play_btn.setText("⏸")
 
         play_btn.clicked.connect(toggle)
-        self.player.durationChanged.connect(lambda d: slider.setRange(0, d))
-        self.player.positionChanged.connect(
+        player.durationChanged.connect(lambda d: slider.setRange(0, d))
+        player.positionChanged.connect(
             lambda p: (
                 slider.blockSignals(True),
                 slider.setValue(p),
                 slider.blockSignals(False),
-                time_lbl.setText(f"{fmt(p)} / {fmt(self.player.duration())}"),
+                time_lbl.setText(f"{fmt(p)} / {fmt(player.duration())}"),
             )
         )
-        slider.sliderMoved.connect(self.player.setPosition)
+        slider.sliderMoved.connect(player.setPosition)
 
         self.content.addWidget(wrap)
         avail = self.screen_avail()
@@ -671,8 +743,8 @@ class QuickView(QWidget):
         else:
             self.set_panel_size(520, 320)
 
-        self.player.setSource(QUrl.fromLocalFile(path))
-        self.player.play()
+        player.setSource(QUrl.fromLocalFile(path))
+        player.play()
         play_btn.setText("⏸")
 
     def show_text(self, path: str):
@@ -749,12 +821,19 @@ class QuickView(QWidget):
         self.set_panel_size(520, 360)
 
 
-def forward_to_running_instance(paths: list) -> bool:
+def connect_to_daemon() -> QLocalSocket | None:
     sock = QLocalSocket()
-    sock.connectToServer(SOCKET_NAME)
+    sock.connectToServer(SOCKET_PATH)
     if not sock.waitForConnected(300):
+        return None
+    return sock
+
+
+def forward_to_running_instance(paths: list) -> bool:
+    sock = connect_to_daemon()
+    if sock is None:
         return False
-    sock.write("\n".join(paths).encode("utf-8"))
+    sock.write(ipc.encode_paths(paths))
     sock.flush()
     sock.waitForBytesWritten(500)
     sock.disconnectFromServer()
@@ -762,12 +841,11 @@ def forward_to_running_instance(paths: list) -> bool:
 
 
 def daemon_already_running() -> bool:
-    sock = QLocalSocket()
-    sock.connectToServer(SOCKET_NAME)
-    if sock.waitForConnected(300):
-        sock.disconnectFromServer()
-        return True
-    return False
+    sock = connect_to_daemon()
+    if sock is None:
+        return False
+    sock.disconnectFromServer()
+    return True
 
 
 def main():
@@ -778,11 +856,7 @@ def main():
     daemon = "--daemon" in args
     args = [a for a in args if a != "--daemon"]
 
-    paths = []
-    for raw in args:
-        if raw.startswith("file://"):
-            raw = QUrl(raw).toLocalFile()
-        paths.append(os.path.abspath(raw))
+    paths = [ipc.normalize_arg(raw) for raw in args]
     if not paths and not daemon:
         print(__doc__)
         return 1
@@ -819,9 +893,18 @@ def main():
     setup_logging()
     log.info("daemon starting (pid %d), logging to %s", os.getpid(), LOG_FILE)
 
-    QLocalServer.removeServer(SOCKET_NAME)
+    # A name containing '/' makes QLocalServer use it as the literal socket
+    # path instead of placing it in QDir::tempPath(), keeping the location
+    # independent of TMPDIR and identical to what client.py computes.
+    QLocalServer.removeServer(SOCKET_PATH)
     server = QLocalServer()
-    server.listen(SOCKET_NAME)
+    if not server.listen(SOCKET_PATH):
+        # Without the socket every later invocation spawns another daemon;
+        # better to fail loudly and let systemd retry.
+        log.error(
+            "cannot listen on %s: %s", SOCKET_PATH, server.errorString()
+        )
+        return 1
 
     viewer = QuickView()
 
@@ -829,23 +912,49 @@ def main():
         conn = server.nextPendingConnection()
         if conn is None:
             return
+        # A large selection arrives in several chunks; accumulate until the
+        # client closes its end (that close is the message framing) instead
+        # of acting on the first readyRead and truncating the path list.
+        buf = bytearray()
 
-        def handle():
-            data = bytes(conn.readAll()).decode("utf-8", errors="replace")
-            conn.disconnectFromServer()
-            new_paths = [p for p in data.split("\n") if p.strip()]
+        def on_ready():
+            buf.extend(bytes(conn.readAll()))
+
+        def on_done():
+            buf.extend(bytes(conn.readAll()))
+            conn.deleteLater()
+            new_paths = ipc.decode_paths(bytes(buf))
             if not new_paths:
                 return
             if (
                 len(new_paths) == 1
-                and new_paths[0] == viewer.current_path
                 and viewer.isVisible()
+                and viewer.current_path
+                # realpath, so re-triggering through a symlink still toggles
+                and os.path.realpath(new_paths[0])
+                == os.path.realpath(viewer.current_path)
             ):
                 viewer.dismiss()
             else:
                 viewer.show_files(new_paths)
 
-        conn.readyRead.connect(handle)
+        conn.readyRead.connect(on_ready)
+        conn.disconnected.connect(on_done)
+
+        def on_guard_timeout():
+            # The message is incomplete by definition here — detach on_done
+            # first so the forced close drops the buffer instead of acting
+            # on a truncated path list.
+            conn.disconnected.disconnect(on_done)
+            conn.abort()
+            conn.deleteLater()
+
+        # A client that never closes must not hold the slot open forever;
+        # the timer dies with conn, so it can't fire on a deleted socket.
+        guard = QTimer(conn)
+        guard.setSingleShot(True)
+        guard.timeout.connect(on_guard_timeout)
+        guard.start(2000)
 
     server.newConnection.connect(on_connection)
     if paths:

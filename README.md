@@ -65,6 +65,11 @@ files from untrusted sources accordingly:
   the PDF parser runs in-process
 - text/code — plain file I/O capped at 1 MiB, no binary parser involved
 
+The decision of which parser touches a file is made in one place
+(`show_file`'s type routing). Set `QUICKVIEW_STRICT_SANDBOX=1` to refuse
+the in-process parsers entirely: GIFs degrade to a sandboxed still image,
+PDFs and audio/video to the metadata card.
+
 ## Logging & crash diagnostics
 
 - `~/.local/share/quickview/quickview.log` — timestamped events (rotated

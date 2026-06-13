@@ -29,7 +29,7 @@ After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
-ExecStart=$DIR/bin/quickview --daemon
+ExecStart="$DIR/bin/quickview" --daemon
 Restart=on-failure
 RestartSec=5
 
@@ -38,14 +38,19 @@ WantedBy=graphical-session.target
 EOF
     rm -f "$HOME/.config/autostart/quickview-daemon.desktop"
     systemctl --user daemon-reload
-    systemctl --user enable --now quickview.service
+    systemctl --user enable quickview.service
+    # restart, not `enable --now`: --now leaves an already-running daemon
+    # untouched, so an upgrade that changes the socket path or wire
+    # protocol would strand the old daemon on the old socket while new
+    # invocations spawn a second one. restart also starts a stopped unit.
+    systemctl --user restart quickview.service
 else
     mkdir -p "$HOME/.config/autostart"
     cat > "$HOME/.config/autostart/quickview-daemon.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=QuickView Daemon
-Exec=$DIR/bin/quickview --daemon
+Exec="$DIR/bin/quickview" --daemon
 X-KDE-StartupNotify=false
 NoDisplay=true
 EOF
