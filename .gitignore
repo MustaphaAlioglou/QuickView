@@ -1,2 +1,6 @@
 .venv/
 __pycache__/
+
+# Working notes, not part of the published project
+code-review-*.md
+macos-parity-*.md

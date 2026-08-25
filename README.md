@@ -4,6 +4,13 @@ A macOS **Quick Look**–style file previewer for KDE Plasma. Select a file in
 Dolphin, press **Space**, and a floating dark preview panel appears. Press
 Space again (or Esc) to dismiss it.
 
+![A PDF previewed by QuickView](docs/screenshots/pdf.png)
+
+<p align="center">
+  <img src="docs/screenshots/image.png" width="49%" alt="An image preview, with its dimensions in the titlebar">
+  <img src="docs/screenshots/code.png" width="49%" alt="A source file preview">
+</p>
+
 Multi-select works too: select **several files**, trigger QuickView, and
 **← / →** pages through them — the title shows your position (e.g. `2/5`),
 just like Quick Look on a multi-file selection.
@@ -15,6 +22,7 @@ just like Quick Look on a multi-file selection.
 | Images (PNG, JPG, WebP, SVG, …) | Scaled to fit, shows dimensions |
 | Animated GIFs       | Played inline                              |
 | PDFs                | Scrollable multi-page view                 |
+| HTML                | Rendered page (JS off, network blocked) — titlebar button flips to source view |
 | Video / audio       | Plays inline with a seek bar               |
 | Text / code / CSV   | Monospace text view (first 1 MiB)          |
 | Folders             | Item count and contents listing            |
@@ -43,32 +51,58 @@ Clear it with `quickview --clear-cache`.
 
 ## Sandboxed rendering
 
-**Static images** (PNG, JPEG, WebP, SVG, …) are never decoded by the daemon
-itself. On a cache miss it runs `render.py` under **bubblewrap** with
-read-only access to `/usr`, this app folder, and the single target file —
-no network (`--unshare-all`), no write access; the PNG streams back over
-stdout and the daemon writes the cache. A malformed image can only crash
-the throwaway helper. The render also runs asynchronously, so a slow or
-hostile file can't freeze the window or the daemon socket.
+**Every file format is parsed outside the daemon**, inside a bubblewrap
+jail: still images, PDFs, animations, audio and video. The daemon holds the
+window, the socket and the cache — it does not hold a decoder.
 
-If `bwrap` is not installed, images fall back to the metadata card
-(secure by default). Override at your own risk with
-`QUICKVIEW_ALLOW_UNSANDBOXED=1` (out-of-process but **not** sandboxed).
+The jail has read-only `/usr`, this app folder and the font config, no
+network (`--unshare-all`), no capabilities (`--cap-drop ALL`), no writes,
+and — this is the part that matters — **no access to your files at all**.
+The file arrives as a file descriptor passed over the worker socket, so
+there is nothing to bind-mount and nothing for a compromised parser to go
+looking for. A malformed file can only take down its own throwaway worker.
 
-**Not sandboxed** — these are parsed in-process by the daemon, so treat
-files from untrusted sources accordingly:
+**It is also faster than parsing in-process was.** Entering the jail costs
+about 3 ms; what used to cost ~150 ms per preview was importing Qt in a
+fresh helper. So workers are booted *before* they are needed and parked on
+a socket, and each one still handles exactly one file and then exits — the
+same per-file isolation as a throwaway helper, with the startup paid by a
+spare instead of by you. Measured on a 1-page PDF: 583 ms before, ~120 ms
+now; a cached preview is ~2 ms.
 
-- animated GIFs (`QMovie`) and audio/video (`QMediaPlayer`) — live playback
-  can't be handed to a throwaway process (same trade-off as the C++ version)
-- PDFs (`QtPdf`) — unlike the C++ version, which sandboxes a first-page
-  render, this app keeps the interactive scrollable viewer, and that means
-  the PDF parser runs in-process
-- text/code — plain file I/O capped at 1 MiB, no binary parser involved
+- **Images** — decoded to a PNG that the daemon caches and displays.
+- **PDFs** — pages stream one at a time, so page 1 appears while the rest
+  (capped at 50) render; each page is cached individually.
+- **Animations** (GIF/APNG) — every frame is decoded in the jail and
+  streamed here; playback is a timer cycling pixmaps the daemon already
+  holds, so no animation parser runs in this process.
+- **Audio and video** — `media_worker.py` runs the whole pipeline in the
+  jail and plays the audio itself through PipeWire (the one extra socket
+  bound in). Because it owns the audio clock, Qt does A/V sync in there;
+  video frames land in a shared memfd and the daemon just blits them.
+  Play/pause/seek are messages, not method calls.
 
-The decision of which parser touches a file is made in one place
-(`show_file`'s type routing). Set `QUICKVIEW_STRICT_SANDBOX=1` to refuse
-the in-process parsers entirely: GIFs degrade to a sandboxed still image,
-PDFs and audio/video to the metadata card.
+If `bwrap` is not installed, previews that need a parser fall back to the
+metadata card (secure by default). Override at your own risk with
+`QUICKVIEW_ALLOW_UNSANDBOXED=1` (out of process, but **not** sandboxed).
+
+### What still runs in the daemon
+
+Honest list — these are the reads that never reach a jail:
+
+- **HTML** (`QtWebEngine`) — hardened rather than jailed by us: JavaScript
+  and plugins disabled, every request outside `file:`/`data:` blocked (no
+  phoning home), off-the-record profile. Untrusted markup is parsed in
+  Chromium's own renderer process, which has its own sandbox; putting it in
+  ours would be strictly worse. `QUICKVIEW_STRICT_SANDBOX=1` drops HTML to
+  the plain source view if you would rather not rely on that.
+- **Text** — plain bytes, capped at 1 MiB, no parser involved; read on a
+  pool thread so a stalled network mount can't freeze the window.
+- **MIME sniffing** and the file-type icon — Qt reads magic bytes to decide
+  which of the above applies. Bounded matching, no decoding.
+- **The workers' own PNG output**, which the daemon decodes to display. A
+  compromised worker could aim a malformed PNG at the daemon's decoder —
+  one hardened format instead of every format Qt supports, but not zero.
 
 ## Logging & crash diagnostics
 
@@ -78,11 +112,29 @@ PDFs and audio/video to the metadata card.
 - `~/.local/share/quickview/crash.log` — faulthandler tracebacks if a
   native crash (e.g. inside a Qt decoder) takes the process down.
 
+## Requirements
+
+- **KDE Plasma** with Dolphin (Wayland or X11). Nothing else in the desktop
+  is assumed — the Space binding is a Dolphin service menu.
+- **bubblewrap** (`bwrap`) — mandatory, not optional: every parser runs
+  inside the jail it provides. `pacman -S bubblewrap`,
+  `apt install bubblewrap`, `dnf install bubblewrap`.
+- **Python 3.10+**. `install.sh` creates a virtualenv in `.venv/` and
+  installs PySide6 into it; no system packages are touched.
+- PipeWire or PulseAudio, if you want sound in video/audio previews.
+
 ## Install
 
 ```bash
+git clone https://github.com/MustaphaAlioglou/QuickView.git
+cd QuickView
 ./install.sh
 ```
+
+`install.sh` checks for `bwrap`, builds the virtualenv, installs PySide6
+(a few hundred MB on first run), registers the Dolphin service menu, puts a
+`quickview` launcher on your `PATH`, and enables the background daemon as a
+systemd user service.
 
 Then bind Space in Dolphin (one-time):
 **Menu → Configure → Configure Keyboard Shortcuts… → search "Quick Look" → Custom → Space**
@@ -93,16 +145,21 @@ Then bind Space in Dolphin (one-time):
   service `quickview.service`, started at login) so previews open in ~20 ms
 - `client.py` — fast path: sends the path(s) to the daemon over a Unix
   socket without loading Qt
-- `render.py` — sandboxed image decoder, spawned under bubblewrap
+- `worker.py` — the jailed preview worker: images, PDF pages and animation
+  frames, decoding from a passed file descriptor
+- `media_worker.py` — the jailed player: decodes and plays audio/video, and
+  streams video frames back through shared memory
+- `renderers.py` — the decoders themselves, shared by the workers and the
+  standalone scripts
+- `render.py`, `render_pdf.py` — standalone one-shot versions of the image
+  and PDF renderers, kept for reproducing a render by hand
 - `bin/quickview` — launcher: fast path first, full launch as fallback
 - `quickview-servicemenu.desktop` — Dolphin service menu ("Quick Look")
-- `.venv/` — self-contained PySide6 install (no system packages touched)
+- `.venv/` — self-contained PySide6 install, created by `install.sh` (no
+  system packages touched)
 
-The daemon idles at ~300 MB (Qt stays loaded — that's what makes previews
-instant). A Rust alternative with a smaller footprint lives in
-`~/Desktop/quickview-rs`, but on Wayland it cannot hide its window between
-previews (a winit limitation), so this Qt version is the better daily
-driver on Plasma Wayland.
+The daemon idles at ~300 MB, which is the price of keeping Qt loaded — and
+keeping Qt loaded is what makes previews open in ~20 ms instead of ~1 s.
 
 ## Notes
 
@@ -115,3 +172,21 @@ driver on Plasma Wayland.
   `~/.local/share/kio/servicemenus/quickview-servicemenu.desktop`,
   `~/.local/bin/quickview`, and the cache/log dirs
   `~/.cache/quickview` and `~/.local/share/quickview`.
+
+## Contributing
+
+Issues and pull requests are welcome. Two things worth knowing before you
+open one:
+
+- **Nothing that parses an untrusted file may run in the daemon.** New
+  formats go in `renderers.py` and are reached through a worker op; the
+  daemon only ever sees PNG bytes or decoded frames it asked for.
+- The daemon is long-lived. Anything allocated per preview has to be freed
+  per preview — it is expected to run for weeks without restarting.
+
+## License
+
+GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+The screenshots show KDE's default *Next* wallpaper and Ghostscript's
+manual, both from the system's own packages.

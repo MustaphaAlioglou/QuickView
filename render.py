@@ -1,18 +1,32 @@
 #!/usr/bin/env python3
-"""Sandboxed image decoder for QuickView.
+# QuickView — a Quick Look style file previewer for KDE Plasma.
+# Copyright (C) 2026 Mustapha Alioglou
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation, either version 3 of the License, or (at your
+# option) any later version. This program is distributed WITHOUT ANY
+# WARRANTY; see the LICENSE file, or <https://www.gnu.org/licenses/>.
+"""One-shot sandboxed image decoder for QuickView.
 
 Usage: render.py <file> <max_w> <max_h>
 
 Decodes one image and writes it to stdout as PNG, downscaled to fit
 max_w x max_h. The original dimensions travel along in a
-"QuickView:OrigSize" tEXt chunk. quickview.py runs this under bubblewrap
-(read-only /usr + this app + the one target file, no network, no writes),
-so a malicious file can only take down this throwaway process, never the
-daemon — see render_image() there.
+"QuickView:OrigSize" tEXt chunk.
+
+The daemon no longer uses this: it talks to a warm worker.py inside the
+same jail instead, which avoids paying Qt's import cost per file. This
+script is the standalone equivalent — handy for reproducing a render by
+hand, and for checking what the sandbox sees:
+
+    bwrap ... -- ./render.py suspicious.jpg 800 600 > out.png
 """
 
 import os
 import sys
+
+import renderers
 
 
 def main() -> int:
@@ -22,29 +36,16 @@ def main() -> int:
     path, max_w, max_h = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtCore import QBuffer, QIODevice, Qt
-    from PySide6.QtGui import QGuiApplication, QImageReader
+    from PySide6.QtGui import QGuiApplication
 
-    app = QGuiApplication([sys.argv[0]])  # noqa: F841 — QImageReader needs it
+    app = QGuiApplication([sys.argv[0]])  # noqa: F841 — the decoder needs it
 
-    reader = QImageReader(path)
-    reader.setAutoTransform(True)
-    img = reader.read()
-    if img.isNull():
-        print(f"unsupported or corrupt: {reader.errorString()}", file=sys.stderr)
+    try:
+        png = renderers.render_image(path, max_w, max_h)
+    except RuntimeError as exc:
+        print(exc, file=sys.stderr)
         return 1
-
-    orig = f"{img.width()}×{img.height()}"
-    if img.width() > max_w or img.height() > max_h:
-        img = img.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-    img.setText("QuickView:OrigSize", orig)
-
-    buf = QBuffer()
-    buf.open(QIODevice.OpenModeFlag.WriteOnly)
-    if not img.save(buf, "PNG"):
-        print("PNG encode failed", file=sys.stderr)
-        return 1
-    sys.stdout.buffer.write(bytes(buf.data()))
+    sys.stdout.buffer.write(png)
     return 0
 
 

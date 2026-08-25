@@ -1,3 +1,12 @@
+# QuickView — a Quick Look style file previewer for KDE Plasma.
+# Copyright (C) 2026 Mustapha Alioglou
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation, either version 3 of the License, or (at your
+# option) any later version. This program is distributed WITHOUT ANY
+# WARRANTY; see the LICENSE file, or <https://www.gnu.org/licenses/>.
+
 """The client↔daemon IPC contract, in one place.
 
 Both client.py and quickview.py import this module, so the socket path,

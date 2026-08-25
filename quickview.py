@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# QuickView — a Quick Look style file previewer for KDE Plasma.
+# Copyright (C) 2026 Mustapha Alioglou
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation, either version 3 of the License, or (at your
+# option) any later version. This program is distributed WITHOUT ANY
+# WARRANTY; see the LICENSE file, or <https://www.gnu.org/licenses/>.
 """QuickView — a macOS Quick Look style previewer for KDE.
 
 Usage: quickview <file> [file ...]
@@ -16,31 +24,37 @@ instance: same file toggles the window closed (like Quick Look), a
 different file switches the preview.
 """
 
+import array
 import faulthandler
 import hashlib
 import html
+import json
 import logging
 import logging.handlers
+import mmap
 import os
 import shutil
+import socket
+import struct
+import subprocess
 import sys
 from collections import OrderedDict
 
 import ipc
 
 from PySide6.QtCore import (
-    Qt, QUrl, QSize, QProcess, QTimer, QFileInfo, QMimeDatabase,
-    QStandardPaths,
+    Qt, QUrl, QPoint, QSize, QObject, QSocketNotifier, QThreadPool,
+    QTimer, QFileInfo, QMimeDatabase, QStandardPaths, Signal,
 )
 from PySide6.QtGui import (
-    QAction, QFont, QGuiApplication, QImage, QKeySequence,
-    QMovie, QPainter, QPixmap, QShortcut, QColor, QDesktopServices,
+    QAction, QFont, QGuiApplication, QImage, QKeySequence, QRegion,
+    QPainter, QPixmap, QShortcut, QColor, QDesktopServices,
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QFileIconProvider, QFrame, QHBoxLayout, QLabel,
-    QPlainTextEdit, QPushButton, QSizePolicy, QSlider, QStackedLayout,
-    QVBoxLayout, QWidget, QGraphicsDropShadowEffect,
+    QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSlider,
+    QStackedLayout, QVBoxLayout, QWidget, QGraphicsDropShadowEffect,
 )
 
 SOCKET_PATH = ipc.socket_path()
@@ -56,7 +70,10 @@ TEXT_EXTENSIONS = {
 
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-RENDER_HELPER = os.path.join(APP_DIR, "render.py")
+WORKER_HELPER = os.path.join(APP_DIR, "worker.py")
+# Cap on rendered pages so a 2000-page (or hostile) PDF can't grind the
+# helper for minutes; the title says when the preview is truncated.
+PDF_MAX_PAGES = 50
 
 CACHE_DIR = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
@@ -76,6 +93,19 @@ LOG_FILE = os.path.join(DATA_DIR, "quickview.log")
 LOG_MAX_BYTES = 5 * 1024 * 1024
 
 PNG_MAGIC = b"\x89PNG"
+# Sanity bound on one frame of a helper's stdout stream. A screen-sized PNG
+# page is a couple of MB; anything past this is a broken or hostile helper.
+MAX_FRAME_BYTES = 64 * 1024 * 1024
+# Frame slots the media worker cycles through in shared memory.
+MEDIA_SLOTS = 2
+# The worker caps frames too, but it is the untrusted side of the socket:
+# 512 screen-sized pixmaps is gigabytes of daemon memory, so the frames a
+# preview will actually hold are bounded here as well.
+# Formats show_file() treats as animations by default: a still WebP would
+# otherwise pay a decode round trip to learn it has one frame.
+ANIM_MIMES = ("image/gif", "image/apng")
+ANIM_MAX_FRAMES = 512
+ANIM_MAX_PIXMAP_BYTES = 256 * 1024 * 1024
 
 log = logging.getLogger("quickview")
 
@@ -109,9 +139,31 @@ def setup_logging():
 # by path + mtime + size, so a changed file re-renders and a repeat view of
 # an unchanged one skips decoding entirely.
 
-def cache_key(path: str, st: os.stat_result, max_w: int, max_h: int) -> str:
+def cache_key(
+    path: str, st: os.stat_result, max_w: int, max_h: int, variant: str = ""
+) -> str:
     raw = f"{path}\0{st.st_mtime_ns}\0{st.st_size}\0{max_w}x{max_h}"
+    if variant:  # e.g. "pdf3v2" — page 3 of a PDF at this width
+        raw += f"\0{variant}"
     return hashlib.sha256(raw.encode()).hexdigest() + ".png"
+
+
+def png_size(data: bytes) -> tuple[int, int] | None:
+    """(width, height) from a PNG's IHDR, without decoding the image."""
+    if len(data) < 24 or data[:4] != PNG_MAGIC or data[12:16] != b"IHDR":
+        return None
+    w = int.from_bytes(data[16:20], "big")
+    h = int.from_bytes(data[20:24], "big")
+    return (w, h) if w > 0 and h > 0 else None
+
+
+def cache_read_head(key: str, n: int = 24) -> bytes | None:
+    """The first n bytes of a cached file — enough for a PNG's IHDR."""
+    try:
+        with open(os.path.join(CACHE_DIR, key), "rb") as fh:
+            return fh.read(n)
+    except OSError:
+        return None
 
 
 def cache_read(key: str) -> bytes | None:
@@ -203,46 +255,99 @@ def clear_cache():
 # ---------------------------------------------------------------- sandbox
 
 _warned_no_bwrap = False
+_bwrap_path = ...  # ... = not looked up yet; None = not installed
 
 
-def build_render_command(path: str, max_w: int, max_h: int) -> list | None:
-    """Command line that decodes an image out of process (None = refused).
+def find_bwrap() -> str | None:
+    """shutil.which("bwrap"), resolved once — every render asked before."""
+    global _bwrap_path
+    if _bwrap_path is ...:
+        _bwrap_path = shutil.which("bwrap")
+    return _bwrap_path
 
-    The daemon never decodes untrusted *static images* in-process (animated
-    GIFs, PDFs and audio/video are different — see the README): render.py
-    runs under bubblewrap with read-only /usr + this app dir + the single
-    target file, no network (--unshare-all) and no writes — the PNG comes
-    back on stdout and the *daemon* writes the cache. Without bwrap we
-    refuse, unless QUICKVIEW_ALLOW_UNSANDBOXED=1 (still out of process,
-    NOT sandboxed).
+
+def _font_binds() -> list:
+    """Read-only binds that let Qt find fonts *and* their prebuilt cache.
+
+    Without these the jail has no /etc/fonts, so fontconfig rebuilds its
+    index on every single spawn: measured 583 ms vs 148 ms for a one-page
+    PDF. /etc/fonts alone is worse than neither (749 ms) — it turns on the
+    scan without supplying the cache that makes it cheap — so the config
+    is only bound when a cache is there to go with it.
     """
-    global _warned_no_bwrap
-    helper = [sys.executable, RENDER_HELPER, path, str(max_w), str(max_h)]
-    bwrap = shutil.which("bwrap")
+    # The jail runs with --clearenv and HOME=/tmp, so fontconfig looks for
+    # a user cache in /tmp/.cache/fontconfig — binding ~/.cache/fontconfig
+    # at its real path leaves it invisible in there, which is how a system
+    # with no /var/cache/fontconfig ended up with /etc/fonts and no usable
+    # cache: the 749 ms worst case above.
+    caches = []
+    if os.path.isdir("/var/cache/fontconfig"):
+        caches.append(("/var/cache/fontconfig", "/var/cache/fontconfig"))
+    user = os.path.expanduser("~/.cache/fontconfig")
+    if os.path.isdir(user):
+        caches.append((user, "/tmp/.cache/fontconfig"))
+    if not caches or not os.path.isdir("/etc/fonts"):
+        return []
+    binds = ["--ro-bind", "/etc/fonts", "/etc/fonts"]
+    for src, dest in caches:
+        binds += ["--ro-bind", src, dest]
+    return binds
+
+
+def sandbox_flags(bwrap: str) -> list:
+    """The jail every helper runs in: read-only /usr + this app dir, no
+    network, no writes, no capabilities, its own everything."""
+    return [
+        bwrap,
+        "--ro-bind", "/usr", "/usr",
+        "--symlink", "usr/lib", "/lib",
+        "--symlink", "usr/lib", "/lib64",
+        "--symlink", "usr/bin", "/bin",
+        "--symlink", "usr/bin", "/sbin",
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        "--ro-bind", APP_DIR, APP_DIR,
+        *_font_binds(),
+        "--unshare-all",
+        "--cap-drop", "ALL",
+        "--die-with-parent",
+        "--new-session",
+        "--clearenv",
+        "--setenv", "QT_QPA_PLATFORM", "offscreen",
+        "--setenv", "HOME", "/tmp",
+        "--setenv", "XDG_RUNTIME_DIR", "/tmp",
+    ]
+
+
+# --------------------------------------------------------- worker pool
+# The jail costs ~3 ms; importing PySide6 in the helper costs ~150 ms. So
+# the helper is booted *before* it is needed and parked on a socket, and the
+# file reaches it as a file descriptor (SCM_RIGHTS) rather than a bind
+# mount — the jail then needs no access to the user's filesystem at all.
+#
+# Isolation is unchanged from the old throwaway helpers: a worker handles
+# one file and exits. What changed is who waits for the boot — a spare, not
+# the user.
+
+WORKER_SPARES = 2
+JOB_TIMEOUT_MS = 20000
+MEDIA_HELPER = os.path.join(APP_DIR, "media_worker.py")
+
+
+def build_worker_command(fd: int) -> list | None:
+    """bwrap command for a warm worker, or None when we must refuse.
+
+    Note what is *not* here: no --ro-bind of any user file. The worker sees
+    /usr, this app dir and fonts, and gets its file as a descriptor.
+    """
+    helper = [sys.executable, WORKER_HELPER, str(fd)]
+    bwrap = find_bwrap()
     if bwrap:
-        return [
-            bwrap,
-            "--ro-bind", "/usr", "/usr",
-            "--symlink", "usr/lib", "/lib",
-            "--symlink", "usr/lib", "/lib64",
-            "--symlink", "usr/bin", "/bin",
-            "--symlink", "usr/bin", "/sbin",
-            "--proc", "/proc",
-            "--dev", "/dev",
-            "--tmpfs", "/tmp",
-            "--ro-bind", APP_DIR, APP_DIR,
-            "--ro-bind", path, path,
-            "--unshare-all",
-            "--die-with-parent",
-            "--new-session",
-            "--clearenv",
-            "--setenv", "QT_QPA_PLATFORM", "offscreen",
-            "--setenv", "HOME", "/tmp",
-            "--setenv", "XDG_RUNTIME_DIR", "/tmp",
-            "--",
-        ] + helper
+        return sandbox_flags(bwrap) + ["--"] + helper
     if os.environ.get("QUICKVIEW_ALLOW_UNSANDBOXED") == "1":
         return helper
+    global _warned_no_bwrap
     if not _warned_no_bwrap:
         _warned_no_bwrap = True
         log.warning(
@@ -251,6 +356,511 @@ def build_render_command(path: str, max_w: int, max_h: int) -> list | None:
             "to accept the risk)"
         )
     return None
+
+
+class Worker:
+    """A booted, idle, jailed process waiting for its one job."""
+
+    def __init__(self, proc, sock):
+        self.proc = proc
+        self.sock = sock
+        self.err = bytearray()
+        # Drained from the moment it is spawned, not from the moment it is
+        # given a job: a spare that chatters during Qt's boot (a broken font
+        # cache, QT_LOGGING_RULES) would otherwise fill the 64 KiB pipe
+        # buffer and block before it ever reads its request.
+        self._errnotifier = QSocketNotifier(
+            proc.stderr.fileno(), QSocketNotifier.Type.Read
+        )
+        self._errnotifier.activated.connect(self._drain_err)
+
+    def _drain_err(self):
+        try:
+            chunk = os.read(self.proc.stderr.fileno(), 4096)
+        except OSError:
+            self._errnotifier.setEnabled(False)
+            return
+        if not chunk:
+            self._errnotifier.setEnabled(False)
+            return
+        # Bounded: a hostile file can make Qt chatter indefinitely and we
+        # only ever log the first few hundred characters.
+        if len(self.err) < 4096:
+            self.err += chunk
+
+    def kill(self):
+        self._errnotifier.setEnabled(False)
+        for close in (self.sock.close, self.proc.kill):
+            try:
+                close()
+            except OSError:
+                pass
+        try:
+            # Reap it. SIGKILL is already delivered, so this returns at once;
+            # skipping the wait would leave one zombie per preview behind in
+            # a daemon that runs for weeks.
+            self.proc.wait(timeout=2)
+        except (subprocess.TimeoutExpired, OSError):
+            log.warning("worker %d would not die", self.proc.pid)
+        try:
+            self.proc.stderr.close()
+        except OSError:
+            pass
+
+
+class WorkerPool:
+    """Keeps a couple of workers pre-booted so a preview never waits."""
+
+    def __init__(self):
+        self._spares = []
+
+    def prime(self):
+        """Top the pool back up. Cheap: fork+exec returns immediately and
+        the Qt import happens in the child while the user reads."""
+        while len(self._spares) < WORKER_SPARES:
+            w = self._spawn()
+            if w is None:
+                return  # refused (no bwrap) — callers fall back
+            self._spares.append(w)
+
+    def take(self) -> Worker | None:
+        while self._spares:
+            w = self._spares.pop(0)
+            if w.proc.poll() is None:  # still alive
+                QTimer.singleShot(0, self.prime)
+                return w
+            log.debug("discarding dead spare worker")
+            w.kill()
+        w = self._spawn()  # pool was empty or stale — pay the boot cost
+        QTimer.singleShot(0, self.prime)
+        return w
+
+    def shutdown(self):
+        for w in self._spares:
+            w.kill()
+        self._spares.clear()
+
+    def _spawn(self) -> Worker | None:
+        parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        cmd = build_worker_command(child.fileno())
+        if cmd is None:
+            parent.close()
+            child.close()
+            return None
+        try:
+            os.set_inheritable(child.fileno(), True)
+            proc = subprocess.Popen(
+                cmd,
+                pass_fds=(child.fileno(),),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            log.warning("worker spawn failed: %s", exc)
+            parent.close()
+            child.close()
+            return None
+        finally:
+            child.close()
+        return Worker(proc, parent)
+
+
+def build_media_worker_command(fd: int) -> list | None:
+    """Jail for the media player: the standard one plus an audio socket.
+
+    Playing sound is the single capability the media worker has that the
+    render workers don't. PipeWire (and its PulseAudio shim) are reached
+    through sockets under the real XDG_RUNTIME_DIR, so they are bound into
+    the jail's /tmp, which is where its XDG_RUNTIME_DIR points. Everything
+    else — the filesystem, the network, the user's files — stays shut off.
+    """
+    helper = [sys.executable, MEDIA_HELPER, str(fd)]
+    bwrap = find_bwrap()
+    if not bwrap:
+        if os.environ.get("QUICKVIEW_ALLOW_UNSANDBOXED") == "1":
+            return helper
+        return None
+    run_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    audio = []
+    for name in ("pipewire-0", "pulse"):
+        src = os.path.join(run_dir, name)
+        if os.path.exists(src):
+            audio += ["--ro-bind", src, f"/tmp/{name}"]
+    if os.path.isdir("/etc/pipewire"):
+        audio += ["--ro-bind", "/etc/pipewire", "/etc/pipewire"]
+    if not audio:
+        log.warning("no PipeWire/PulseAudio socket found — preview is muted")
+    return sandbox_flags(bwrap) + audio + ["--"] + helper
+
+
+class MediaSession(QObject):
+    """A jailed QMediaPlayer, driven over a socket.
+
+    The daemon holds no decoder: it sends transport commands, receives
+    status, and blits frames the worker has written into shared memory.
+    """
+
+    def __init__(self, window, path, max_w, max_h, handlers):
+        super().__init__(window)
+        self._handlers = handlers
+        self._buf = bytearray()
+        self._alive = False
+        self._mm = None
+        self.slot_bytes = max_w * max_h * 4
+
+        parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        cmd = build_media_worker_command(child.fileno())
+        if cmd is None:
+            parent.close()
+            child.close()
+            QTimer.singleShot(
+                0, lambda: handlers["error"]("sandbox refused (no bwrap)")
+            )
+            return
+        try:
+            media_fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        except OSError as exc:
+            parent.close()
+            child.close()
+            QTimer.singleShot(0, lambda: handlers["error"](str(exc)))
+            return
+
+        # A memfd is the frame transport: an anonymous shared buffer that
+        # crosses the jail as a descriptor, so it works with --unshare-ipc
+        # (SysV/POSIX shared memory would not).
+        frame_fd = os.memfd_create("quickview-frames")
+        os.ftruncate(frame_fd, self.slot_bytes * MEDIA_SLOTS)
+        self._mm = mmap.mmap(frame_fd, self.slot_bytes * MEDIA_SLOTS)
+
+        try:
+            os.set_inheritable(child.fileno(), True)
+            self._proc = subprocess.Popen(
+                cmd,
+                pass_fds=(child.fileno(),),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            for fd in (media_fd, frame_fd):
+                os.close(fd)
+            parent.close()
+            child.close()
+            QTimer.singleShot(0, lambda: handlers["error"](str(exc)))
+            return
+        finally:
+            child.close()
+
+        self._sock = parent
+        self._alive = True
+        self._notifier = QSocketNotifier(
+            parent.fileno(), QSocketNotifier.Type.Read, self
+        )
+        self._notifier.activated.connect(self._readable)
+
+        job = json.dumps({
+            "op": "media", "max_w": max_w, "max_h": max_h,
+            "slot_bytes": self.slot_bytes,
+        }).encode()
+        try:
+            parent.sendmsg(
+                [struct.pack(">I", len(job))],
+                [(
+                    socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                    array.array("i", [media_fd, frame_fd]),
+                )],
+            )
+            parent.sendall(job)
+        except OSError as exc:
+            QTimer.singleShot(0, lambda: handlers["error"](str(exc)))
+        finally:
+            os.close(media_fd)
+            os.close(frame_fd)  # the worker and our mmap keep it alive
+
+    # ------------------------------------------------------------ control
+    def send(self, msg: dict):
+        if not self._alive:
+            return
+        payload = json.dumps(msg).encode()
+        try:
+            self._sock.sendall(struct.pack(">I", len(payload)) + payload)
+        except OSError:
+            self.stop()
+
+    def stop(self):
+        if not self._alive:
+            return
+        self._alive = False
+        self._notifier.setEnabled(False)
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        try:
+            self._proc.kill()
+        except OSError:
+            pass
+        try:
+            # Bounded, like Worker.kill(): SIGKILL is already delivered, so
+            # this normally returns at once — but a worker wedged in an
+            # uninterruptible read on a stalled mount must not take the
+            # window, the shortcuts and the IPC socket down with it.
+            self._proc.wait(timeout=2)
+        except (subprocess.TimeoutExpired, OSError):
+            log.warning("media worker %d would not die", self._proc.pid)
+        if self._mm is not None:
+            self._mm.close()
+            self._mm = None
+
+    # ------------------------------------------------------------ reading
+    def _readable(self):
+        if not self._alive:
+            return
+        try:
+            chunk = self._sock.recv(1 << 16)
+        except OSError as exc:
+            self._handlers["error"](str(exc))
+            self.stop()
+            return
+        if not chunk:
+            self.stop()
+            self._handlers["error"]("player exited")
+            return
+        self._buf += chunk
+        while len(self._buf) >= 4:
+            (n,) = struct.unpack(">I", self._buf[:4])
+            if n > MAX_FRAME_BYTES or len(self._buf) < 4 + n:
+                if n > MAX_FRAME_BYTES:
+                    self.stop()
+                return
+            try:
+                msg = json.loads(bytes(self._buf[4:4 + n]))
+            except ValueError:
+                self.stop()
+                return
+            del self._buf[:4 + n]
+            self._dispatch(msg)
+
+    def _dispatch(self, msg: dict):
+        kind = msg.get("t")
+        if kind == "frame":
+            img = self.read_frame(msg)
+            if img is not None:
+                self._handlers["frame"](img)
+        elif kind in self._handlers:
+            self._handlers[kind](msg)
+
+    def read_frame(self, msg: dict):
+        """Copy one frame out of shared memory as a QImage."""
+        if self._mm is None:
+            return None
+        try:
+            slot, w, h = int(msg["slot"]), int(msg["w"]), int(msg["h"])
+            stride = int(msg["stride"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not 0 <= slot < MEDIA_SLOTS:
+            return None  # no such slot to release either
+        img = self._copy_frame(slot, w, h, stride)
+        # The slot is free for the worker to fill again — either because
+        # the pixels are copied out, or because the frame was rejected and
+        # there is nothing left to preserve. Until this ack lands, the
+        # worker holds off, so a daemon busy with layout can no longer be
+        # handed a slot whose contents have already been replaced.
+        self.send({"t": "ack", "slot": slot})
+        return img
+
+    def _copy_frame(self, slot: int, w: int, h: int, stride: int):
+        # The worker is untrusted, so every number is checked before it
+        # reaches QImage: a frame claiming w=100000, h=1, stride=4 passes a
+        # size check on stride * h alone and then reads far past the slot.
+        if w <= 0 or h <= 0:
+            return None
+        if stride < w * 4:  # Format_RGB32: four bytes a pixel, minimum
+            return None
+        need = stride * h
+        if need <= 0 or need > self.slot_bytes:
+            return None
+        # Copied, not wrapped: the worker fills this slot again as soon as
+        # it is acked, and QImage would still be pointing at it.
+        off = slot * self.slot_bytes
+        data = bytes(self._mm[off:off + need])
+        if len(data) < need:  # a short mmap slice would be read past, too
+            return None
+        return QImage(data, w, h, stride, QImage.Format.Format_RGB32).copy()
+
+
+class FileReader(QObject):
+    """Reads a bounded slice of a file on a pool thread.
+
+    Only used for the text preview, which parses nothing — but a file on a
+    stalled network mount blocks just as hard as a hostile parser, and the
+    daemon's socket has to keep answering.
+
+    Deliberately not a QRunnable: the pool touches a runnable again *after*
+    run() returns (to check autoDelete), so a reader whose last reference
+    was dropped by the daemon in the meantime would be a use-after-free.
+    Handing the pool a bound method instead leaves the lifetime to Python —
+    the pool's own wrapper holds this object until run() has finished.
+    """
+
+    done = Signal(bytes, str)
+
+    def __init__(self, path: str, limit: int):
+        super().__init__()
+        self._path = path
+        self._limit = limit
+
+    def run(self):
+        try:
+            with open(self._path, "rb") as fh:
+                self.done.emit(fh.read(self._limit), "")
+        except OSError as exc:
+            self.done.emit(b"", str(exc))
+
+
+class SandboxJob(QObject):
+    """One file parsed by one jailed worker, asynchronously.
+
+    on_frame(payload) fires per frame as it arrives (so PDF page 1 shows
+    while page 2 renders); on_done(ok, error) fires exactly once. Frames are
+    length-prefixed the same way the standalone helpers stream them.
+    """
+
+    def __init__(self, pool, path, job, on_frame, on_done, parent=None):
+        super().__init__(parent)
+        self._on_frame = on_frame
+        self._on_done = on_done
+        self._buf = bytearray()
+        self.header = {}  # the worker's reply header: {"ok": ..., "count": N}
+        self._header = None
+        self._err = bytearray()
+        self._done = False
+        # Set by the worker's end-of-stream marker. Without it, a worker
+        # that dies halfway looks exactly like one that finished.
+        self._complete = False
+        self._worker = pool.take()
+        if self._worker is None:
+            QTimer.singleShot(0, lambda: self._finish(False, "sandbox refused"))
+            return
+
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        except OSError as exc:
+            self._worker.kill()
+            self._worker = None
+            QTimer.singleShot(0, lambda: self._finish(False, str(exc)))
+            return
+
+        sock = self._worker.sock
+        self._notifier = QSocketNotifier(
+            sock.fileno(), QSocketNotifier.Type.Read, self
+        )
+        self._notifier.activated.connect(self._readable)
+        # stderr is drained by the Worker itself, from spawn time.
+        # Inactivity watchdog, not a total budget: a 50-page PDF arrives over
+        # several seconds, but each frame should come quickly.
+        self._watchdog = QTimer(self)
+        self._watchdog.setSingleShot(True)
+        self._watchdog.timeout.connect(
+            lambda: self._finish(False, "timed out")
+        )
+        self._watchdog.start(JOB_TIMEOUT_MS)
+
+        payload = json.dumps(job).encode()
+        try:
+            sock.sendmsg(
+                [struct.pack(">I", len(payload))],
+                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))],
+            )
+            sock.sendall(payload)
+        except OSError as exc:
+            QTimer.singleShot(0, lambda: self._finish(False, str(exc)))
+        finally:
+            os.close(fd)  # the worker holds its own copy now
+
+    # ------------------------------------------------------------ reading
+    def _readable(self):
+        if self._done:
+            return
+        try:
+            chunk = self._worker.sock.recv(1 << 16)
+        except OSError as exc:
+            self._finish(False, str(exc))
+            return
+        if not chunk:  # worker exited
+            if self._complete:
+                self._finish(True)
+            elif self._header is None:
+                self._finish(False, "worker closed the socket")
+            else:
+                # Frames arrived but the end marker never did: the worker
+                # died partway (a page it could not render, a kill). Saying
+                # "ok" here is what let a PDF that stopped at page 7 of 50
+                # be reported as a complete render.
+                self._finish(False, "worker stopped before finishing")
+            return
+        self._watchdog.start(JOB_TIMEOUT_MS)
+        self._buf += chunk
+        while len(self._buf) >= 4:
+            (n,) = struct.unpack(">I", self._buf[:4])
+            if n > MAX_FRAME_BYTES:
+                self._finish(False, f"absurd frame length {n}")
+                return
+            if len(self._buf) < 4 + n:
+                return
+            payload = bytes(self._buf[4:4 + n])
+            del self._buf[:4 + n]
+            if self._header is not None and n == 0:
+                self._complete = True  # end-of-stream marker
+                continue
+            if self._header is None:
+                try:
+                    self._header = json.loads(payload)
+                except ValueError:
+                    self._finish(False, "malformed worker header")
+                    return
+                self.header = self._header
+                if not self._header.get("ok"):
+                    self._finish(False, self._header.get("error", "failed"))
+                    return
+                continue
+            self._on_frame(payload)
+
+    def _finish(self, ok: bool, error: str = ""):
+        if self._done:
+            return
+        self._done = True
+        self.cancel()
+        if not ok and self._err:
+            error = f"{error}: " + self._err.decode(
+                "utf-8", errors="replace"
+            ).strip()[:500]
+        self._on_done(ok, error)
+        # One job object per preview *and* per prefetch would otherwise pile
+        # up as children of the window for the life of a daemon that runs
+        # for weeks. Queued, so it outlives the callback above.
+        self.deleteLater()
+
+    def cancel(self):
+        """Stop listening and kill the worker. Safe to call twice."""
+        if self._done and self._worker is None:
+            return  # already torn down; the C++ side may be gone with it
+        self._done = True
+        for attr in ("_notifier", "_watchdog"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                obj.setEnabled(False) if isinstance(
+                    obj, QSocketNotifier
+                ) else obj.stop()
+        if self._worker is not None:
+            self._err = self._worker.err  # collected since it was spawned
+            self._worker.kill()
+            self._worker = None
+        # Also covers a job cancelled from outside, which never reaches
+        # _finish. deleteLater() twice is harmless.
+        self.deleteLater()
 
 
 def human_size(n: int) -> str:
@@ -266,6 +876,8 @@ class TitleBar(QWidget):
     def __init__(self, window):
         super().__init__()
         self._window = window
+        self._drag_from = None    # cursor position where a drag started
+        self._drag_origin = None  # panel position at that moment
         self.setFixedHeight(40)
 
         self.close_btn = QPushButton("✕")
@@ -281,16 +893,44 @@ class TitleBar(QWidget):
         self.open_btn.setObjectName("openBtn")
         self.open_btn.clicked.connect(window.open_externally)
 
+        # HTML only: flips between rendered preview and source view.
+        self.mode_btn = QPushButton("Code")
+        self.mode_btn.setObjectName("openBtn")
+        self.mode_btn.clicked.connect(window.toggle_html_mode)
+        self.mode_btn.hide()
+
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 8, 12, 8)
         lay.addWidget(self.close_btn)
         lay.addWidget(self.title, 1)
+        lay.addWidget(self.mode_btn)
         lay.addWidget(self.open_btn)
 
+    # The window is a full-screen overlay, so there is nothing for the
+    # compositor to move: dragging the titlebar slides the panel inside it.
+    # startSystemMove() would be a no-op here (and is ignored outright on
+    # Wayland, which is what kept the panel off centre in the first place).
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self._window.windowHandle().startSystemMove()
+            self._drag_from = event.globalPosition().toPoint()
+            self._drag_origin = self._window.panel.pos()
+            # Accepted, not propagated: the press has to land here for the
+            # move events of the drag to follow it.
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_from is not None:
+            delta = event.globalPosition().toPoint() - self._drag_from
+            self._window.move_panel(self._drag_origin + delta)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_from = None
+        super().mouseReleaseEvent(event)
 
 
 class QuickView(QWidget):
@@ -307,11 +947,18 @@ class QuickView(QWidget):
         self.current_path = None
         self.selection = []
         self.sel_index = 0
-        self.movie = None
-        self.player = None
-        self.audio_out = None
+        self.anim_timer = None
+        self.media = None
         self._mem_cache = OrderedDict()  # key -> (pixmap, dims, nbytes)
-        self._render_proc = None
+        self.pool = WorkerPool()
+        self._render_job = None
+        self._prefetch_job = None
+        self._prefetch_queue = []  # (path, key, job) awaiting a warm render
+        self._pdf_gen = None  # token invalidating in-flight page appends
+        self._pdf_labels = []  # one placeholder per page of the open PDF
+        self._text_readers = set()  # readers still on a pool thread
+        self._html_rendered = True  # HTML mode: rendered page vs. source
+        self._web_profile = None  # lazy; one hardened profile for all pages
 
         self.panel = QFrame(self)
         self.panel.setObjectName("panel")
@@ -321,9 +968,11 @@ class QuickView(QWidget):
         shadow.setColor(QColor(0, 0, 0, 160))
         self.panel.setGraphicsEffect(shadow)
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(24, 24, 24, 32)
-        outer.addWidget(self.panel)
+        # Room left around the panel for the drop shadow; the panel is
+        # placed inside the overlay by _place_panel(), not by a layout.
+        self._margins = (24, 24, 24, 32)  # left, top, right, bottom
+        self._panel_size = QSize(520 + 48, 320 + 56 + 40)
+        self._panel_pos = None  # None = centred; a point once dragged
 
         self.titlebar = TitleBar(self)
         self.content = QStackedLayout()
@@ -335,11 +984,16 @@ class QuickView(QWidget):
         panel_lay.addWidget(self.titlebar)
         panel_lay.addLayout(self.content, 1)
 
+        # Fully opaque: every colour below is solid, including the ones that
+        # used to be white-over-panel blends. WA_TranslucentBackground stays
+        # on above — it is what lets the rounded corners and the drop shadow
+        # composite against the desktop — but nothing shows through the panel
+        # itself any more.
         self.setStyleSheet("""
             #panel {
-                background-color: rgba(34, 34, 38, 245);
+                background-color: #222226;
                 border-radius: 12px;
-                border: 1px solid rgba(255, 255, 255, 30);
+                border: 1px solid #3c3c40;
             }
             #titleLabel {
                 color: #e8e8ea; font-size: 13px; font-weight: 600;
@@ -351,19 +1005,19 @@ class QuickView(QWidget):
             }
             #closeBtn:hover { background-color: #ff5f57; color: #4b0d0a; }
             #openBtn {
-                background-color: rgba(255, 255, 255, 26); color: #e8e8ea;
+                background-color: #38383c; color: #e8e8ea;
                 border: none; border-radius: 6px; padding: 4px 14px;
                 font-size: 12px;
             }
-            #openBtn:hover { background-color: rgba(255, 255, 255, 45); }
+            #openBtn:hover { background-color: #4a4a4d; }
             QPlainTextEdit {
-                background-color: transparent; color: #dcdcde;
+                background-color: #222226; color: #dcdcde;
                 border: none; padding: 8px 14px;
                 font-family: monospace; font-size: 12px;
             }
             QLabel { color: #dcdcde; }
             QSlider::groove:horizontal {
-                height: 4px; background: rgba(255,255,255,40); border-radius: 2px;
+                height: 4px; background: #454548; border-radius: 2px;
             }
             QSlider::handle:horizontal {
                 width: 12px; margin: -4px 0; border-radius: 6px; background: #e8e8ea;
@@ -371,9 +1025,9 @@ class QuickView(QWidget):
         """)
 
         for keys, fn in (
-            (Qt.Key_Space, self.dismiss),
-            (Qt.Key_Escape, self.dismiss),
-            (Qt.Key_Q, self.dismiss),
+            (Qt.Key_Space, lambda: self.dismiss("space")),
+            (Qt.Key_Escape, lambda: self.dismiss("escape")),
+            (Qt.Key_Q, lambda: self.dismiss("q")),
             (Qt.Key_Left, lambda: self.step_sibling(-1)),
             (Qt.Key_Right, lambda: self.step_sibling(+1)),
             (Qt.Key_Return, self.open_externally),
@@ -385,14 +1039,19 @@ class QuickView(QWidget):
             activated=QApplication.instance().quit,
         )
 
-    def dismiss(self):
+    def dismiss(self, reason: str = "request"):
         """Hide the preview but keep the process resident for instant reuse."""
+        if self.isVisible():
+            log.debug("dismissed (%s)", reason)
         self.clear_content()
         self.hide()
+        # The next preview starts centred again, whatever this one was
+        # dragged to.
+        self._panel_pos = None
 
     def closeEvent(self, event):
         event.ignore()
-        self.dismiss()
+        self.dismiss("window closed")
 
     # ---------------------------------------------------------------- helpers
 
@@ -404,37 +1063,136 @@ class QuickView(QWidget):
         avail = self.screen_avail()
         w = min(max(w, 480), int(avail.width() * 0.85))
         h = min(max(h, 320), int(avail.height() * 0.85))
-        self.resize(w + 48, h + 56 + 40)
-        self.center_on_screen()
+        # Sizes the panel, not the window: the window is a full-screen
+        # overlay, so a preview that grows (a PDF swapping its "Loading…"
+        # card for the page column) re-centres instead of drifting away
+        # from wherever the compositor first put it.
+        self._panel_size = QSize(w + 48, h + 56 + 40)
+        self._place_panel()
+        # Which caller sized the panel, and against which screen. A preview
+        # that opens too small is either a fallback card sized 520x320 or a
+        # screen this ran before the window had one.
+        log.debug(
+            "panel sized %dx%d (panel %dx%d at %d,%d in overlay %dx%d, "
+            "screen %dx%d)",
+            w, h, self.panel.width(), self.panel.height(),
+            self.panel.x(), self.panel.y(), self.width(), self.height(),
+            avail.width(), avail.height(),
+        )
 
-    def center_on_screen(self):
+    def fit_overlay(self):
+        """Cover the work area. Only the size lands on Wayland; that is
+        enough, because the panel is centred against the screen below."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        self.setGeometry(screen.availableGeometry())
+
+    def _place_panel(self):
+        """Lay the panel out inside the overlay: centred unless dragged."""
+        left, top, right, bottom = self._margins
+        pw = min(self._panel_size.width(), self.width()) - left - right
+        ph = min(self._panel_size.height(), self.height()) - top - bottom
+        self.panel.resize(max(pw, 1), max(ph, 1))
+        if self._panel_pos is None:
+            self.center_panel()
+        else:
+            self.move_panel(self._panel_pos)
+        self._apply_mask()
+
+    def _apply_mask(self):
+        """Take input only where the panel is.
+
+        The overlay spans the work area so the panel can be positioned
+        exactly, but it must not *behave* like a window that size: without
+        this mask every click meant for Dolphin lands on the preview
+        instead. Masked, the rest of the overlay is not even there as far
+        as clicks are concerned — they go to whatever is underneath, as
+        they did when the window was panel-sized.
+        """
+        handle = self.windowHandle()
+        if handle is None:
+            return  # not created yet; _place_panel runs again after show()
+        left, top, right, bottom = self._margins
+        # QWindow.setMask(), not QWidget.setMask(): the widget one clips
+        # painting as well as input, so shrinking it left the previous,
+        # larger panel's pixels on screen with the new panel drawn inside
+        # them — a window within a window. The window one is an input hint
+        # and nothing more.
+        handle.setMask(
+            QRegion(
+                # Grown by the margins so the drop shadow stays clickable
+                # rather than being cut out of the input region.
+                self.panel.geometry().adjusted(-left, -top, right, bottom)
+            )
+        )
+        self.clearMask()  # undo any widget-level mask from an older build
+        self.update()     # repaint the whole overlay, stale frame included
+
+    def center_panel(self):
+        """Centre the panel on the screen itself and forget any drag.
+
+        Centred in global coordinates, not in the overlay: a compositor
+        that puts the overlay somewhere other than the work-area origin
+        then still leaves the panel dead centre on screen.
+        """
+        self._panel_pos = None
         screen = self.screen() or QGuiApplication.primaryScreen()
         geo = screen.availableGeometry()
-        self.move(
-            geo.x() + (geo.width() - self.width()) // 2,
-            geo.y() + (geo.height() - self.height()) // 2,
+        target = QPoint(
+            geo.x() + (geo.width() - self.panel.width()) // 2,
+            geo.y() + (geo.height() - self.panel.height()) // 2,
+        )
+        self.panel.move(self._clamped(self.mapFromGlobal(target)))
+
+    def move_panel(self, pos):
+        """Move the panel within the overlay (a titlebar drag)."""
+        self._panel_pos = self._clamped(pos)
+        self.panel.move(self._panel_pos)
+
+    def _clamped(self, pos) -> QPoint:
+        """A panel position kept fully inside the overlay."""
+        left, top, right, bottom = self._margins
+        return QPoint(
+            max(left, min(pos.x(), self.width() - self.panel.width() - right)),
+            max(top, min(pos.y(), self.height() - self.panel.height() - bottom)),
+        )
+
+    def resizeEvent(self, event):
+        # The overlay follows the screen (resolution change, another output).
+        super().resizeEvent(event)
+        self._place_panel()
+        log.debug(
+            "overlay %dx%d, panel %dx%d at %d,%d",
+            self.width(), self.height(), self.panel.width(),
+            self.panel.height(), self.panel.x(), self.panel.y(),
         )
 
     def _cancel_render(self):
-        proc = self._render_proc
-        self._render_proc = None
-        if proc is not None and proc.state() != QProcess.ProcessState.NotRunning:
-            proc.kill()
+        job = self._render_job
+        self._render_job = None
+        if job is not None:
+            job.cancel()
 
     def clear_content(self):
         self._cancel_render()
-        if self.player is not None:
-            self.player.stop()
-            # The media pipeline keeps emitting positionChanged after stop();
-            # sever every connection so a queued emission can't reach the
-            # slider/label lambdas after deleteLater destroys their widgets.
-            self.player.disconnect()
-            self.player.deleteLater()
-            self.player = None
-            self.audio_out = None
-        if self.movie is not None:
-            self.movie.stop()
-            self.movie = None
+        if self.media is not None:
+            # Killing the worker is the whole teardown: the decoder, the
+            # audio stream and the frame buffer all live in that process, so
+            # no late signal can reach widgets we are about to destroy.
+            self.media.stop()
+            self.media.deleteLater()
+            self.media = None
+        if self.anim_timer is not None:
+            self.anim_timer.stop()
+            self.anim_timer.deleteLater()
+            self.anim_timer = None
+        self._clear_widgets()
+
+    def _clear_widgets(self):
+        # Widgets only — no process/player teardown. The PDF path swaps its
+        # "Loading…" message for the page column while its helper is still
+        # streaming, so it must not go through clear_content().
+        self._pdf_gen = None
+        self._pdf_labels = []  # they are about to be deleted with the view
         while self.content.count():
             w = self.content.takeAt(0).widget()
             if w is not None:
@@ -443,7 +1201,7 @@ class QuickView(QWidget):
     def open_externally(self):
         if self.current_path:
             QDesktopServices.openUrl(QUrl.fromLocalFile(self.current_path))
-            self.dismiss()
+            self.dismiss("opened externally")
 
     def step_sibling(self, delta: int):
         # With a multi-file selection, ← → page through it (like Quick Look
@@ -489,6 +1247,7 @@ class QuickView(QWidget):
 
         name = os.path.basename(path) or path
         self.set_title(name)
+        self.titlebar.mode_btn.setVisible(False)  # show_html() re-enables
 
         if not os.path.exists(path):
             self.show_message(f"File not found:\n{path}")
@@ -498,26 +1257,37 @@ class QuickView(QWidget):
             mime = self.mime_db.mimeTypeForFile(path).name()
             ext = os.path.splitext(path)[1].lower()
             # This routing is the sandbox enforcement point. Every branch
-            # below either decodes out of process (show_image), reads plain
-            # bytes (text/fallback), or uses an in-process parser — GIF
-            # (QMovie), PDF (QtPdf), media (QtMultimedia) — which only
-            # `inprocess` permits. With QUICKVIEW_STRICT_SANDBOX=1 a GIF
-            # falls through to the sandboxed still-image path and PDF/media
-            # fall through to the metadata card.
-            inprocess = os.environ.get("QUICKVIEW_STRICT_SANDBOX") != "1"
-            if mime == "image/gif" and inprocess:
-                self.show_gif(path)
+            # below hands the file to a jailed worker (show_image, show_pdf,
+            # show_anim, show_media) or reads plain bytes (text/fallback).
+            # The one exception is HTML, which QtWebEngine parses in its own
+            # Chromium renderer sandbox rather than in our jail;
+            # QUICKVIEW_STRICT_SANDBOX=1 drops it to the source view for
+            # anyone who would rather not rely on that.
+            allow_webengine = os.environ.get("QUICKVIEW_STRICT_SANDBOX") != "1"
+            if mime in ANIM_MIMES:
+                self.show_anim(path)
             elif mime.startswith("image/"):
                 self.show_image(path)
-            elif mime == "application/pdf" and inprocess:
+            elif mime == "application/pdf":
                 self.show_pdf(path)
-            elif mime.startswith(("video/", "audio/")) and inprocess:
+            elif (
+                mime == "text/html" or ext in (".html", ".htm")
+            ) and allow_webengine:
+                self.show_html(path)
+            elif mime.startswith(("video/", "audio/")):
                 self.show_media(path, video=mime.startswith("video/"))
             elif mime.startswith("text/") or ext in TEXT_EXTENSIONS:
                 self.show_text(path)
             else:
                 self.show_fallback(path, mime)
 
+        # Transparent overlay the size of the work area, with the panel
+        # centred inside it: the one way to put a preview at a chosen spot
+        # under Wayland, which ignores move() outright. Deliberately *not*
+        # fullscreen — KWin lowers an inactive fullscreen window below the
+        # focused one, so a preview raised without an activation token
+        # (from the daemon, not a click) would vanish behind other windows.
+        self.fit_overlay()
         self.show()
         self.raise_()
         self.activateWindow()
@@ -529,9 +1299,12 @@ class QuickView(QWidget):
         self.content.addWidget(label)
         self.set_panel_size(520, 320)
 
-    def show_image(self, path: str):
+    def image_fit_box(self) -> tuple:
         avail = self.screen_avail()
-        max_w, max_h = int(avail.width() * 0.85) - 48, int(avail.height() * 0.85) - 96
+        return int(avail.width() * 0.85) - 48, int(avail.height() * 0.85) - 96
+
+    def show_image(self, path: str):
+        max_w, max_h = self.image_fit_box()
         try:
             st = os.stat(path)
         except OSError as exc:
@@ -560,36 +1333,23 @@ class QuickView(QWidget):
             log.warning("dropping corrupt cache entry for %s", path)
             cache_remove(key)
 
-        cmd = build_render_command(path, max_w, max_h)
-        if cmd is None:
-            # Decode refused (no bwrap) — metadata card.
-            self.show_fallback(path, self.mime_db.mimeTypeForFile(path).name())
-            return
-
-        # Decode asynchronously: a slow or hostile file must not freeze the
-        # event loop — keys, the close button and the daemon socket stay
-        # live while the sandboxed helper works.
+        # Decode asynchronously in the jail: a slow or hostile file must not
+        # freeze the event loop — keys, the close button and the daemon socket
+        # stay live while the worker works.
         self.show_message("Loading preview…")
-        proc = QProcess(self)
-        self._render_proc = proc
-        watchdog = QTimer(proc)
-        watchdog.setSingleShot(True)
-        watchdog.timeout.connect(proc.kill)
+        got = {"png": None, "job": None}
 
-        def finished(code, _status):
-            stale = self._render_proc is not proc
-            if not stale:
-                self._render_proc = None
-            png = bytes(proc.readAllStandardOutput())
-            err = bytes(proc.readAllStandardError()).decode(
-                "utf-8", errors="replace"
-            )
-            proc.deleteLater()
-            if stale or path != self.current_path:
-                return  # the user moved on while we rendered
+        def on_frame(png: bytes):
+            got["png"] = png
+
+        def on_done(ok: bool, error: str):
+            if self._render_job is not got["job"] or path != self.current_path:
+                return  # superseded, or the user moved on while we rendered
+            self._render_job = None
+            png = got["png"]
             img = (
                 QImage.fromData(png)
-                if code == 0 and png[:4] == PNG_MAGIC
+                if ok and png and png[:4] == PNG_MAGIC
                 else QImage()
             )
             if not img.isNull():
@@ -600,18 +1360,17 @@ class QuickView(QWidget):
                 cache_write(key, png)
                 self._show_decoded(path, key, img)
             else:
-                log.warning(
-                    "render helper failed (rc=%s): %s",
-                    code, err.strip()[:500],
-                )
+                log.warning("render failed: %s (%s)", path, error[:500])
                 self.clear_content()
                 self.show_fallback(
                     path, self.mime_db.mimeTypeForFile(path).name()
                 )
 
-        proc.finished.connect(finished)
-        proc.start(cmd[0], cmd[1:])
-        watchdog.start(20000)
+        got["job"] = self._render_job = SandboxJob(
+            self.pool, path,
+            {"op": "image", "max_w": max_w, "max_h": max_h},
+            on_frame, on_done, self,
+        )
 
     def _show_decoded(self, path: str, key: str, img: QImage):
         """Display a successfully decoded preview and remember its pixmap."""
@@ -639,70 +1398,397 @@ class QuickView(QWidget):
         self.content.addWidget(label)
         self.set_panel_size(pix.width() + 24, pix.height() + 24)
         self.set_title(f"{os.path.basename(path)}  —  {dims}")
+        self._prefetch_neighbors()
 
-    def show_gif(self, path: str):
-        self.movie = QMovie(path)
-        if not self.movie.isValid():
-            self.show_image(path)
+    # ------------------------------------------------------------- prefetch
+    # Warm the disk cache for the files ← → would show next, so paging
+    # through a folder of photos never waits on a cold decode. Same sandboxed
+    # helper, same cache key — show_image() then hits the disk tier.
+
+    def _neighbor_paths(self) -> list:
+        if len(self.selection) > 1:
+            n = len(self.selection)
+            return [
+                self.selection[(self.sel_index + d) % n] for d in (1, -1)
+            ]
+        if not self.current_path:
+            return []
+        folder = os.path.dirname(self.current_path) or "."
+        try:
+            names = sorted(
+                (n for n in os.listdir(folder) if not n.startswith(".")),
+                key=str.lower,
+            )
+        except OSError:
+            return []
+        cur = os.path.basename(self.current_path)
+        if cur not in names:
+            return []
+        idx = names.index(cur)
+        return [
+            os.path.join(folder, names[(idx + d) % len(names)])
+            for d in (1, -1)
+        ]
+
+    def _prefetch_neighbors(self):
+        max_w, max_h = self.image_fit_box()
+        queue = []
+        for p in self._neighbor_paths():
+            if p == self.current_path:
+                continue
+            mime = self.mime_db.mimeTypeForFile(p).name()
+            # Only what show_image() would render: animations take the
+            # show_anim() path (whose frames this key is never read for)
+            # and everything else has no cache tier to warm.
+            if not mime.startswith("image/") or mime in ANIM_MIMES:
+                continue
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            key = cache_key(p, st, max_w, max_h)
+            if key in self._mem_cache or os.path.exists(
+                os.path.join(CACHE_DIR, key)
+            ):
+                continue
+            queue.append((p, key, max_w, max_h))
+        self._prefetch_queue = queue
+        self._start_next_prefetch()
+
+    def _start_next_prefetch(self):
+        # One worker at a time, so speculative work never competes with a
+        # render the user is actually waiting on for a whole core.
+        if self._prefetch_job is not None or not self._prefetch_queue:
             return
+        path, key, max_w, max_h = self._prefetch_queue.pop(0)
+        got = {"png": None}
+
+        def on_done(ok: bool, _error: str):
+            self._prefetch_job = None
+            png = got["png"]
+            if ok and png and png[:4] == PNG_MAGIC:
+                log.debug("prefetched: %s", path)
+                cache_write(key, png)
+            self._start_next_prefetch()
+
+        self._prefetch_job = SandboxJob(
+            self.pool, path,
+            {"op": "image", "max_w": max_w, "max_h": max_h},
+            lambda png: got.__setitem__("png", png), on_done, self,
+        )
+
+    # ------------------------------------------------------- animation
+    # QMovie decodes an untrusted GIF frame by frame for as long as the
+    # window is open, so it never ran in the daemon safely. Instead the
+    # jailed worker decodes every frame up front and streams them here as
+    # PNGs; playback is then a timer cycling pixmaps the daemon already
+    # holds — no animation parser in this process at all.
+
+    def show_anim(self, path: str):
+        max_w, max_h = self.image_fit_box()
+        self.show_message("Loading preview…")
+        state = {"frames": [], "bytes": 0, "job": None}
+
+        def on_frame(payload: bytes):
+            if self._render_job is not state["job"] or path != self.current_path:
+                return
+            if len(payload) < 4:  # the worker is untrusted: no short reads
+                return
+            delay = struct.unpack(">I", payload[:4])[0]
+            img = QImage.fromData(payload[4:])
+            if img.isNull():
+                return
+            pix = QPixmap.fromImage(img)
+            state["bytes"] += pix.width() * pix.height() * 4
+            state["frames"].append((pix, delay))
+            if len(state["frames"]) == 1:
+                self._begin_anim(path, state)
+            if (
+                len(state["frames"]) >= ANIM_MAX_FRAMES
+                or state["bytes"] >= ANIM_MAX_PIXMAP_BYTES
+            ):
+                # Enough: play what we have rather than let a worker that
+                # streams for ever fill the daemon's heap.
+                log.debug(
+                    "animation capped at %d frames: %s",
+                    len(state["frames"]), path,
+                )
+                self._cancel_render()
+
+        def on_done(ok: bool, error: str):
+            if self._render_job is not state["job"] or path != self.current_path:
+                return
+            self._render_job = None
+            if state["frames"]:
+                return  # partial decodes still animate what arrived
+            log.warning("animation decode failed: %s (%s)", path, error[:500])
+            # Not an animation we can decode — a still frame is still useful.
+            self.clear_content()
+            self.show_image(path)
+
+        state["job"] = self._render_job = SandboxJob(
+            self.pool, path, {"op": "anim", "max_w": max_w, "max_h": max_h},
+            on_frame, on_done, self,
+        )
+
+    def _begin_anim(self, path: str, state: dict):
+        """Show frame 0 and start the cycle; later frames join as they land."""
         label = QLabel()
         label.setAlignment(Qt.AlignCenter)
-        label.setMovie(self.movie)
-        self.movie.start()
-        size = self.movie.frameRect().size()
+        pix, _delay = state["frames"][0]
+        label.setPixmap(pix)
+        self._clear_widgets()
         self.content.addWidget(label)
-        self.set_panel_size(size.width() + 24, size.height() + 24)
+        self.set_panel_size(pix.width() + 24, pix.height() + 24)
+
+        idx = {"i": 0}
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        self.anim_timer = timer
+
+        def tick():
+            frames = state["frames"]
+            if not frames or self.current_path != path:
+                return
+            idx["i"] = (idx["i"] + 1) % len(frames)
+            pix, delay = frames[idx["i"]]
+            label.setPixmap(pix)
+            timer.start(delay)
+
+        timer.timeout.connect(tick)
+        timer.start(state["frames"][0][1])
+
+    # -------------------------------------------------------------- pdf
+    # PDFs render out of process like still images: render_pdf.py streams
+    # page PNGs from inside the bubblewrap jail and the daemon shows page 1
+    # the moment it arrives. Pages land in the disk cache individually, so
+    # a repeat view never touches the PDF parser at all.
 
     def show_pdf(self, path: str):
-        from PySide6.QtPdf import QPdfDocument
-        from PySide6.QtPdfWidgets import QPdfView
+        avail = self.screen_avail()
+        page_w = max(int(avail.width() * 0.55) - 44, 400)
+        try:
+            st = os.stat(path)
+        except OSError as exc:
+            self.show_message(str(exc))
+            return
 
-        view = QPdfView()
-        # Parent the document to the view, not the window: clear_content()
-        # deletes the view, and the loaded document must go with it instead
-        # of accumulating on the long-lived daemon window.
-        doc = QPdfDocument(view)
-        doc.load(path)
-        view.setDocument(doc)
-        view.setPageMode(QPdfView.PageMode.MultiPage)
-        view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
-        view.setStyleSheet("QPdfView { border: none; background-color: #2a2a2e; }")
-        self.content.addWidget(view)
+        def page_key(i: int) -> str:
+            return cache_key(path, st, page_w, 0, f"pdf{i}v2")
+
+        png0 = cache_read(page_key(0))
+        img0 = QImage.fromData(png0) if png0 is not None else QImage()
+        total = 0
+        if not img0.isNull():
+            try:
+                total = int(img0.text("QuickView:PageCount"))
+            except ValueError:
+                pass
+        if total > 0:
+            log.debug("disk cache hit (pdf): %s", path)
+            self._pdf_show_cached(path, page_key, page_w, total, img0)
+        else:
+            if png0 is not None:
+                cache_remove(page_key(0))
+            self._pdf_render(path, page_key, page_w)
+
+    def _pdf_begin_view(self, path: str, total: int, sizes: list):
+        """Swap in the page column, at its full height from the start.
+
+        Every page gets a placeholder of its real size before any pixels
+        arrive, so the scrollable range is final on the first paint. Adding
+        pages as they decoded meant the range grew for a second or two, and
+        a reader who scrolled in that window was clamped to a two-page
+        document and left near the top of a thirty-page one — which looks
+        exactly like the view scrolling itself back up.
+        """
+        self._clear_widgets()
+        col = QWidget()
+        lay = QVBoxLayout(col)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(12)
+        self._pdf_labels = []
+        for w, h in sizes:
+            label = QLabel()
+            label.setFixedSize(w, h)
+            label.setStyleSheet("background: #2a2a2e;")  # an unfilled page
+            lay.addWidget(label, 0, Qt.AlignHCenter)
+            self._pdf_labels.append(label)
+        lay.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("background: #222226;")
+        scroll.setWidget(col)
+        self.content.addWidget(scroll)
         avail = self.screen_avail()
         self.set_panel_size(int(avail.width() * 0.55), int(avail.height() * 0.85))
-        self.set_title(f"{os.path.basename(path)}  —  {doc.pageCount()} pages")
+        pages = f"{total} pages"
+        if total > PDF_MAX_PAGES:
+            pages += f" (showing first {PDF_MAX_PAGES})"
+        self.set_title(f"{os.path.basename(path)}  —  {pages}")
+        return lay
+
+    def _pdf_fill_page(self, i: int, img: QImage):
+        """Put a decoded page into its placeholder."""
+        if not 0 <= i < len(self._pdf_labels):
+            return
+        label = self._pdf_labels[i]
+        if label.size() != img.size():  # an estimate that missed
+            label.setFixedSize(img.size())
+        label.setPixmap(QPixmap.fromImage(img))
+        label.setStyleSheet("")
+
+    def _pdf_show_cached(
+        self, path: str, page_key, page_w: int, total: int, img0: QImage
+    ):
+        # Fill cached pages one per event-loop turn: page 1 paints
+        # immediately and a 50-page reopen never freezes input.
+        count = min(total, PDF_MAX_PAGES)
+        # Sizes come from the cached PNGs' headers — 24 bytes each, no
+        # decode — so the column is the right height before any page is
+        # decoded. A page missing from the cache falls back to page 1's
+        # size; the resumed render corrects it when it lands.
+        fallback = (img0.width(), img0.height())
+        sizes = [fallback]
+        for i in range(1, count):
+            head = cache_read_head(page_key(i))
+            sizes.append((head and png_size(head)) or fallback)
+        lay = self._pdf_begin_view(path, total, sizes)
+        gen = object()
+        self._pdf_gen = gen
+        state = {"i": 0}
+
+        def step():
+            if self._pdf_gen is not gen:
+                return  # the view was cleared under us
+            i = state["i"]
+            if i >= count:
+                return
+            img = (
+                img0 if i == 0
+                else QImage.fromData(cache_read(page_key(i)) or b"")
+            )
+            if img.isNull():
+                # A page is missing (the pruner dropped it, or an earlier
+                # render was cut short when the panel closed). Resume the
+                # render at that page and keep appending to the view we
+                # already built: restarting from page 0 would throw away
+                # what is on screen and jump the reader back to the top.
+                log.debug("pdf cache incomplete at page %d: %s", i, path)
+                self._pdf_gen = None  # stop this stepper; the job takes over
+                self._pdf_render(path, page_key, page_w, start=i, lay=lay)
+                return
+            self._pdf_fill_page(i, img)
+            state["i"] = i + 1
+            QTimer.singleShot(0, step)
+
+        step()
+
+    def _pdf_render(self, path: str, page_key, page_w: int, start: int = 0,
+                    lay=None):
+        """Render pages start.. into the view, streaming from the jail.
+
+        With lay given the pages append to an existing page column (a
+        resumed partial cache); otherwise the column is created when the
+        first page arrives.
+        """
+        self._cancel_render()
+        if lay is None:
+            self._clear_widgets()
+            self.show_message("Loading preview…")
+            self._pdf_labels = []
+        # got: frames received, which is what fixes a page's number;
+        # shown: pages actually on screen. They differ when a page fails to
+        # decode, and the page number must not slide down to fill that gap —
+        # caching the next page under the failed page's key would put every
+        # later page one position too low, and a cache that wrong looks
+        # complete on the next open.
+        state = {"got": 0, "shown": 0, "lay": lay, "job": None}
+
+        def on_frame(png: bytes):
+            if self._render_job is not state["job"] or path != self.current_path:
+                return
+            page = start + state["got"]
+            state["got"] += 1
+            img = QImage.fromData(png)
+            if img.isNull():
+                # Left uncached, so the next open resumes the render here.
+                log.warning("pdf page %d decode failed: %s", page, path)
+                return
+            if state["lay"] is None:
+                try:
+                    total = int(img.text("QuickView:PageCount"))
+                except ValueError:
+                    # No usable tEXt chunk — fall back to what the worker
+                    # said it would stream.
+                    total = state["job"].header.get("count", page + 1)
+                # Page 1's size stands in for the rest until they arrive:
+                # pages of one document almost always match, and any that
+                # does not is corrected as it lands. What matters is that
+                # the column is its full height before the reader scrolls.
+                count = min(total, PDF_MAX_PAGES)
+                state["lay"] = self._pdf_begin_view(
+                    path, total, [(img.width(), img.height())] * count
+                )
+            cache_write(page_key(page), png)
+            self._pdf_fill_page(page, img)
+            state["shown"] += 1
+
+        def on_done(ok: bool, error: str):
+            if self._render_job is not state["job"] or path != self.current_path:
+                return
+            self._render_job = None
+            if state["shown"] == 0 and start == 0:
+                log.warning("pdf render failed: %s (%s)", path, error[:500])
+                self._clear_widgets()
+                self.show_fallback(path, "application/pdf")
+            elif not ok:
+                # Keep the pages that made it; just note the truncation.
+                log.warning("pdf render truncated: %s (%s)", path, error[:500])
+
+        state["job"] = self._render_job = SandboxJob(
+            self.pool, path,
+            {"op": "pdf", "page_w": page_w, "max_pages": PDF_MAX_PAGES,
+             "start": start},
+            on_frame, on_done, self,
+        )
+
+    # ------------------------------------------------------------ media
+    # Audio and video are decoded by media_worker.py inside the jail, which
+    # also owns the audio clock (so Qt keeps doing A/V sync in there). What
+    # arrives here is finished RGB frames in shared memory plus position
+    # updates — the daemon runs no demuxer and no codec.
 
     def show_media(self, path: str, video: bool):
-        from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-        from PySide6.QtMultimediaWidgets import QVideoWidget
-
         wrap = QWidget()
         lay = QVBoxLayout(wrap)
         lay.setContentsMargins(0, 0, 0, 8)
         lay.setSpacing(6)
 
-        # The closures below capture `player` directly: clear_content() nulls
-        # self.player while late signal emissions may still be in flight, and
-        # an AttributeError on None is not an acceptable way to find out.
-        player = QMediaPlayer(self)
-        self.player = player
-        self.audio_out = QAudioOutput(self)
-        player.setAudioOutput(self.audio_out)
-
+        avail = self.screen_avail()
         if video:
-            surface = QVideoWidget()
-            player.setVideoOutput(surface)
+            surface = QLabel()
+            surface.setAlignment(Qt.AlignCenter)
+            surface.setStyleSheet("background: black;")
+            surface.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
             lay.addWidget(surface, 1)
+            max_w = int(avail.width() * 0.6)
+            max_h = int(avail.height() * 0.65)
         else:
+            surface = None
             icon = self.icon_provider.icon(QFileInfo(path))
             art = QLabel()
             art.setAlignment(Qt.AlignCenter)
             art.setPixmap(icon.pixmap(128, 128))
             lay.addWidget(art, 1)
+            # Audio still needs a frame budget for cover art the decoder may
+            # emit; keep it small.
+            max_w, max_h = 640, 640
 
         controls = QHBoxLayout()
         controls.setContentsMargins(14, 0, 14, 0)
-        play_btn = QPushButton("▶")
+        play_btn = QPushButton("⏸")
         play_btn.setObjectName("openBtn")
         play_btn.setFixedWidth(40)
         slider = QSlider(Qt.Horizontal)
@@ -712,59 +1798,174 @@ class QuickView(QWidget):
         controls.addWidget(time_lbl)
         lay.addLayout(controls)
 
-        def fmt(ms):
-            s = ms // 1000
-            return f"{s // 60}:{s % 60:02d}"
-
-        def toggle():
-            if player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-                player.pause()
-                play_btn.setText("▶")
-            else:
-                player.play()
-                play_btn.setText("⏸")
-
-        play_btn.clicked.connect(toggle)
-        player.durationChanged.connect(lambda d: slider.setRange(0, d))
-        player.positionChanged.connect(
-            lambda p: (
-                slider.blockSignals(True),
-                slider.setValue(p),
-                slider.blockSignals(False),
-                time_lbl.setText(f"{fmt(p)} / {fmt(player.duration())}"),
-            )
-        )
-        slider.sliderMoved.connect(player.setPosition)
-
         self.content.addWidget(wrap)
-        avail = self.screen_avail()
         if video:
             self.set_panel_size(int(avail.width() * 0.6), int(avail.height() * 0.65))
         else:
             self.set_panel_size(520, 320)
 
-        player.setSource(QUrl.fromLocalFile(path))
-        player.play()
-        play_btn.setText("⏸")
+        def fmt(ms):
+            s = max(int(ms), 0) // 1000
+            return f"{s // 60}:{s % 60:02d}"
+
+        state = {"duration": 0, "playing": True}
+
+        def on_frame(img: QImage):
+            if surface is None:
+                return
+            pix = QPixmap.fromImage(img)
+            if pix.width() > surface.width() or pix.height() > surface.height():
+                pix = pix.scaled(
+                    surface.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+            surface.setPixmap(pix)
+
+        def on_meta(msg):
+            state["duration"] = msg.get("duration", 0)
+            slider.setRange(0, state["duration"])
+
+        def on_position(msg):
+            p = msg.get("position", 0)
+            slider.blockSignals(True)
+            slider.setValue(p)
+            slider.blockSignals(False)
+            time_lbl.setText(f"{fmt(p)} / {fmt(state['duration'])}")
+
+        def on_eof(_msg=None):
+            state["playing"] = False
+            play_btn.setText("▶")
+
+        def on_error(msg):
+            error = msg if isinstance(msg, str) else msg.get("error", "failed")
+            log.warning("media playback failed: %s (%s)", path, error[:500])
+            if self.current_path != path:
+                return
+            self.clear_content()
+            self.show_fallback(path, self.mime_db.mimeTypeForFile(path).name())
+
+        self.media = MediaSession(
+            self, path, max_w, max_h,
+            {
+                "frame": on_frame, "meta": on_meta, "position": on_position,
+                "eof": on_eof, "error": on_error,
+            },
+        )
+
+        def toggle():
+            state["playing"] = not state["playing"]
+            self.media.send({"t": "play" if state["playing"] else "pause"})
+            play_btn.setText("⏸" if state["playing"] else "▶")
+
+        play_btn.clicked.connect(toggle)
+        slider.sliderMoved.connect(
+            lambda p: self.media.send({"t": "seek", "position": p})
+        )
 
     def show_text(self, path: str):
-        try:
-            with open(path, "rb") as fh:
-                data = fh.read(TEXT_PREVIEW_LIMIT + 1)
-        except OSError as exc:
-            self.show_message(str(exc))
-            return
-        truncated = len(data) > TEXT_PREVIEW_LIMIT
-        text = data[:TEXT_PREVIEW_LIMIT].decode("utf-8", errors="replace")
-        if truncated:
-            text += "\n\n[... truncated ...]"
+        # Read off the event loop: no parser is involved (plain bytes, capped
+        # at 1 MiB), but a file on a stalled NFS or FUSE mount would freeze
+        # the window and the daemon socket with it.
+        self.show_message("Loading preview…")
+        # Size the window now, not when the bytes land. show_message() sizes
+        # the panel for a short message, and a window that is mapped small
+        # and resized a moment later can keep the small size on Wayland —
+        # which is what made the first open of a text file look cramped.
+        self._size_for_text()
+
+        def show(data: bytes, error: str):
+            if path != self.current_path:
+                return  # the user moved on while the read was in flight
+            if error:
+                self._clear_widgets()
+                self.show_message(error)
+                return
+            truncated = len(data) > TEXT_PREVIEW_LIMIT
+            text = data[:TEXT_PREVIEW_LIMIT].decode("utf-8", errors="replace")
+            if truncated:
+                text += "\n\n[... truncated ...]"
+            self._clear_widgets()
+            self._show_text_widget(text)
+
+        # Every in-flight reader is held, not just the newest: previewing a
+        # second file while the first is still blocked on a stalled mount
+        # used to drop the only reference to a running reader.
+        reader = FileReader(path, TEXT_PREVIEW_LIMIT + 1)
+        reader.done.connect(show)
+        reader.done.connect(lambda *_: self._text_readers.discard(reader))
+        self._text_readers.add(reader)
+        QThreadPool.globalInstance().start(reader.run)
+
+    def _size_for_text(self):
+        avail = self.screen_avail()
+        self.set_panel_size(int(avail.width() * 0.5), int(avail.height() * 0.75))
+
+    def _show_text_widget(self, text: str):
         edit = QPlainTextEdit()
         edit.setReadOnly(True)
         edit.setPlainText(text)
         edit.setFrameShape(QFrame.NoFrame)
         self.content.addWidget(edit)
+        self._size_for_text()
+
+    # -------------------------------------------------------------- html
+    # Rendered with QtWebEngine, hardened for untrusted files: JavaScript
+    # and plugins off, every request outside file:/data: blocked before it
+    # leaves the process (no phoning home), and an off-the-record profile
+    # so nothing persists. Chromium's own multi-process sandbox still wraps
+    # the renderer. The titlebar button flips to the plain source view;
+    # QUICKVIEW_STRICT_SANDBOX=1 skips rendering entirely (code view only).
+
+    def show_html(self, path: str):
+        btn = self.titlebar.mode_btn
+        btn.setVisible(True)
+        if self._html_rendered:
+            btn.setText("Code")
+            self._show_html_rendered(path)
+        else:
+            btn.setText("Preview")
+            self.show_text(path)
+
+    def toggle_html_mode(self):
+        self._html_rendered = not self._html_rendered
+        if self.current_path:
+            self.show_file(self.current_path)
+
+    def _show_html_rendered(self, path: str):
+        from PySide6.QtWebEngineCore import (
+            QWebEnginePage, QWebEngineProfile, QWebEngineSettings,
+            QWebEngineUrlRequestInterceptor,
+        )
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+
+        class LocalOnlyInterceptor(QWebEngineUrlRequestInterceptor):
+            def interceptRequest(self, info):
+                if info.requestUrl().scheme() not in ("file", "data"):
+                    info.block(True)
+
+        if self._web_profile is None:
+            # One off-the-record profile for the daemon's lifetime, parented
+            # to the window: pages (parented to their view) can never
+            # outlive it, which a per-view profile can't guarantee — Qt
+            # destroys siblings in creation order and warns "Expect
+            # troubles!" when the profile goes first.
+            self._web_profile = QWebEngineProfile(self)
+            self._web_interceptor = LocalOnlyInterceptor(self._web_profile)
+            self._web_profile.setUrlRequestInterceptor(self._web_interceptor)
+            settings = self._web_profile.settings()
+            for attr in (
+                QWebEngineSettings.WebAttribute.JavascriptEnabled,
+                QWebEngineSettings.WebAttribute.PluginsEnabled,
+                QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls,
+            ):
+                settings.setAttribute(attr, False)
+
+        view = QWebEngineView()
+        page = QWebEnginePage(self._web_profile, view)
+        view.setPage(page)
+        view.load(QUrl.fromLocalFile(path))
+        self.content.addWidget(view)
         avail = self.screen_avail()
-        self.set_panel_size(int(avail.width() * 0.5), int(avail.height() * 0.75))
+        self.set_panel_size(int(avail.width() * 0.6), int(avail.height() * 0.8))
 
     def show_folder(self, path: str):
         try:
@@ -877,6 +2078,9 @@ def main():
         )
         return 1
 
+    # QtWebEngine (HTML previews) is imported lazily on first use, which Qt
+    # only allows if contexts are shareable from the start.
+    QGuiApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setApplicationName("QuickView")
     # Stay resident after the window is dismissed so the next preview is
@@ -934,7 +2138,7 @@ def main():
                 and os.path.realpath(new_paths[0])
                 == os.path.realpath(viewer.current_path)
             ):
-                viewer.dismiss()
+                viewer.dismiss("same path sent again")
             else:
                 viewer.show_files(new_paths)
 
@@ -957,6 +2161,11 @@ def main():
         guard.start(2000)
 
     server.newConnection.connect(on_connection)
+    # Boot the first workers now, while the user is still reaching for the
+    # keyboard: the ~150 ms Qt import in the jail is what previews used to
+    # wait on, and a resident daemon can pay it ahead of time.
+    QTimer.singleShot(0, viewer.pool.prime)
+    app.aboutToQuit.connect(viewer.pool.shutdown)
     if paths:
         viewer.show_files(paths)
     return app.exec()

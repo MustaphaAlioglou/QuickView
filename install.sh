@@ -1,7 +1,52 @@
 #!/usr/bin/env bash
-# Installs QuickView's Dolphin integration for the current user.
+# Installs QuickView for the current user: dependencies, the Dolphin
+# service menu, a launcher on PATH and the background daemon.
 set -e
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---------------------------------------------------------- dependencies
+# bubblewrap is not optional. Every parser runs inside the jail it
+# provides, and without it QuickView refuses to decode anything rather
+# than fall back to parsing untrusted files in its own process.
+if ! command -v bwrap >/dev/null 2>&1; then
+    cat >&2 <<'MSG'
+quickview: bubblewrap (bwrap) is required but was not found.
+
+Every file format is parsed inside a bubblewrap jail; without it
+QuickView will refuse to decode anything. Install it, then re-run:
+
+  Arch          sudo pacman -S bubblewrap
+  Debian/Ubuntu sudo apt install bubblewrap
+  Fedora        sudo dnf install bubblewrap
+  openSUSE      sudo zypper install bubblewrap
+MSG
+    exit 1
+fi
+
+PY="$DIR/.venv/bin/python"
+if [ ! -x "$PY" ]; then
+    # Built with the *system* Python on purpose: Miniconda's bundled
+    # Kerberos libraries conflict with Qt's networking libraries, which
+    # shows up as an import error deep inside PySide6.
+    SYS_PY=/usr/bin/python3
+    [ -x "$SYS_PY" ] || SYS_PY="$(command -v python3 || true)"
+    if [ -z "$SYS_PY" ]; then
+        echo "quickview: no python3 found — install Python 3.10 or newer." >&2
+        exit 1
+    fi
+    if ! "$SYS_PY" -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
+        echo "quickview: Python 3.10 or newer is required ($SYS_PY is older)." >&2
+        exit 1
+    fi
+    echo "Creating the virtualenv in .venv (using $SYS_PY)..."
+    "$SYS_PY" -m venv "$DIR/.venv"
+fi
+
+if ! "$PY" -c "import PySide6" >/dev/null 2>&1; then
+    echo "Installing PySide6 into .venv (a few hundred MB on first run)..."
+    "$PY" -m pip install --quiet --upgrade pip
+    "$PY" -m pip install PySide6
+fi
 
 chmod +x "$DIR/bin/quickview"
 
@@ -9,9 +54,13 @@ chmod +x "$DIR/bin/quickview"
 # the repo can live at any path. KDE requires the .desktop file in
 # servicemenus to carry the executable bit.
 mkdir -p "$HOME/.local/share/kio/servicemenus"
-sed "s|@DIR@|$DIR|" "$DIR/quickview-servicemenu.desktop" \
-    > "$HOME/.local/share/kio/servicemenus/quickview-servicemenu.desktop"
-chmod +x "$HOME/.local/share/kio/servicemenus/quickview-servicemenu.desktop"
+MENU_DEST="$HOME/.local/share/kio/servicemenus/quickview-servicemenu.desktop"
+# Remove any prior entry first. An older install symlinked this path back to
+# the repo template; without this rm, the redirect below would follow that
+# symlink and truncate its own source before sed could read it.
+rm -f "$MENU_DEST"
+sed "s|@DIR@|$DIR|" "$DIR/quickview-servicemenu.desktop" > "$MENU_DEST"
+chmod +x "$MENU_DEST"
 
 # Command on PATH (handy for terminal use: `quickview somefile`).
 mkdir -p "$HOME/.local/bin"
