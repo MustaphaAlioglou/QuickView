@@ -24,7 +24,7 @@ just like Quick Look on a multi-file selection.
 | PDFs                | Scrollable multi-page view                 |
 | HTML                | Rendered page (JS off, network blocked) — titlebar button flips to source view |
 | Video / audio       | Plays inline with a seek bar               |
-| Text / code / CSV   | Monospace text view (first 1 MiB)          |
+| Text / code / CSV   | Monospace view with syntax highlighting (first 1 MiB) |
 | Folders             | Item count and contents listing            |
 | Everything else     | Icon, type, size and modified date         |
 
@@ -36,6 +36,26 @@ just like Quick Look on a multi-file selection.
 | ← / →           | Previous / next file — pages through the selection if several files were passed, otherwise folder siblings |
 | Enter           | Open the file in its default application  |
 | Ctrl+Q          | Quit the background daemon entirely       |
+
+## Syntax highlighting
+
+Source files are coloured by [Pygments][pyg], which runs **inside the jail**
+with everything else — its lexers are regexes, and a file written to make one
+backtrack should take down a throwaway worker, not the daemon that owns your
+window. What comes back is the text plus a list of colour spans; the daemon
+paints ranges and parses nothing.
+
+Files over 256 KiB are shown unhighlighted (lexing 1 MiB takes ~1.5 s, which
+is slower than the preview it decorates). Any Pygments style works:
+
+```bash
+QUICKVIEW_CODE_STYLE=dracula   # gruvbox-dark, nord, monokai, native, …
+```
+
+Set it in the systemd unit's `Environment=` to make it stick. Without Pygments
+installed the preview is plain text — nothing breaks.
+
+[pyg]: https://pygments.org/
 
 ## Preview cache
 
@@ -51,9 +71,11 @@ Clear it with `quickview --clear-cache`.
 
 ## Sandboxed rendering
 
-**Every file format is parsed outside the daemon**, inside a bubblewrap
-jail: still images, PDFs, animations, audio and video. The daemon holds the
-window, the socket and the cache — it does not hold a decoder.
+**Every format QuickView decodes itself is parsed outside the daemon**,
+inside a bubblewrap jail: still images, PDFs, animations, audio, video, and
+the syntax highlighter. The daemon holds the window, the socket and the
+cache — it does not hold a decoder. HTML is the one exception, and it is
+covered under *What still runs in the daemon* below.
 
 The jail has read-only `/usr`, this app folder and the font config, no
 network (`--unshare-all`), no capabilities (`--cap-drop ALL`), no writes,
@@ -76,6 +98,8 @@ now; a cached preview is ~2 ms.
 - **Animations** (GIF/APNG) — every frame is decoded in the jail and
   streamed here; playback is a timer cycling pixmaps the daemon already
   holds, so no animation parser runs in this process.
+- **Text and code** — read and lexed in the jail; what comes back is the
+  text plus colour spans, so no lexer runs in this process.
 - **Audio and video** — `media_worker.py` runs the whole pipeline in the
   jail and plays the audio itself through PipeWire (the one extra socket
   bound in). Because it owns the audio clock, Qt does A/V sync in there;
@@ -96,13 +120,19 @@ Honest list — these are the reads that never reach a jail:
   Chromium's own renderer process, which has its own sandbox; putting it in
   ours would be strictly worse. `QUICKVIEW_STRICT_SANDBOX=1` drops HTML to
   the plain source view if you would rather not rely on that.
-- **Text** — plain bytes, capped at 1 MiB, no parser involved; read on a
-  pool thread so a stalled network mount can't freeze the window.
+- **Text** — only as a fallback. Text normally goes through the jail like
+  everything else (that is where the highlighter runs); when the sandbox is
+  unavailable the daemon reads the bytes itself, capped at 1 MiB, on a pool
+  thread so a stalled network mount can't freeze the window. No parser is
+  involved on that path — the file is shown uncoloured.
 - **MIME sniffing** and the file-type icon — Qt reads magic bytes to decide
   which of the above applies. Bounded matching, no decoding.
 - **The workers' own PNG output**, which the daemon decodes to display. A
   compromised worker could aim a malformed PNG at the daemon's decoder —
   one hardened format instead of every format Qt supports, but not zero.
+  The same decoder runs on disk cache entries, and those live in
+  `~/.cache/quickview/previews/` where anything running as you can rewrite
+  them, so it is the same exposure by a second route.
 
 ## Logging & crash diagnostics
 
@@ -121,6 +151,8 @@ Honest list — these are the reads that never reach a jail:
   `apt install bubblewrap`, `dnf install bubblewrap`.
 - **Python 3.10+**. `install.sh` creates a virtualenv in `.venv/` and
   installs PySide6 into it; no system packages are touched.
+- **Pygments**, optional — installed into the same virtualenv by
+  `install.sh`. Without it, code previews are plain text.
 - PipeWire or PulseAudio, if you want sound in video/audio previews.
 
 ## Install

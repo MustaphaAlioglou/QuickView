@@ -48,6 +48,13 @@ if ! "$PY" -c "import PySide6" >/dev/null 2>&1; then
     "$PY" -m pip install PySide6
 fi
 
+# Optional: syntax highlighting for the text preview. A missing Pygments
+# costs colour, nothing else, so a failure here is not fatal.
+if ! "$PY" -c "import pygments" >/dev/null 2>&1; then
+    echo "Installing Pygments (syntax highlighting)..."
+    "$PY" -m pip install Pygments || echo "  (skipped — previews will be plain text)"
+fi
+
 chmod +x "$DIR/bin/quickview"
 
 # Dolphin context-menu entry ("Quick Look"), rendered from the template so

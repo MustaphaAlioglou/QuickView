@@ -13,8 +13,10 @@ Wayland, and an installer that works on a machine other than the author's.
 
 ### Security
 
-- **Every file format is now parsed outside the daemon.** Images, PDFs,
-  animations, audio and video all run in a bubblewrap jail; the daemon
+- **Every format QuickView decodes itself is now parsed outside the
+  daemon.** Images, PDFs, animations, audio, video and the syntax
+  highlighter all run in a bubblewrap jail (HTML is the exception, and
+  stays in Chromium's own renderer sandbox); the daemon
   keeps the window, the socket and the cache, and holds no decoder. The
   previously documented exceptions — animated GIFs (`QMovie`) and
   audio/video (`QMediaPlayer`) — are gone.
@@ -34,6 +36,19 @@ Wayland, and an installer that works on a machine other than the author's.
 
 ### Added
 
+- **Syntax highlighting in the text preview**, via Pygments — and it runs in
+  the jail, not here. Lexers are regexes; a file written to make one
+  backtrack should cost a throwaway worker, not the process holding the
+  window and the IPC socket. The worker returns the text plus
+  `[start, length, colour]` spans, and the daemon paints ranges: no lexer
+  and no HTML parser on this side. Text previews therefore go through a
+  worker now, with the old in-process read (`show_text_direct`) kept as the
+  fallback for when the sandbox is unavailable.
+
+  Files over 256 KiB stay plain — 83 KiB of Python lexes in ~245 ms, but
+  1 MiB takes ~1.5 s, slower than the preview it decorates. Pick any
+  Pygments style with `QUICKVIEW_CODE_STYLE` (default `one-dark`); with
+  Pygments absent the preview is simply uncoloured.
 - `worker.py` — warm jailed worker for images, PDF pages and animation
   frames, decoding from a passed descriptor.
 - `media_worker.py` — jailed audio/video player. It owns the audio clock
@@ -62,7 +77,8 @@ Wayland, and an installer that works on a machine other than the author's.
   the button, slider and text backgrounds. `WA_TranslucentBackground` stays
   on — it is what makes the rounded corners and drop shadow composite —
   but nothing shows through the panel.
-- Text previews are read on a pool thread, so a file on a stalled NFS or
+- Text previews are read on a pool thread — now the fallback path, since
+  text normally goes through the jail — so a file on a stalled NFS or
   FUSE mount can no longer freeze the window and the daemon socket. The
   window is sized for text up front instead of being resized after the read
   lands.

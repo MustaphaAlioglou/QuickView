@@ -49,6 +49,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QAction, QFont, QGuiApplication, QImage, QKeySequence, QRegion,
     QPainter, QPixmap, QShortcut, QColor, QDesktopServices,
+    QTextCharFormat, QTextCursor,
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -59,6 +60,10 @@ from PySide6.QtWidgets import (
 
 SOCKET_PATH = ipc.socket_path()
 TEXT_PREVIEW_LIMIT = 1024 * 1024  # 1 MiB
+# Any Pygments style name: dracula, gruvbox-dark, nord, monokai, native…
+# one-dark's own background (#282C34) is a shade off the panel's #222226,
+# so its palette sits in this panel without recolouring anything.
+CODE_STYLE = os.environ.get("QUICKVIEW_CODE_STYLE", "one-dark")
 
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".rst", ".log", ".ini", ".cfg", ".conf", ".toml",
@@ -1861,16 +1866,65 @@ class QuickView(QWidget):
             lambda p: self.media.send({"t": "seek", "position": p})
         )
 
+    # ---------------------------------------------------------------- text
+    # Text goes through the jail like everything else, for one reason: the
+    # highlighter. Pygments lexers are regexes, and a file written to make
+    # one backtrack would wedge whichever process runs it — which must not
+    # be the one holding the window and the IPC socket. The worker sends
+    # back the text plus colour spans; the daemon paints ranges and parses
+    # nothing. If the sandbox is unavailable, show_text_direct() below reads
+    # the bytes here instead, unhighlighted.
+
     def show_text(self, path: str):
-        # Read off the event loop: no parser is involved (plain bytes, capped
-        # at 1 MiB), but a file on a stalled NFS or FUSE mount would freeze
-        # the window and the daemon socket with it.
         self.show_message("Loading preview…")
-        # Size the window now, not when the bytes land. show_message() sizes
+        # Size the window now, not when the text lands. show_message() sizes
         # the panel for a short message, and a window that is mapped small
         # and resized a moment later can keep the small size on Wayland —
         # which is what made the first open of a text file look cramped.
         self._size_for_text()
+        state = {"job": None, "shown": False}
+
+        def on_frame(payload: bytes):
+            if self._render_job is not state["job"] or path != self.current_path:
+                return
+            try:
+                doc = json.loads(payload)
+                text = doc["text"]
+                spans = doc.get("spans") or []
+                styles = doc.get("styles") or []
+            except (ValueError, TypeError, KeyError):
+                log.warning("text worker sent a malformed payload: %s", path)
+                return
+            if doc.get("truncated"):
+                text += "\n\n[... truncated ...]"
+            self._clear_widgets()
+            self._show_text_widget(text, spans, styles)
+            state["shown"] = True
+
+        def on_done(ok: bool, error: str):
+            if self._render_job is not state["job"] or path != self.current_path:
+                return
+            self._render_job = None
+            if not state["shown"]:
+                log.debug(
+                    "text worker unavailable (%s) — reading in-process", error[:200]
+                )
+                self.show_text_direct(path)
+
+        state["job"] = self._render_job = SandboxJob(
+            self.pool, path,
+            {
+                "op": "text", "name": os.path.basename(path),
+                "limit": TEXT_PREVIEW_LIMIT, "style": CODE_STYLE,
+            },
+            on_frame, on_done, self,
+        )
+
+    def show_text_direct(self, path: str):
+        """The unhighlighted fallback: read the bytes here, off the event
+        loop. No parser is involved (plain bytes, capped at 1 MiB), but a
+        file on a stalled NFS or FUSE mount would freeze the window and the
+        daemon socket with it."""
 
         def show(data: bytes, error: str):
             if path != self.current_path:
@@ -1899,13 +1953,47 @@ class QuickView(QWidget):
         avail = self.screen_avail()
         self.set_panel_size(int(avail.width() * 0.5), int(avail.height() * 0.75))
 
-    def _show_text_widget(self, text: str):
+    def _show_text_widget(self, text: str, spans=(), styles=()):
         edit = QPlainTextEdit()
         edit.setReadOnly(True)
         edit.setPlainText(text)
         edit.setFrameShape(QFrame.NoFrame)
+        if spans and styles:
+            self._paint_spans(edit, spans, styles)
         self.content.addWidget(edit)
         self._size_for_text()
+
+    @staticmethod
+    def _paint_spans(edit, spans, styles):
+        """Colour [start, length, style] ranges over the document.
+
+        The offsets come from a worker and are applied to a document this
+        process built, so they are checked rather than trusted: a bad index
+        or a range past the end is skipped, not clamped into something that
+        paints the wrong text.
+        """
+        formats = []
+        for colour in styles:
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(colour))
+            formats.append(fmt)
+        doc = edit.document()
+        end = doc.characterCount() - 1
+        cursor = QTextCursor(doc)
+        cursor.beginEditBlock()
+        for span in spans:
+            try:
+                start, length, index = span
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= index < len(formats):
+                continue
+            if not 0 <= start < end or length <= 0 or start + length > end:
+                continue
+            cursor.setPosition(start)
+            cursor.setPosition(start + length, QTextCursor.KeepAnchor)
+            cursor.setCharFormat(formats[index])
+        cursor.endEditBlock()
 
     # -------------------------------------------------------------- html
     # Rendered with QtWebEngine, hardened for untrusted files: JavaScript

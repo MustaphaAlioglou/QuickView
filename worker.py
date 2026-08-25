@@ -24,6 +24,9 @@ length + payload:
 
     daemon -> worker   one JSON request {"op": ..., ...}, with the target
                        file's fd attached as ancillary data
+
+The "text" op is the one that answers with JSON rather than pixels: the file's
+text plus the colour spans of its syntax (see renderers.highlight_text).
     worker -> daemon   one JSON header {"ok": true, "count": N} (or
                        {"ok": false, "error": "..."}), then N frames, each
                        raw PNG bytes, each flushed as it is produced, then
@@ -120,6 +123,13 @@ def main() -> int:
                 send(sock, png)
             if first:  # a zero-page document
                 header(0)
+        elif op == "text":
+            doc = renderers.highlight_text(
+                src, job.get("name", ""), job["limit"],
+                job.get("style", "one-dark"),
+            )
+            header(1)
+            send(sock, json.dumps(doc).encode())
         elif op == "anim":
             first = True
             for count, delay, png in renderers.render_anim(

@@ -22,6 +22,13 @@ fallback path.
 # waiting on. Every encode below uses it.
 PNG_QUALITY = 80
 
+# Above this, a file is shown as plain text. Pygments is a regex machine and
+# the cost climbs with size: measured here, 83 KiB of Python lexes in 109 ms,
+# but 1 MiB takes 1.5 s and yields a quarter of a million tokens — slower
+# than the preview it is meant to decorate, and a payload bigger than the
+# file itself.
+HIGHLIGHT_MAX_BYTES = 256 * 1024
+
 # A PDF may declare any page geometry it likes, and the height is derived
 # from the requested width: a 1 pt x 10000 pt page asks for a ten-million
 # pixel column, i.e. tens of GB of QImage. The jail has no memory limit of
@@ -171,3 +178,76 @@ def render_anim(source, max_w: int, max_h: int, max_frames: int, max_bytes: int)
         yield count, delay, _encode(img)
         if spent >= max_bytes or not movie.jumpToNextFrame():
             break
+
+
+def highlight_text(source, name: str, limit: int, style_name: str = "one-dark") -> dict:
+    """Read a text file and return it with colour spans for its syntax.
+
+    Returns {"text", "truncated", "spans", "styles", "lexer"}. `spans` is a
+    list of [start, length, style_index] over the *characters* of "text";
+    only tokens that differ from the default colour are listed, and adjacent
+    runs sharing a colour are merged, which is what keeps the result far
+    smaller than the file.
+
+    This runs in the jail on purpose. Pygments lexers are regexes, and a file
+    crafted to make one backtrack would otherwise wedge the daemon that owns
+    the window and the IPC socket; in here the worker's watchdog kills it and
+    the daemon shows the file unhighlighted.
+    """
+    data = source.read(limit + 1) if hasattr(source, "read") else open(source, "rb").read(limit + 1)
+    data = bytes(data)
+    truncated = len(data) > limit
+    text = data[:limit].decode("utf-8", errors="replace")
+    # Normalised here, before anything measures an offset: the daemon's
+    # QTextDocument stores "\n" line ends, so lexing "\r\n" text would put
+    # every span one character further off with each line.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    out = {"text": text, "truncated": truncated, "spans": [], "styles": [],
+           "lexer": None}
+    if len(text) > HIGHLIGHT_MAX_BYTES:
+        return out
+    try:
+        from pygments import lex
+        from pygments.lexers import get_lexer_for_filename
+        from pygments.styles import get_style_by_name
+        from pygments.token import Token
+        from pygments.util import ClassNotFound
+    except ImportError:
+        return out  # highlighting is optional; plain text is a fine preview
+
+    try:
+        # By filename only. guess_lexer() runs every lexer's analyse_text()
+        # over the content, which is both slow and a lot more regex surface.
+        # ensurenl=False keeps the text identical to what the daemon shows,
+        # so the offsets below stay valid.
+        lexer = get_lexer_for_filename(name, ensurenl=False, stripnl=False)
+        style = get_style_by_name(style_name)
+    except ClassNotFound:
+        return out  # unknown extension, or a style name that does not exist
+
+    default = style.style_for_token(Token.Text).get("color")
+    palette, styles, spans = {}, [], []
+    # style_for_token() walks the token hierarchy on every call, which costs
+    # more than the lexing does; there are only a handful of distinct token
+    # types in a file, so ask once each.
+    colour_of = {}
+    pos = 0
+    for ttype, value in lex(text, lexer):
+        length = len(value)
+        colour = colour_of.get(ttype)
+        if colour is None:
+            colour = colour_of[ttype] = style.style_for_token(ttype).get("color") or ""
+        if colour and colour != default and value.strip():
+            index = palette.get(colour)
+            if index is None:
+                index = palette[colour] = len(styles)
+                styles.append("#" + colour)
+            if spans and spans[-1][2] == index and spans[-1][0] + spans[-1][1] == pos:
+                spans[-1][1] += length  # one run, not two
+            else:
+                spans.append([pos, length, index])
+        pos += length
+
+    out["spans"], out["styles"], out["lexer"] = spans, styles, lexer.name
+    return out
