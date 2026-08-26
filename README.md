@@ -15,6 +15,39 @@ Multi-select works too: select **several files**, trigger QuickView, and
 **← / →** pages through them — the title shows your position (e.g. `2/5`),
 just like Quick Look on a multi-file selection.
 
+## Features
+
+- **Instant.** A resident daemon keeps Qt loaded, so the panel appears in
+  ~20 ms instead of the ~1 s a cold start costs. The launcher hands the path
+  over in about 4 ms through a compiled client that loads no interpreter.
+- **Every parser runs in a sandbox.** Images, PDFs, animations, audio,
+  video, archives, office documents and the syntax highlighter all decode
+  inside a bubblewrap jail with no network and no filesystem — the file
+  arrives as a file descriptor. HTML is the exception only in that it uses
+  Chromium's own renderer sandbox instead. The daemon holds the window, the
+  socket and the cache, and no decoder at all.
+- **← / →** walks the folder, or pages through a multi-file selection.
+- **Find in PDFs.** **Ctrl+F** searches the text and highlights matches in
+  place; **Enter** / **Shift+Enter** step through them. Phrases work,
+  including across line breaks.
+- **Syntax highlighting** for source files, lexed by Pygments inside the
+  jail and themeable with any Pygments style.
+- **Archives are listed, never extracted**, so an archive that expands to
+  terabytes costs nothing to look at.
+- **Office documents are laid out as pages**, like a PDF, rather than shown
+  as a wall of text.
+- **Media plays inline** with a seek bar, decoded and mixed in the jail.
+- **HTML renders** with JavaScript off and the network blocked, and the
+  titlebar flips to source view.
+- **Two-tier preview cache**, in memory and on disk, so reopening a file is
+  effectively instant; neighbouring images are warmed in the background
+  while you look at the current one.
+- **Anything it cannot preview** still gets a card with its icon, type, size
+  and modified date, so Space is never a dead key.
+- **Self-contained.** `install.sh` builds a virtualenv and touches no system
+  packages. **Enter** opens the file in its real application whenever the
+  preview is not enough.
+
 ## What it previews
 
 | Type                | How                                        |
