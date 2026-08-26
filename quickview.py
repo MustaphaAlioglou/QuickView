@@ -41,6 +41,7 @@ import subprocess
 import sys
 from collections import OrderedDict
 
+import config
 import ipc
 
 from PySide6.QtCore import (
@@ -61,11 +62,15 @@ from PySide6.QtWidgets import (
 )
 
 SOCKET_PATH = ipc.socket_path()
-TEXT_PREVIEW_LIMIT = 1024 * 1024  # 1 MiB
+# User settings, read once at startup — see config.py for the file's shape
+# and why the surface is deliberately this small.
+SETTINGS = config.load()
+
+TEXT_PREVIEW_LIMIT = SETTINGS["text_limit_kb"] * 1024
 # Any Pygments style name: dracula, gruvbox-dark, nord, monokai, native…
 # one-dark's own background (#282C34) is a shade off the panel's #222226,
 # so its palette sits in this panel without recolouring anything.
-CODE_STYLE = os.environ.get("QUICKVIEW_CODE_STYLE", "one-dark")
+CODE_STYLE = SETTINGS["code_style"]
 
 # Listed by container, not by application: a preview of any of these is a
 # listing of what is inside, never an extraction.
@@ -101,17 +106,17 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKER_HELPER = os.path.join(APP_DIR, "worker.py")
 # Cap on rendered pages so a 2000-page (or hostile) PDF can't grind the
 # helper for minutes; the title says when the preview is truncated.
-PDF_MAX_PAGES = 50
+PDF_MAX_PAGES = SETTINGS["pdf_max_pages"]
 
 CACHE_DIR = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
     "quickview", "previews",
 )
-CACHE_CAP_BYTES = 256 * 1024 * 1024
+CACHE_CAP_BYTES = SETTINGS["disk_cache_mb"] * 1024 * 1024
 # The memory tier holds screen-sized pixmaps (~25 MB each on a 4K display),
 # so it must be bounded by bytes, not entry count, in a process that never
 # exits.
-MEM_CACHE_BYTES = 96 * 1024 * 1024
+MEM_CACHE_BYTES = SETTINGS["memory_cache_mb"] * 1024 * 1024
 
 DATA_DIR = os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")),
@@ -299,6 +304,8 @@ _unpruned_bytes = _PRUNE_EVERY_BYTES
 
 def cache_write(key: str, png: bytes):
     global _unpruned_bytes
+    if CACHE_CAP_BYTES <= 0:
+        return  # disk cache turned off in the config file
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
         tmp = os.path.join(CACHE_DIR, f".{key}.tmp")
@@ -2817,6 +2824,10 @@ def main():
 
     setup_logging()
     log.info("daemon starting (pid %d), logging to %s", os.getpid(), LOG_FILE)
+    # A commented template, so the settings are discoverable without going
+    # to the README. Only ever created, never rewritten.
+    if config.write_default_if_missing():
+        log.info("wrote default settings to %s", config.CONFIG_FILE)
 
     # A name containing '/' makes QLocalServer use it as the literal socket
     # path instead of placing it in QDir::tempPath(), keeping the location

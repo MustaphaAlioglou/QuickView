@@ -44,6 +44,8 @@ just like Quick Look on a multi-file selection.
   while you look at the current one.
 - **Anything it cannot preview** still gets a card with its icon, type, size
   and modified date, so Space is never a dead key.
+- **Configurable** through `~/.config/quickview/quickview.conf`, written with
+  its defaults commented in on first run.
 - **Self-contained.** `install.sh` builds a virtualenv and touches no system
   packages. **Enter** opens the file in its real application whenever the
   preview is not enough.
@@ -84,12 +86,14 @@ paints ranges and parses nothing.
 Files over 256 KiB are shown unhighlighted (lexing 1 MiB takes ~1.5 s, which
 is slower than the preview it decorates). Any Pygments style works:
 
-```bash
-QUICKVIEW_CODE_STYLE=dracula   # gruvbox-dark, nord, monokai, native, …
+```ini
+# ~/.config/quickview/quickview.conf
+[preview]
+code_style = dracula   # gruvbox-dark, nord, monokai, native, …
 ```
 
-Set it in the systemd unit's `Environment=` to make it stick. Without Pygments
-installed the preview is plain text — nothing breaks.
+See [Settings](#settings) below. Without Pygments installed the preview is
+plain text — nothing breaks.
 
 [pyg]: https://pygments.org/
 
@@ -197,6 +201,33 @@ Honest list — these are the reads that never reach a jail:
 - `~/.local/share/quickview/crash.log` — faulthandler tracebacks if a
   native crash (e.g. inside a Qt decoder) takes the process down.
 
+## Settings
+
+`~/.config/quickview/quickview.conf`, written with the defaults commented in
+the first time the daemon starts. Editing it takes effect on the next
+restart:
+
+```bash
+systemctl --user restart quickview.service
+```
+
+| Setting | Default | What it does |
+|---------|---------|--------------|
+| `[preview] code_style` | `one-dark` | Pygments style for source files |
+| `[preview] text_limit_kb` | `1024` | How much of a text file to read before truncating |
+| `[preview] pdf_max_pages` | `50` | Pages rendered from a PDF or office document |
+| `[cache] disk_cache_mb` | `256` | Rendered previews kept on disk; `0` disables it |
+| `[cache] memory_cache_mb` | `96` | Decoded pixmaps kept in memory |
+
+Each has a matching `QUICKVIEW_*` environment variable (`QUICKVIEW_CODE_STYLE`,
+`QUICKVIEW_PDF_MAX_PAGES`, …) that wins over the file, which is handy for
+trying a value without editing anything. Out-of-range numbers are clamped and
+an unreadable file falls back to the defaults, so a typo never stops the
+daemon starting.
+
+Everything else in the code is a safety bound on untrusted input — frame
+sizes, frame counts, worker timeouts — and is deliberately not configurable.
+
 ## Requirements
 
 - **KDE Plasma** with Dolphin (Wayland or X11). Nothing else in the desktop
@@ -249,6 +280,7 @@ Then bind Space in Dolphin (one-time):
   was available at install time. Correct, just ~15 ms slower per preview
 - `ipc.py` — the client↔daemon wire format, and the single implementation
   of path normalization
+- `config.py` — the handful of user settings, and their defaults
 - `worker.py` — the jailed preview worker: images, PDF pages and animation
   frames, decoding from a passed file descriptor
 - `media_worker.py` — the jailed player: decodes and plays audio/video, and

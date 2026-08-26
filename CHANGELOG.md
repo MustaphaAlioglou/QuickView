@@ -9,6 +9,16 @@ project has no version tags yet, so entries are dated.
 
 ### Added
 
+- **A settings file at `~/.config/quickview/quickview.conf`**, written with
+  its defaults commented in the first time the daemon starts and never
+  rewritten afterwards. It carries the syntax-highlighting style, the text
+  preview limit, the PDF page cap and both cache sizes; each still has a
+  `QUICKVIEW_*` environment variable that wins over the file. Previously the
+  one setting that existed had to go in the systemd unit's `Environment=`,
+  which `install.sh` regenerates on every run — so it was silently lost on
+  the next upgrade. Out-of-range values are clamped and an unparseable file
+  falls back to the defaults. The many other constants are safety bounds on
+  untrusted input and stay in the code deliberately.
 - **Ctrl+F finds text in a PDF preview.** Matches are highlighted in place
   and Enter / Shift+Enter step through them, scrolling each into view. The
   daemon owns no PDF parser, so the query goes to a jailed worker (a new
