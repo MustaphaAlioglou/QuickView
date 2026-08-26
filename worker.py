@@ -25,12 +25,21 @@ length + payload:
     daemon -> worker   one JSON request {"op": ..., ...}, with the target
                        file's fd attached as ancillary data
 
-The "text" op is the one that answers with JSON rather than pixels: the file's
-text plus the colour spans of its syntax (see renderers.highlight_text).
+The "text" op answers with JSON rather than pixels: the file's text plus the
+colour spans of its syntax (see renderers.highlight_text). So does
+"pdfsearch", which returns the rectangles of a query's matches already in
+page pixels.
     worker -> daemon   one JSON header {"ok": true, "count": N} (or
                        {"ok": false, "error": "..."}), then N frames, each
-                       raw PNG bytes, each flushed as it is produced, then
-                       a zero-length frame as the end-of-stream marker
+                       flushed as it is produced, then a zero-length frame
+                       as the end-of-stream marker
+
+Frames are encoded images (PNG, or JPEG for the cache copy of a
+photograph), with one exception: the "image" op sends two, the first being
+raw ARGB32 pixels — the header carries "w", "h", "stride", "fmt" and
+"orig" — and the second the encoded copy for the daemon's disk cache.
+Compressing pixels to move them between two processes on one machine cost
+more than the decode did; see renderers.raw_frame and encode_cached.
 
 The marker is what tells the daemon a stream ended because it was finished
 rather than because the worker died: once the header has gone out there is
@@ -109,9 +118,31 @@ def main() -> int:
 
     try:
         if op == "image":
-            png = renderers.render_image(src, job["max_w"], job["max_h"])
-            header(1)
-            send(sock, png)
+            # Two frames, in this order on purpose. The raw pixels let the
+            # daemon paint immediately; the encoded copy that follows is
+            # only for its disk cache, so that cost lands in here, after the
+            # image is already on screen, instead of in front of it.
+            img, orig = renderers.decode_image(src, job["max_w"], job["max_h"])
+            # "raw": False is the daemon's prefetch, which only warms the
+            # disk cache — sending it pixels it will drop is megabytes of
+            # copying for nothing.
+            want_raw = job.get("raw", True)
+            geom = {}
+            raw = b""
+            if want_raw:
+                raw, geom = renderers.raw_frame(img)
+            state["header"] = True
+            send(sock, json.dumps(
+                {"ok": True, "count": 2 if want_raw else 1,
+                 "orig": orig, **geom}
+            ).encode())
+            if want_raw:
+                send(sock, raw)
+            # Read back by the daemon's cache-hit path, which still takes
+            # the dimensions from this chunk — Qt carries it through JPEG as
+            # a comment marker as well as through PNG's tEXt.
+            img.setText("QuickView:OrigSize", orig)
+            send(sock, renderers.encode_cached(img))
         elif op == "pdf":
             first = True
             for count, png in renderers.render_pdf(
@@ -130,6 +161,14 @@ def main() -> int:
             )
             header(1)
             send(sock, json.dumps(doc).encode())
+        elif op == "pdfsearch":
+            # Answers with JSON, not pixels: the rectangles are already in
+            # page pixels, so the daemon paints them without owning a parser
+            # or repeating the render geometry.
+            header(1)
+            send(sock, json.dumps(renderers.search_pdf(
+                src, job.get("query", ""), job["page_w"], job["max_pages"],
+            )).encode())
         elif op == "archive":
             # Takes the raw descriptor, not the QFile: zipfile/tarfile want a
             # Python file object and the external listers read /dev/fd.

@@ -21,6 +21,8 @@ fallback path.
 # default for ~20% larger files — the right trade for a preview a human is
 # waiting on. Every encode below uses it.
 PNG_QUALITY = 80
+# Cache-only, and only for images with no alpha — see encode_cached.
+JPEG_QUALITY = 85
 
 # Above this, a file is shown as plain text. Pygments is a regex machine and
 # the cost climbs with size: measured here, 83 KiB of Python lexes in 109 ms,
@@ -53,23 +55,68 @@ ARCHIVE_TOOLS = (
 # pixel column, i.e. tens of GB of QImage. The jail has no memory limit of
 # its own, so the bound has to be here.
 PDF_MAX_PAGE_PX = 10000
+# A search that matches half the document is not a useful answer, and every
+# hit costs a getSelectionAtIndex call and a rectangle on the wire.
+PDF_MAX_HITS = 500
 
 
-def _encode(img) -> bytes:
+def _encode(img, fmt: str = "PNG", quality: int = PNG_QUALITY) -> bytes:
     from PySide6.QtCore import QBuffer, QIODevice
 
     buf = QBuffer()
     buf.open(QIODevice.OpenModeFlag.WriteOnly)
-    if not img.save(buf, "PNG", PNG_QUALITY):
-        raise RuntimeError("PNG encode failed")
+    if not img.save(buf, fmt, quality):
+        raise RuntimeError(f"{fmt} encode failed")
     return bytes(buf.data())
 
 
-def render_image(source, max_w: int, max_h: int) -> bytes:
-    """Decode one image, downscaled to fit max_w x max_h, as PNG bytes.
+def encode_cached(img) -> bytes:
+    """Encode a preview for the daemon's disk cache.
 
-    The original dimensions travel along in a "QuickView:OrigSize" tEXt
-    chunk. `source` is a path or a QIODevice.
+    JPEG for photographs: a preview-sized image costs ~24 ms to write and
+    ~11 ms to read back against PNG's ~111 and ~37, and lands in a tenth of
+    the space, so the fixed cache holds ten times as many previews before
+    it starts evicting. The loss at this quality is invisible at preview
+    size, and this is a cache — the original is never touched.
+
+    PNG whenever the image carries alpha, because JPEG has none and a
+    transparent logo would come back on a black square. Qt writes the
+    "QuickView:OrigSize" tEXt chunk into a JPEG comment marker, so the
+    dimensions the cache-hit path reads survive either way.
+    """
+    if img.hasAlphaChannel():
+        return _encode(img)
+    return _encode(img, "JPG", JPEG_QUALITY)
+
+
+def raw_frame(img) -> tuple:
+    """(pixel bytes, geometry) for handing an image over a local socket.
+
+    PNG costs ~100 ms to write and ~30 ms to read back for a preview-sized
+    photo — more than the decode it follows — and buys nothing between two
+    processes on the same machine. Raw ARGB32 is ~0.4 ms each way. BMP is
+    the obvious middle ground and is wrong: Qt's BMP writer drops the alpha
+    channel, so transparent PNGs and SVGs would come back opaque.
+
+    The geometry travels beside the bytes because the receiver cannot infer
+    stride: Qt pads rows, so bytesPerLine is not always width * 4.
+    """
+    from PySide6.QtGui import QImage
+
+    if img.format() != QImage.Format.Format_ARGB32:
+        img = img.convertToFormat(QImage.Format.Format_ARGB32)
+    return bytes(img.constBits()), {
+        "w": img.width(), "h": img.height(),
+        "stride": img.bytesPerLine(), "fmt": "argb32",
+    }
+
+
+def decode_image(source, max_w: int, max_h: int) -> tuple:
+    """(QImage, "W×H") — the decode alone, without choosing a wire format.
+
+    Split out of render_image so a caller that wants both the raw pixels
+    and an encoded copy (the worker: pixels to show now, a cache entry to
+    keep) pays for one decode instead of two.
     """
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QImageIOHandler, QImageReader
@@ -105,8 +152,164 @@ def render_image(source, max_w: int, max_h: int) -> bytes:
         orig = f"{img.width()}×{img.height()}"
     if img.width() > max_w or img.height() > max_h:
         img = img.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    return img, orig
+
+
+def render_image(source, max_w: int, max_h: int) -> bytes:
+    """Decode one image, downscaled to fit max_w x max_h, as PNG bytes.
+
+    The original dimensions travel along in a "QuickView:OrigSize" tEXt
+    chunk. `source` is a path or a QIODevice.
+    """
+    img, orig = decode_image(source, max_w, max_h)
     img.setText("QuickView:OrigSize", orig)
     return _encode(img)
+
+
+def _open_pdf(source):
+    """Load a PDF, raising rather than returning a half-built document."""
+    from PySide6.QtPdf import QPdfDocument
+
+    doc = QPdfDocument()
+    # The path overload returns an Error; the QIODevice one returns None and
+    # reports through error()/status() instead. Ask the document either way.
+    err = doc.load(source)
+    if err is None:
+        err = doc.error()
+    if err != QPdfDocument.Error.None_:
+        raise RuntimeError(f"pdf load failed: {err}")
+    return doc
+
+
+def _page_px(doc, i: int, page_w: int) -> tuple:
+    """(width, height) in pixels for page i rendered at page_w.
+
+    Shared by render_pdf and search_pdf on purpose. Search maps a match's
+    bounding rectangle from points into this pixel space, so the two must
+    agree exactly — if they drift, every highlight lands in the wrong place,
+    and only on the page shapes that hit the clamps below.
+    """
+    pt = doc.pagePointSize(i)
+    w = max(min(page_w, PDF_MAX_PAGE_PX), 1)
+    h = max(1, round(w * pt.height() / max(pt.width(), 1)))
+    if h > PDF_MAX_PAGE_PX:
+        # Absurdly tall page: keep the aspect ratio and let it be narrow
+        # rather than allocating by its declared height.
+        h = PDF_MAX_PAGE_PX
+        w = max(1, round(h * pt.width() / max(pt.height(), 1)))
+    return w, h
+
+
+def _flatten(text: str, drop_spaces: bool = False) -> tuple:
+    """Casefold and normalize whitespace, keeping a map back to the original.
+
+    A PDF's text layer breaks lines with \r\n, so a phrase the reader sees
+    as continuous ("degree of Master") is not continuous in the string.
+    Collapsing every run of whitespace to one space makes the phrase
+    findable; the returned list maps each flattened index back to its index
+    in `text`, which is what getSelectionAtIndex needs to place the match.
+
+    drop_spaces removes whitespace altogether, for the fallback described in
+    search_pdf: some PDFs position their glyphs instead of emitting spaces,
+    and Qt's extractor hands those back as "accordingtoyoursoftskills".
+    """
+    out, back, space = [], [], False
+    for i, ch in enumerate(text):
+        if ch.isspace():
+            if drop_spaces:
+                continue
+            if out and not space:  # one space per run, never a leading one
+                out.append(" ")
+                back.append(i)
+                space = True
+            continue
+        space = False
+        low = ch.casefold()
+        # casefold can expand (ß -> ss); every produced char points at the
+        # single source character it came from, so the map stays aligned.
+        out.append(low)
+        back.extend([i] * len(low))
+    while out and out[-1] == " ":
+        out.pop()
+        back.pop()
+    return "".join(out), back
+
+
+def search_pdf(source, query: str, page_w: int, max_pages: int,
+               max_hits: int = PDF_MAX_HITS) -> dict:
+    """Case-insensitive substring search, as rectangles in page pixels.
+
+    Returns {"matches": [{"page": n, "rects": [[x, y, w, h], ...]}, ...],
+    "capped": bool} — one entry per match, and one rectangle per line it
+    spans. The
+    daemon holds no PDF parser, so the text extraction and the geometry both
+    happen in here and it receives something it can paint directly.
+
+    Only the pages the viewer actually shows are searched: a hit reported on
+    page 73 of a document that stops rendering at 50 is worse than silence.
+    """
+    if not _flatten(query)[0]:
+        return {"matches": [], "capped": False}
+
+    doc = _open_pdf(source)
+    pages = [doc.getAllText(i).text() for i in range(min(doc.pageCount(),
+                                                        max_pages))]
+    out = _scan(doc, pages, query, page_w, max_hits, drop_spaces=False)
+    # Nothing found and the query has a space in it? Try again ignoring
+    # spaces entirely. Qt's getAllText does not always reconstruct the gaps
+    # between glyphs, so a page that reads "soft skills" can extract as
+    # "softskills" and no amount of whitespace *collapsing* will match it.
+    # Only as a fallback, and only for multi-word queries: matching without
+    # spaces would otherwise let "the rap" hit "therapy".
+    if not out["matches"] and any(c.isspace() for c in query.strip()):
+        loose = _scan(doc, pages, query, page_w, max_hits, drop_spaces=True)
+        if loose["matches"]:
+            loose["loose"] = True
+            return loose
+    return out
+
+
+def _scan(doc, pages: list, query: str, page_w: int, max_hits: int,
+          drop_spaces: bool) -> dict:
+    """One search pass over already-extracted page text."""
+    needle = _flatten(query, drop_spaces)[0]
+    matches = []
+    if not needle:
+        return {"matches": [], "capped": False, "loose": False}
+    for i, page_text in enumerate(pages):
+        hay, back = _flatten(page_text, drop_spaces)
+        if not hay:
+            continue
+        w_px, h_px = _page_px(doc, i, page_w)
+        pt = doc.pagePointSize(i)
+        sx = w_px / max(pt.width(), 1)
+        sy = h_px / max(pt.height(), 1)
+        at = hay.find(needle)
+        while at != -1:
+            # back[] maps flattened offsets to real ones: a phrase broken
+            # over a line is contiguous in `hay` but not in the page text.
+            start = back[at]
+            end = back[at + len(needle) - 1]
+            sel = doc.getSelectionAtIndex(i, start, end - start + 1)
+            if sel.isValid():
+                # bounds(), not boundingRectangle(): a match crossing a line
+                # gets one polygon per line, where the single bounding box
+                # would be a slab covering both lines and the gap between.
+                rects = []
+                for poly in sel.bounds():
+                    r = poly.boundingRect()
+                    rects.append([
+                        round(r.x() * sx), round(r.y() * sy),
+                        max(1, round(r.width() * sx)),
+                        max(1, round(r.height() * sy)),
+                    ])
+                if rects:
+                    matches.append({"page": i, "rects": rects})
+                    if len(matches) >= max_hits:
+                        return {"matches": matches, "capped": True,
+                                "loose": False}
+            at = hay.find(needle, at + 1)
+    return {"matches": matches, "capped": False, "loose": False}
 
 
 def render_pdf(source, page_w: int, max_pages: int, start: int = 0):
@@ -121,28 +324,12 @@ def render_pdf(source, page_w: int, max_pages: int, start: int = 0):
     """
     from PySide6.QtCore import QSize, Qt
     from PySide6.QtGui import QImage, QPainter
-    from PySide6.QtPdf import QPdfDocument
 
-    doc = QPdfDocument()
-    # The path overload returns an Error; the QIODevice one returns None and
-    # reports through error()/status() instead. Ask the document either way.
-    err = doc.load(source)
-    if err is None:
-        err = doc.error()
-    if err != QPdfDocument.Error.None_:
-        raise RuntimeError(f"pdf load failed: {err}")
-
+    doc = _open_pdf(source)
     total = doc.pageCount()
     count = min(total, max_pages)
     for i in range(max(start, 0), count):
-        pt = doc.pagePointSize(i)
-        w = max(min(page_w, PDF_MAX_PAGE_PX), 1)
-        h = max(1, round(w * pt.height() / max(pt.width(), 1)))
-        if h > PDF_MAX_PAGE_PX:
-            # Absurdly tall page: keep the aspect ratio and let it be
-            # narrow rather than allocating by its declared height.
-            h = PDF_MAX_PAGE_PX
-            w = max(1, round(h * pt.width() / max(pt.height(), 1)))
+        w, h = _page_px(doc, i, page_w)
         rendered = doc.render(i, QSize(w, h))
         if rendered.isNull():
             raise RuntimeError(f"render failed on page {i}")

@@ -7,8 +7,51 @@ project has no version tags yet, so entries are dated.
 
 ## 2026-08-26
 
+### Added
+
+- **Ctrl+F finds text in a PDF preview.** Matches are highlighted in place
+  and Enter / Shift+Enter step through them, scrolling each into view. The
+  daemon owns no PDF parser, so the query goes to a jailed worker (a new
+  `pdfsearch` op) that extracts the text and answers with match rectangles
+  already in page pixels — the daemon only paints them. Multi-word phrases
+  work, including across a line break: a PDF's text layer breaks lines with
+  `\r\n`, so the page text is matched with whitespace collapsed and each
+  match is highlighted with one rectangle per line it spans rather than one
+  box swallowing the gap between them. Some PDFs position their glyphs
+  instead of emitting spaces, and Qt extracts those as
+  "accordingtoyoursoftskills"; when an exact multi-word search finds
+  nothing, it retries ignoring whitespace altogether and marks the result
+  `≈` so an approximate hit is never mistaken for a literal one. Search
+  covers the pages the viewer actually shows (the first 50), because a hit
+  reported on page 73 of a document that stops rendering at 50 is worse
+  than silence. Office documents share the PDF view but are laid out through
+  `QTextDocument`, so they do not get the find row.
+
 ### Performance
 
+- **Photo previews open about 2.4x faster: ~338 ms to ~127 ms** (median of
+  15 cold renders across five photos, measured from the daemon's own
+  `preview:` -> `rendered:` log). The worker used to PNG-compress every
+  decoded image to hand it down a Unix socket to a process that immediately
+  decompressed it — ~107 ms to write and ~31 ms to read back, more than the
+  JPEG decode in front of it. It now sends raw ARGB32 pixels (~0.4 ms each
+  way) and the daemon paints as soon as they land. The copy the disk cache
+  wants still gets made, but in the jailed worker *after* the image is on
+  screen, so it is off the user-visible path. BMP would have been the
+  obvious middle ground and is wrong: Qt's BMP writer drops the alpha
+  channel, so transparent PNGs and SVGs would have come back opaque.
+- **Reopening a photo is ~3.4x faster: ~54 ms to ~16 ms**, and the disk
+  cache holds ten times as much. Preview images with no alpha are cached as
+  JPEG rather than PNG — ~24 ms to write and ~11 ms to read back against
+  ~111 and ~37, at a tenth of the size, so the 256 MB cap now fits over a
+  thousand previews instead of ~110. Images that carry alpha stay PNG,
+  because JPEG has none and a transparent logo would come back on a black
+  square. The `QuickView:OrigSize` tEXt chunk survives as a JPEG comment
+  marker, so the cache-hit path is unchanged, and existing PNG entries stay
+  readable.
+- Prefetching a neighbouring image no longer ships pixels it throws away —
+  it warms the disk cache and displays nothing, so it asks for the encoded
+  frame alone.
 - **The fast path is now a compiled client (`client.rs`).** Handing a path
   to the warm daemon cost ~29 ms, essentially all of it Python interpreter
   startup — `urllib.parse` alone was ~6 ms of it. The Rust client does the

@@ -37,6 +37,7 @@ just like Quick Look on a multi-file selection.
 | Space / Esc / Q | Close the preview                         |
 | ← / →           | Previous / next file — pages through the selection if several files were passed, otherwise folder siblings |
 | Enter           | Open the file in its default application  |
+| Ctrl+F          | Find text in a PDF, words or phrases — Enter and Shift+Enter step through matches, Esc closes |
 | Ctrl+Q          | Quit the background daemon entirely       |
 
 ## Syntax highlighting

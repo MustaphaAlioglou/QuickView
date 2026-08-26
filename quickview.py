@@ -44,7 +44,7 @@ from collections import OrderedDict
 import ipc
 
 from PySide6.QtCore import (
-    Qt, QUrl, QPoint, QSize, QObject, QSocketNotifier, QThreadPool,
+    Qt, QUrl, QPoint, QRect, QSize, QObject, QSocketNotifier, QThreadPool,
     QTimer, QFileInfo, QMimeDatabase, QStandardPaths, Signal,
 )
 from PySide6.QtGui import (
@@ -55,8 +55,9 @@ from PySide6.QtGui import (
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QFileIconProvider, QFrame, QHBoxLayout, QLabel,
-    QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSlider,
-    QStackedLayout, QVBoxLayout, QWidget, QGraphicsDropShadowEffect,
+    QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
+    QSlider, QStackedLayout, QVBoxLayout, QWidget,
+    QGraphicsDropShadowEffect,
 )
 
 SOCKET_PATH = ipc.socket_path()
@@ -120,8 +121,10 @@ LOG_FILE = os.path.join(DATA_DIR, "quickview.log")
 LOG_MAX_BYTES = 5 * 1024 * 1024
 
 PNG_MAGIC = b"\x89PNG"
-# Sanity bound on one frame of a helper's stdout stream. A screen-sized PNG
-# page is a couple of MB; anything past this is a broken or hostile helper.
+JPEG_MAGIC = b"\xff\xd8\xff"
+# Sanity bound on one frame of a helper's stdout stream. The largest a
+# legitimate frame gets is a screen-sized raw image — 21 MB on a 4K panel —
+# so anything past this is a broken or hostile helper.
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 # Frame slots the media worker cycles through in shared memory.
 MEDIA_SLOTS = 2
@@ -175,6 +178,51 @@ def cache_key(
     return hashlib.sha256(raw.encode()).hexdigest() + ".png"
 
 
+class MatchOverlay(QWidget):
+    """Translucent highlight boxes drawn over one rendered PDF page.
+
+    Parented to the page's QLabel and sized to it, so the rectangles the
+    worker sends — already in page pixels — need no further transform. The
+    widget is transparent to clicks so it never swallows a drag on the page
+    underneath.
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._rects = []
+        self._current = ()  # indices of the active match, empty on this page
+
+    def set_matches(self, rects: list, current=None):
+        """`current` is the range of indices belonging to the active match."""
+        self._rects = rects
+        self._current = current or ()
+        self.update()
+
+    def paintEvent(self, _event):
+        if not self._rects:
+            return
+        painter = QPainter(self)
+        for i, (x, y, w, h) in enumerate(self._rects):
+            # The match the reader is standing on is opaque enough to find
+            # at a glance; the rest are a soft wash so the page stays legible.
+            painter.fillRect(
+                QRect(x, y, w, h),
+                QColor(255, 190, 40, 200) if i in self._current
+                else QColor(255, 220, 90, 90),
+            )
+        painter.end()
+
+
+def is_cache_blob(data: bytes) -> bool:
+    """Whether a worker frame is an encodable image for the disk cache.
+
+    The image op's cache frame is JPEG for photographs and PNG when the
+    image has alpha (see renderers.encode_cached), so both magics count.
+    """
+    return data[:4] == PNG_MAGIC or data[:3] == JPEG_MAGIC
+
+
 def png_size(data: bytes) -> tuple[int, int] | None:
     """(width, height) from a PNG's IHDR, without decoding the image."""
     if len(data) < 24 or data[:4] != PNG_MAGIC or data[12:16] != b"IHDR":
@@ -182,6 +230,33 @@ def png_size(data: bytes) -> tuple[int, int] | None:
     w = int.from_bytes(data[16:20], "big")
     h = int.from_bytes(data[20:24], "big")
     return (w, h) if w > 0 and h > 0 else None
+
+
+def image_from_raw(data: bytes, header: dict) -> QImage:
+    """Rebuild a QImage from the worker's raw ARGB32 frame.
+
+    The geometry is worker-supplied, and the worker is the process that
+    just parsed a hostile file, so it is checked against the buffer before
+    Qt is pointed at it: an overlarge stride or a short frame would have
+    QImage read past the end of the allocation. Returns a null QImage when
+    anything does not line up, which the caller already treats as a failed
+    render.
+    """
+    try:
+        w = int(header.get("w", 0))
+        h = int(header.get("h", 0))
+        stride = int(header.get("stride", 0))
+    except (TypeError, ValueError):
+        return QImage()
+    if header.get("fmt") != "argb32":
+        return QImage()
+    if w <= 0 or h <= 0 or stride < w * 4:
+        return QImage()
+    if len(data) < stride * h:
+        return QImage()
+    # .copy() because the QImage above only borrows `data`, which is a
+    # Python object free to be collected the moment this returns.
+    return QImage(data, w, h, stride, QImage.Format.Format_ARGB32).copy()
 
 
 def cache_read_head(key: str, n: int = 24) -> bytes | None:
@@ -985,6 +1060,16 @@ class QuickView(QWidget):
         self._prefetch_queue = []  # (path, key, job) awaiting a warm render
         self._pdf_gen = None  # token invalidating in-flight page appends
         self._pdf_labels = []  # one placeholder per page of the open PDF
+        self._pdf_overlays = []  # a MatchOverlay per page, for find results
+        self._find_bar = None    # the Ctrl+F row, while a PDF is showing
+        self._find_scroll = None  # the page column's QScrollArea
+        self._find_path = None   # the PDF find is currently bound to
+        self._find_hits = []     # [[page, x, y, w, h], ...] for the query
+        self._find_of = None     # the query _find_hits belongs to
+        self._find_loose = False  # hits came from the spaces-ignored pass
+        self._find_at = -1       # index into _find_hits
+        self._find_page_w = 0    # pixel width the hits were computed for
+        self._find_job = None
         self._text_readers = set()  # readers still on a pool thread
         self._html_rendered = True  # HTML mode: rendered page vs. source
         self._office_text = False   # office mode: thumbnail vs. extracted text
@@ -1055,16 +1140,27 @@ class QuickView(QWidget):
             }
         """)
 
-        for keys, fn in (
-            (Qt.Key_Space, lambda: self.dismiss("space")),
-            (Qt.Key_Escape, lambda: self.dismiss("escape")),
-            (Qt.Key_Q, lambda: self.dismiss("q")),
-            (Qt.Key_Left, lambda: self.step_sibling(-1)),
-            (Qt.Key_Right, lambda: self.step_sibling(+1)),
-            (Qt.Key_Return, self.open_externally),
-            (Qt.Key_Enter, self.open_externally),
-        ):
+        # Kept in a list because every one of them is a *single* key, and a
+        # QShortcut outranks the key events of a focused child widget: with
+        # the find field open, typing a space or a "q" would dismiss the
+        # preview and the arrows would switch files. _set_nav_shortcuts()
+        # turns them off for exactly as long as that field has focus.
+        self._nav_shortcuts = [
             QShortcut(QKeySequence(keys), self, activated=fn)
+            for keys, fn in (
+                (Qt.Key_Space, lambda: self.dismiss("space")),
+                (Qt.Key_Escape, lambda: self.dismiss("escape")),
+                (Qt.Key_Q, lambda: self.dismiss("q")),
+                (Qt.Key_Left, lambda: self.step_sibling(-1)),
+                (Qt.Key_Right, lambda: self.step_sibling(+1)),
+                (Qt.Key_Return, self.open_externally),
+                (Qt.Key_Enter, self.open_externally),
+            )
+        ]
+        QShortcut(
+            QKeySequence(Qt.CTRL | Qt.Key_F), self,
+            activated=self.open_find,
+        )
         QShortcut(
             QKeySequence(Qt.CTRL | Qt.Key_Q), self,
             activated=QApplication.instance().quit,
@@ -1224,6 +1320,19 @@ class QuickView(QWidget):
         # streaming, so it must not go through clear_content().
         self._pdf_gen = None
         self._pdf_labels = []  # they are about to be deleted with the view
+        self._pdf_overlays = []
+        # The find row is a child of the view being torn down, so drop every
+        # reference to it rather than leaving Ctrl+F pointed at a dead widget.
+        self._find_bar = None
+        self._find_scroll = None
+        self._find_path = None
+        self._find_hits = []
+        self._find_of = None
+        self._find_at = -1
+        if self._find_job is not None:
+            self._find_job.cancel()
+            self._find_job = None
+        self._set_nav_shortcuts(True)
         while self.content.count():
             w = self.content.takeAt(0).widget()
             if w is not None:
@@ -1372,34 +1481,63 @@ class QuickView(QWidget):
         # freeze the event loop — keys, the close button and the daemon socket
         # stay live while the worker works.
         self.show_message("Loading preview…")
-        got = {"png": None, "job": None}
+        # Frame 0 is raw pixels to show, frame 1 the encoded copy to cache
+        # — see the worker's module docstring.
+        got = {"frames": [], "job": None, "shown": False}
 
-        def on_frame(png: bytes):
-            got["png"] = png
+        def on_frame(data: bytes):
+            got["frames"].append(data)
+            if len(got["frames"]) != 1:
+                return  # frame 2 is the cache copy; on_done deals with it
+            job = got["job"]
+            if job is None or self._render_job is not job:
+                return  # superseded
+            if path != self.current_path:
+                return  # the user moved on while we rendered
+            # Painted here rather than in on_done: the pixels are complete
+            # the moment they land, and waiting for the worker's cache copy
+            # would put that encode back in front of the user.
+            img = image_from_raw(data, job.header)
+            if img.isNull():
+                return  # on_done reports it
+            got["shown"] = True
+            log.debug("rendered: %s", path)
+            # Hand the job off before displaying. _show_decoded clears the
+            # panel, clear_content() calls _cancel_render(), and that would
+            # kill the worker halfway through the encode this still needs
+            # for the cache. Nothing cancels it now; it is parented to the
+            # window, finishes in tens of ms and tears itself down.
+            self._render_job = None
+            self._show_decoded(path, key, img, job.header.get("orig"))
 
         def on_done(ok: bool, error: str):
+            frames = got["frames"]
+            if got["shown"]:
+                # Not gated on the job still being current: the cache is
+                # keyed by path and size, so a frame that lands after the
+                # user has moved on is still the right answer for this file.
+                # Persisted only once the full stream arrives — a truncated
+                # blob behind a valid magic must not become a sticky cache
+                # entry. A worker that died after the pixels but before the
+                # encode leaves the image on screen and nothing cached.
+                if ok and len(frames) > 1 and is_cache_blob(frames[1]):
+                    cache_write(key, frames[1])
+                else:
+                    # The image is on screen either way; say so, or a cache
+                    # that silently never fills looks like a fast renderer.
+                    log.warning(
+                        "not cached: %s (ok=%s frames=%d error=%s)",
+                        path, ok, len(frames), error[:200],
+                    )
+                return
             if self._render_job is not got["job"] or path != self.current_path:
                 return  # superseded, or the user moved on while we rendered
             self._render_job = None
-            png = got["png"]
-            img = (
-                QImage.fromData(png)
-                if ok and png and png[:4] == PNG_MAGIC
-                else QImage()
+            log.warning("render failed: %s (%s)", path, error[:500])
+            self.clear_content()
+            self.show_fallback(
+                path, self.mime_db.mimeTypeForFile(path).name()
             )
-            if not img.isNull():
-                log.debug("rendered: %s", path)
-                # Persist only after the full decode succeeds — a truncated
-                # blob behind a valid magic must not become a sticky cache
-                # entry.
-                cache_write(key, png)
-                self._show_decoded(path, key, img)
-            else:
-                log.warning("render failed: %s (%s)", path, error[:500])
-                self.clear_content()
-                self.show_fallback(
-                    path, self.mime_db.mimeTypeForFile(path).name()
-                )
 
         got["job"] = self._render_job = SandboxJob(
             self.pool, path,
@@ -1407,9 +1545,16 @@ class QuickView(QWidget):
             on_frame, on_done, self,
         )
 
-    def _show_decoded(self, path: str, key: str, img: QImage):
-        """Display a successfully decoded preview and remember its pixmap."""
-        dims = img.text("QuickView:OrigSize") or f"{img.width()}×{img.height()}"
+    def _show_decoded(self, path: str, key: str, img: QImage, dims: str = ""):
+        """Display a successfully decoded preview and remember its pixmap.
+
+        `dims` comes from the worker's header on a fresh render; the disk
+        cache-hit path passes nothing and falls back to the text chunk in
+        the cached image.
+        """
+        dims = dims or img.text("QuickView:OrigSize") or (
+            f"{img.width()}×{img.height()}"
+        )
         pix = QPixmap.fromImage(img)
         nbytes = pix.width() * pix.height() * max(pix.depth(), 1) // 8
         self._mem_cache.pop(key, None)
@@ -1496,20 +1641,29 @@ class QuickView(QWidget):
         if self._prefetch_job is not None or not self._prefetch_queue:
             return
         path, key, max_w, max_h = self._prefetch_queue.pop(0)
-        got = {"png": None}
+        got = {"blob": None}
+
+        def on_frame(data: bytes):
+            # Only the encoded frame belongs in the cache. "raw": False
+            # below means that is the one frame we get, but check rather
+            # than trust the frame order — this consumer never displays.
+            if is_cache_blob(data):
+                got["blob"] = data
 
         def on_done(ok: bool, _error: str):
             self._prefetch_job = None
-            png = got["png"]
-            if ok and png and png[:4] == PNG_MAGIC:
+            blob = got["blob"]
+            if ok and blob:
                 log.debug("prefetched: %s", path)
-                cache_write(key, png)
+                cache_write(key, blob)
             self._start_next_prefetch()
 
         self._prefetch_job = SandboxJob(
             self.pool, path,
-            {"op": "image", "max_w": max_w, "max_h": max_h},
-            lambda png: got.__setitem__("png", png), on_done, self,
+            # No raw frame: prefetch fills the disk cache and shows nothing,
+            # so the pixels would be several megabytes copied to be dropped.
+            {"op": "image", "max_w": max_w, "max_h": max_h, "raw": False},
+            on_frame, on_done, self,
         )
 
     # ------------------------------------------------------- animation
@@ -1627,7 +1781,8 @@ class QuickView(QWidget):
                 cache_remove(page_key(0))
             self._pdf_render(path, page_key, page_w)
 
-    def _pdf_begin_view(self, path: str, total: int, sizes: list):
+    def _pdf_begin_view(self, path: str, total: int, sizes: list,
+                        searchable: bool = False, page_w: int = 0):
         """Swap in the page column, at its full height from the start.
 
         Every page gets a placeholder of its real size before any pixels
@@ -1643,19 +1798,42 @@ class QuickView(QWidget):
         lay.setContentsMargins(14, 14, 14, 14)
         lay.setSpacing(12)
         self._pdf_labels = []
+        self._pdf_overlays = []
         for w, h in sizes:
             label = QLabel()
             label.setFixedSize(w, h)
             label.setStyleSheet("background: #2a2a2e;")  # an unfilled page
             lay.addWidget(label, 0, Qt.AlignHCenter)
             self._pdf_labels.append(label)
+            overlay = MatchOverlay(label)
+            overlay.setGeometry(0, 0, w, h)
+            self._pdf_overlays.append(overlay)
         lay.addStretch(1)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet("background: #222226;")
         scroll.setWidget(col)
-        self.content.addWidget(scroll)
+        # Wrapper so the find row can sit above the pages and scroll with
+        # neither of them.
+        holder = QWidget()
+        hlay = QVBoxLayout(holder)
+        hlay.setContentsMargins(0, 0, 0, 0)
+        hlay.setSpacing(0)
+        find_bar = self._build_find_bar()
+        hlay.addWidget(find_bar)
+        hlay.addWidget(scroll, 1)
+        self.content.addWidget(holder)
+        # Find is only wired up for real PDFs: office documents share this
+        # view but are laid out through QTextDocument, which getAllText
+        # knows nothing about.
+        if searchable:
+            self._find_bar = find_bar
+            self._find_scroll = scroll
+            self._find_path = path
+            self._find_page_w = page_w
+        else:
+            find_bar.hide()
         avail = self.screen_avail()
         self.set_panel_size(int(avail.width() * 0.55), int(avail.height() * 0.85))
         pages = f"{total} pages"
@@ -1663,6 +1841,215 @@ class QuickView(QWidget):
             pages += f" (showing first {PDF_MAX_PAGES})"
         self.set_title(f"{os.path.basename(path)}  —  {pages}")
         return lay
+
+    # ------------------------------------------------------------ find
+    # Ctrl+F over a PDF. The daemon owns no parser, so the query goes to a
+    # jailed worker (op "pdfsearch") which answers with match rectangles
+    # already in page pixels; everything here is navigation and painting.
+
+    def _set_nav_shortcuts(self, on: bool):
+        for sc in self._nav_shortcuts:
+            sc.setEnabled(on)
+
+    def open_find(self):
+        """Ctrl+F: reveal the find row, if a PDF is what is showing."""
+        if self._find_bar is None:
+            return  # not a PDF (or nothing open) — Ctrl+F does nothing
+        self._find_bar.show()
+        self._find_input.setFocus()
+        self._find_input.selectAll()
+
+    def close_find(self):
+        if self._find_bar is None:
+            return
+        self._find_bar.hide()
+        self._set_nav_shortcuts(True)
+        self._find_hits = []
+        self._find_of = None
+        self._find_at = -1
+        self._paint_matches()
+        self._find_label.setText("")
+
+    def _build_find_bar(self) -> QWidget:
+        bar = QWidget()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(14, 8, 14, 0)
+        row.setSpacing(8)
+        self._find_input = QLineEdit()
+        self._find_input.setPlaceholderText("Find in document…")
+        self._find_input.setStyleSheet(
+            "QLineEdit { background:#2a2a2e; color:#e8e8ea; border:1px solid"
+            " #3a3a40; border-radius:6px; padding:5px 8px; }"
+        )
+        # The nav shortcuts are single keys and outrank this field's own key
+        # events, so they are off precisely while it holds focus.
+        self._find_input.focusInEvent = self._wrap_focus(
+            self._find_input.focusInEvent, False
+        )
+        self._find_input.focusOutEvent = self._wrap_focus(
+            self._find_input.focusOutEvent, True
+        )
+        self._find_input.returnPressed.connect(self._find_submit)
+        self._find_input.keyPressEvent = self._find_keys(
+            self._find_input.keyPressEvent
+        )
+        self._find_label = QLabel("")
+        self._find_label.setStyleSheet("color:#9a9aa2;")
+        prev_btn = QPushButton("‹")
+        next_btn = QPushButton("›")
+        close_btn = QPushButton("✕")
+        for b, fn in (
+            (prev_btn, lambda: self._find_step(-1)),
+            (next_btn, lambda: self._find_step(+1)),
+            (close_btn, self.close_find),
+        ):
+            b.setFixedWidth(28)
+            b.setStyleSheet(
+                "QPushButton { background:#2a2a2e; color:#e8e8ea; border:1px"
+                " solid #3a3a40; border-radius:6px; padding:4px; }"
+                "QPushButton:hover { background:#35353b; }"
+            )
+            b.setFocusPolicy(Qt.NoFocus)  # never steal focus from the field
+            b.clicked.connect(fn)
+        row.addWidget(self._find_input, 1)
+        row.addWidget(self._find_label)
+        row.addWidget(prev_btn)
+        row.addWidget(next_btn)
+        row.addWidget(close_btn)
+        bar.hide()
+        return bar
+
+    def _find_keys(self, original):
+        """Escape closes the find row; Enter steps, Shift+Enter steps back.
+
+        Escape is handled here rather than by the window shortcut because
+        that one is disabled while this field has focus — and it should be:
+        the first Escape belongs to the find row, only the second to the
+        preview.
+        """
+        def handler(event):
+            if event.key() == Qt.Key_Escape:
+                self.close_find()
+                self.setFocus()
+                return
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                if self._find_hits and self._find_input.text() == self._find_of:
+                    # Same query as the standing results: step, don't re-run.
+                    self._find_step(
+                        -1 if event.modifiers() & Qt.ShiftModifier else +1
+                    )
+                    return
+                self._find_submit()
+                return
+            original(event)
+        return handler
+
+    def _wrap_focus(self, original, nav_on: bool):
+        def handler(event):
+            self._set_nav_shortcuts(nav_on)
+            original(event)
+        return handler
+
+    def _find_submit(self):
+        query = self._find_input.text()
+        if not query or self._find_path is None:
+            return
+        self._find_label.setText("…")
+        self._find_of = query
+        got = {"blob": None}
+
+        def on_frame(data: bytes):
+            got["blob"] = data
+
+        def on_done(ok: bool, error: str):
+            self._find_job = None
+            try:
+                payload = json.loads(got["blob"]) if ok and got["blob"] else {}
+            except (ValueError, TypeError):
+                payload = {}
+            if not ok:
+                log.warning("find failed: %s (%s)", self._find_path, error[:200])
+            self._find_hits = payload.get("matches", [])
+            self._find_at = 0 if self._find_hits else -1
+            if not self._find_hits:
+                self._find_label.setText("no matches")
+            else:
+                self._find_scroll_to(self._find_at)
+            self._paint_matches()
+            self._update_find_label(
+                payload.get("capped", False), payload.get("loose", False)
+            )
+
+        self._find_job = SandboxJob(
+            self.pool, self._find_path,
+            {"op": "pdfsearch", "query": query, "page_w": self._find_page_w,
+             "max_pages": PDF_MAX_PAGES},
+            on_frame, on_done, self,
+        )
+
+    def _update_find_label(self, capped: bool = False, loose: bool = None):
+        if not self._find_hits:
+            return
+        if loose is not None:
+            self._find_loose = loose
+        total = f"{len(self._find_hits)}{'+' if capped else ''}"
+        # "≈" means the exact phrase was not in the text layer and the hits
+        # come from the spaces-ignored fallback — the reader should know the
+        # match is the renderer's best guess, not a literal one.
+        mark = " ≈" if self._find_loose else ""
+        self._find_label.setText(f"{self._find_at + 1} / {total}{mark}")
+
+    def _find_step(self, delta: int):
+        if not self._find_hits:
+            return
+        self._find_at = (self._find_at + delta) % len(self._find_hits)
+        self._find_scroll_to(self._find_at)
+        self._paint_matches()
+        self._update_find_label()
+
+    def _find_scroll_to(self, index: int):
+        if not (0 <= index < len(self._find_hits)) or self._find_scroll is None:
+            return
+        hit = self._find_hits[index]
+        page, rects = hit.get("page", 0), hit.get("rects") or []
+        if not rects or not 0 <= page < len(self._pdf_labels):
+            return
+        # First rectangle: a match wrapped over a line break has one per
+        # line, and the reader wants to land where it starts.
+        x, y, w, h = rects[0]
+        label = self._pdf_labels[page]
+        # Map the match into the scrolled column's coordinates, then ask for
+        # it with a generous margin so it lands mid-view rather than jammed
+        # against the top edge.
+        col = self._find_scroll.widget()
+        top_left = label.mapTo(col, QPoint(int(x), int(y)))
+        self._find_scroll.ensureVisible(
+            top_left.x() + int(w) // 2, top_left.y() + int(h) // 2,
+            80, self._find_scroll.viewport().height() // 2,
+        )
+
+    def _paint_matches(self):
+        """Push the current hits onto each page's overlay.
+
+        One hit can be several rectangles — a phrase that wraps over a line
+        break — so the overlay is told the span belonging to the current
+        match rather than a single index.
+        """
+        per_page = {}
+        current = {}
+        for i, hit in enumerate(self._find_hits):
+            page = hit.get("page", 0)
+            rects = [tuple(int(v) for v in r) for r in hit.get("rects") or []]
+            if not rects:
+                continue
+            start = len(per_page.setdefault(page, []))
+            per_page[page].extend(rects)
+            if i == self._find_at:
+                current = {page: range(start, start + len(rects))}
+        for page, overlay in enumerate(self._pdf_overlays):
+            if overlay is None:
+                continue
+            overlay.set_matches(per_page.get(page, []), current.get(page))
 
     def _pdf_fill_page(self, i: int, img: QImage):
         """Put a decoded page into its placeholder."""
@@ -1690,7 +2077,9 @@ class QuickView(QWidget):
         for i in range(1, count):
             head = cache_read_head(page_key(i))
             sizes.append((head and png_size(head)) or fallback)
-        lay = self._pdf_begin_view(path, total, sizes)
+        lay = self._pdf_begin_view(
+            path, total, sizes, searchable=(op == "pdf"), page_w=page_w
+        )
         gen = object()
         self._pdf_gen = gen
         state = {"i": 0}
@@ -1773,8 +2162,10 @@ class QuickView(QWidget):
                 # does not is corrected as it lands. What matters is that
                 # the column is its full height before the reader scrolls.
                 count = min(total, PDF_MAX_PAGES)
+                log.debug("pdf first page: %s", path)
                 state["lay"] = self._pdf_begin_view(
-                    path, total, [(img.width(), img.height())] * count
+                    path, total, [(img.width(), img.height())] * count,
+                    searchable=(op == "pdf"), page_w=page_w,
                 )
             cache_write(page_key(page), png)
             self._pdf_fill_page(page, img)
