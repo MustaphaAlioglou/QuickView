@@ -178,7 +178,10 @@ Honest list — these are the reads that never reach a jail:
 - **Rust** (`rustc`), optional — `install.sh` uses it to build the small
   fast-path client that hands a path to the daemon in under a millisecond.
   No crates and no Cargo, just `rustc`. Without it the Python client does
-  the same job about 15 ms slower, which is the only difference.
+  the same job about 15 ms slower, which is the only difference: previews
+  look and behave identically either way. `pacman -S rust`,
+  `apt install rustc`, `dnf install rust`. Install it and re-run
+  `./install.sh` to pick up the faster client at any time.
 - **`bsdtar`, `7z` or `unrar`**, optional — used to list rar, 7z and other
   archives that Python's standard library cannot read. zip and tar need
   none of them. With none installed, those archives show the metadata card.
