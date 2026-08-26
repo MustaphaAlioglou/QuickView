@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 # Launcher for QuickView — uses the project's own virtualenv.
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# readlink -f first: install.sh symlinks ~/.local/bin/quickview here, and
+# without resolving that link DIR lands in ~/.local instead of the repo.
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 PY="$DIR/.venv/bin/python"
 
-# Fast path: if the daemon is already running, just hand it the path
-# (~40 ms, no Qt startup). Falls back to a full launch otherwise.
-if [ $# -gt 0 ] && "$PY" "$DIR/client.py" "$@"; then
-    exit 0
+# Fast path: if the daemon is already running, just hand it the paths and
+# skip Qt startup entirely. The compiled client does this in well under a
+# millisecond; client.py is the fallback for machines that had no Rust
+# toolchain at install time and costs ~15 ms of interpreter startup.
+# Either way, a non-zero exit means no daemon answered.
+if [ $# -gt 0 ]; then
+    if [ -x "$DIR/bin/quickview-client" ]; then
+        "$DIR/bin/quickview-client" "$@" && exit 0
+    elif "$PY" "$DIR/client.py" "$@"; then
+        exit 0
+    fi
 fi
 exec "$PY" "$DIR/quickview.py" "$@"

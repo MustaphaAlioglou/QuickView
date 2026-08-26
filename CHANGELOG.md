@@ -5,6 +5,46 @@ project has no version tags yet, so entries are dated.
 
 [kac]: https://keepachangelog.com/en/1.1.0/
 
+## 2026-08-26
+
+### Performance
+
+- **The fast path is now a compiled client (`client.rs`).** Handing a path
+  to the warm daemon cost ~29 ms, essentially all of it Python interpreter
+  startup — `urllib.parse` alone was ~6 ms of it. The Rust client does the
+  same work in ~0.8 ms, so `bin/quickview somefile` now returns in ~4 ms
+  end to end instead of ~40 ms. No crates, so `rustc` builds it without
+  Cargo; `install.sh` skips it with a note when there is no toolchain, and
+  `client.py` stays as the fallback (itself now ~15 ms, having shed its
+  `urllib` import).
+
+### Security
+
+- **The fast-path client no longer parses anything.** Percent-decoding and
+  path normalization moved from the client to `ipc.py` on the daemon side,
+  so the one QuickView process that runs *outside* the bubblewrap jail now
+  forwards its arguments byte for byte and never inspects them. Filenames
+  are untrusted input — a crafted name inside a downloaded archive is a
+  plausible vector — and this keeps every parser on the memory-safe side of
+  the wire. It also leaves `normalize_arg` with a single implementation,
+  which is what its docstring always asked for.
+
+### Fixed
+
+- **Filenames that are not valid UTF-8 now preview instead of silently
+  failing.** The wire format decoded with `errors="replace"`, which turned
+  an undecodable byte into U+FFFD — a path that does not exist. Both
+  directions now use `surrogateescape`, the codec `sys.argv` and `open()`
+  already speak, so those bytes round-trip intact.
+
+### Changed
+
+- The client→daemon message gained a leading field: the sender's working
+  directory, which the daemon resolves relative arguments against (its own
+  cwd, under systemd, is not the client's). An old daemon left running
+  across an upgrade would misread the new format; `install.sh` already
+  restarts the service rather than leaving a running one alone.
+
 ## 2026-08-25 — first public release
 
 The release that took QuickView from a personal tool to a published one:
@@ -36,6 +76,26 @@ Wayland, and an installer that works on a machine other than the author's.
 
 ### Added
 
+- **Archives and office documents preview instead of falling through to the
+  metadata card.** Archives (zip, rar, 7z, tar and friends) show a contents
+  listing with sizes; nothing is ever extracted, only headers are read, so a
+  zip bomb is inert. zip and tar go through Python's standard library, and
+  everything else through `bsdtar`/`7z`/`unrar` — which read the archive from
+  `/dev/fd`, so the jail still gets a descriptor and no path, and no copy is
+  made. Missing listers, encrypted headers and corrupt files fall back to the
+  metadata card without an error.
+
+  Office documents are **laid out as pages** and shown by the same view PDFs
+  use, so they scroll, stream and cache page by page. docx, odt, xlsx and ods
+  are converted in the jail to the HTML subset `QTextDocument` understands —
+  headings, bold/italic, tables, embedded images — and rendered with Qt
+  alone: no office suite, no QtWebEngine. Measured: a 7-page .docx converts
+  in 8 ms and renders a page in 7 ms.
+
+  Slide decks are deliberately not previewed: their content is absolutely
+  positioned graphics with no path through QTextDocument, and the only
+  thing that lays them out is a full office suite. Legacy binary
+  .doc/.xls/.ppt are out for the same reason; both show the metadata card.
 - **Syntax highlighting in the text preview**, via Pygments — and it runs in
   the jail, not here. Lexers are regexes; a file written to make one
   backtrack should cost a throwaway worker, not the process holding the
@@ -203,6 +263,29 @@ Wayland, and an installer that works on a machine other than the author's.
 
 ### Known limitations
 
+- **Slide decks (`.pptx`, `.odp`) are not previewed at all**, and the
+  reason is worth recording so nobody re-treads it. Their content is
+  absolutely positioned DrawingML, which `QTextDocument` cannot lay out,
+  so the only faithful renderer is LibreOffice. That was implemented and
+  then removed: `soffice --headless --convert-to pdf` **hangs inside the
+  jail** — 90 s with zero bytes on stdout *and* stderr and no output file,
+  where the identical command on the host converts a 149-slide deck in
+  9 s. Binding `/etc/passwd` did not help; neither did giving it the
+  network namespace back. Left enabled it was worse than useless, since
+  every deck would wait out the watchdog before falling back. The
+  remaining option is a DrawingML renderer of our own (shape geometry in
+  EMU, placeholder positions from the slide layouts, pictures from the
+  media parts) — no dependency, but charts and SmartArt would be missing.
+- Spreadsheet sheets are labelled "Sheet 1", "Sheet 2" rather than by
+  their real names; the names are in `xl/workbook.xml` and simply are not
+  read yet.
+- Office layout is `QTextDocument`'s approximation, not Word's: fonts,
+  margins and page breaks differ from what the authoring application
+  shows. It is a readable page, not a faithful reproduction.
+- Archive entries listed through `bsdtar`/`7z`/`unrar` (rar, 7z, iso) show
+  names only — no sizes, and no uncompressed total. The long-listing
+  formats differ per tool and per locale, and a preview does not need
+  them; zip and tar, which go through the standard library, do show sizes.
 - Audio from the jailed player is wired and the socket is reachable
   (`pactl info` succeeds through it), but audible output has not been
   confirmed — this machine currently exposes no real sink (`auto_null`).

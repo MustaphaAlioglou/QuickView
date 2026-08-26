@@ -7,13 +7,19 @@
 # Free Software Foundation, either version 3 of the License, or (at your
 # option) any later version. This program is distributed WITHOUT ANY
 # WARRANTY; see the LICENSE file, or <https://www.gnu.org/licenses/>.
-"""Fast path for QuickView: hand the file path to the running daemon.
+"""Fallback fast path for QuickView: hand the file path to the daemon.
 
-Pure stdlib — no Qt import — so it runs in tens of milliseconds. Exits 0
-if a daemon accepted the path, 1 otherwise (the launcher then falls back
-to starting quickview.py, which becomes the daemon).
+The compiled client.rs does this in under a millisecond and is what
+install.sh puts on the fast path; this is what runs when no Rust
+toolchain was available at install time. Pure stdlib — no Qt import — so
+it still costs tens of milliseconds rather than a Qt startup. Exits 0 if a
+daemon accepted the paths, 1 otherwise (the launcher then falls back to
+starting quickview.py, which becomes the daemon).
+
+Arguments go out raw; the daemon normalizes them. See ipc.py.
 """
 
+import os
 import socket
 import sys
 
@@ -24,12 +30,11 @@ def main() -> int:
     args = sys.argv[1:]
     if not args or any(a.startswith("-") for a in args):
         return 1  # no file, or a flag (--daemon, --clear-cache): quickview.py handles it
-    paths = [ipc.normalize_arg(raw) for raw in args]
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(0.5)
             s.connect(ipc.socket_path())
-            s.sendall(ipc.encode_paths(paths))
+            s.sendall(ipc.encode_request(os.getcwd(), args))
         return 0
     except OSError:
         return 1

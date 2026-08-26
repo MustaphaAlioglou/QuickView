@@ -29,6 +29,25 @@ PNG_QUALITY = 80
 # file itself.
 HIGHLIGHT_MAX_BYTES = 256 * 1024
 
+# An archive listing is a preview, not a file manager: enough entries to see
+# what is in there, and a count for the rest.
+ARCHIVE_MAX_ENTRIES = 500
+# Nothing here decompresses an entry, so a zip bomb is inert — except in the
+# office path, which does read one XML member. That read is bounded by this.
+OFFICE_MAX_MEMBER_BYTES = 16 * 1024 * 1024
+OFFICE_MAX_THUMB_BYTES = 8 * 1024 * 1024
+# A rendered page, in pixels. Width comes from the caller (the panel width);
+# the ratio is A4's, which is what these documents are written for.
+PAGE_RATIO = 297 / 210
+# Archive helpers, by absolute path: the jail runs --clearenv, so there is no
+# PATH to search, and the user's own PATH may point at a conda build that
+# does not exist inside the jail.
+ARCHIVE_TOOLS = (
+    ("/usr/bin/bsdtar", ["-tf"]),
+    ("/usr/bin/7z", ["l", "-ba", "-slt"]),
+    ("/usr/bin/unrar", ["lb"]),
+)
+
 # A PDF may declare any page geometry it likes, and the height is derived
 # from the requested width: a 1 pt x 10000 pt page asks for a ten-million
 # pixel column, i.e. tens of GB of QImage. The jail has no memory limit of
@@ -251,3 +270,492 @@ def highlight_text(source, name: str, limit: int, style_name: str = "one-dark") 
 
     out["spans"], out["styles"], out["lexer"] = spans, styles, lexer.name
     return out
+
+
+def _rewound(fd: int):
+    """A private, rewound file object over an inherited descriptor."""
+    import os
+
+    os.lseek(fd, 0, os.SEEK_SET)
+    return os.fdopen(os.dup(fd), "rb")
+
+
+def list_archive(fd: int, name: str, max_entries: int = ARCHIVE_MAX_ENTRIES) -> dict:
+    """List an archive's entries without extracting anything.
+
+    Reads headers only — no member is ever decompressed — so an archive that
+    expands to terabytes costs nothing here. zip and tar are handled by the
+    standard library; everything else (rar, 7z, iso) goes to whichever of
+    bsdtar/7z/unrar exists, reading the archive through /dev/fd rather than a
+    path, because the jail has the descriptor and no filesystem.
+    """
+    import os
+    import subprocess
+    import tarfile
+    import zipfile
+
+    # count_exact says whether "count" and "total" describe the whole
+    # archive. The tar branch stops reading early on a huge member list, and
+    # a floor reported as a total is worse than an honest "500+".
+    out = {"entries": [], "count": 0, "total": 0, "truncated": False,
+           "count_exact": True, "tool": None}
+
+    with _rewound(fd) as fh:
+        if zipfile.is_zipfile(fh):
+            fh.seek(0)
+            with zipfile.ZipFile(fh) as zf:
+                infos = zf.infolist()
+                out["tool"] = "zipfile"
+                out["count"] = len(infos)
+                out["total"] = sum(i.file_size for i in infos)
+                out["entries"] = [
+                    [i.filename, i.file_size] for i in infos[:max_entries]
+                ]
+                out["truncated"] = len(infos) > max_entries
+                return out
+        fh.seek(0)
+        try:
+            with tarfile.open(fileobj=fh, mode="r:*") as tf:
+                members = []
+                capped = False
+                for member in tf:  # streamed: no full scan up front
+                    if len(members) >= max_entries * 4:
+                        capped = True  # stop before a tar with millions of
+                        break          # members costs a full scan
+                    members.append(member)
+                out["tool"] = "tarfile"
+                out["count"] = len(members)
+                out["total"] = sum(m.size for m in members)
+                out["count_exact"] = not capped
+                out["entries"] = [[m.name, m.size] for m in members[:max_entries]]
+                out["truncated"] = capped or len(members) > max_entries
+                return out
+        except tarfile.TarError:
+            pass
+
+    # Not a zip or a tar: hand the descriptor to an external lister.
+    os.lseek(fd, 0, os.SEEK_SET)
+    for tool, args in ARCHIVE_TOOLS:
+        if not os.path.exists(tool):
+            continue
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            proc = subprocess.run(
+                [tool] + args + ["/dev/fd/%d" % fd],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                pass_fds=(fd,), timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode != 0 or not proc.stdout:
+            continue  # encrypted, corrupt, or a format this tool refuses
+        names = _parse_listing(tool, proc.stdout)
+        if not names:
+            continue
+        out["tool"] = os.path.basename(tool)
+        out["count"] = len(names)
+        out["entries"] = [[n, None] for n in names[:max_entries]]
+        out["truncated"] = len(names) > max_entries
+        return out
+
+    raise RuntimeError("no archive lister available for this format")
+
+
+def _parse_listing(tool: str, data: bytes) -> list:
+    """Entry names out of a lister's stdout. Names only: the long formats
+    differ per tool and per locale, and a preview does not need sizes."""
+    text = data.decode("utf-8", errors="replace")
+    if tool.endswith("7z"):
+        # -slt prints "Path = name" records.
+        return [
+            line[7:].strip() for line in text.splitlines()
+            if line.startswith("Path = ")
+        ]
+    return [line for line in text.splitlines() if line.strip()]
+
+
+def office_preview(fd: int, name: str, limit: int) -> dict:
+    """Preview an OOXML or ODF document without an office suite.
+
+    Both are zip containers, so the standard library is enough. Prefers the
+    thumbnail the authoring application already embedded — that is its own
+    rendering of page one for the cost of unzipping one member — and falls
+    back to the document's text.
+    """
+    import zipfile
+
+    out = {"kind": "empty", "image_b64": None, "image_type": None,
+           "text": "", "truncated": False}
+    with _rewound(fd) as fh:
+        if not zipfile.is_zipfile(fh):
+            raise RuntimeError("not an office document (no zip container)")
+        fh.seek(0)
+        with zipfile.ZipFile(fh) as zf:
+            names = set(zf.namelist())
+            thumb = _embedded_thumbnail(zf, names)
+            if thumb is not None:
+                import base64
+
+                data, kind = thumb
+                out["kind"] = "image"
+                out["image_b64"] = base64.b64encode(data).decode("ascii")
+                out["image_type"] = kind
+            text = _office_text(zf, names, limit)
+            if text:
+                out["text"] = text[:limit]
+                out["truncated"] = len(text) > limit
+                if out["kind"] != "image":
+                    out["kind"] = "text"
+    if out["kind"] == "empty":
+        raise RuntimeError("nothing previewable in this document")
+    return out
+
+
+def _embedded_thumbnail(zf, names):
+    for member, kind in (
+        ("docProps/thumbnail.jpeg", "jpeg"),
+        ("docProps/thumbnail.jpg", "jpeg"),
+        ("docProps/thumbnail.png", "png"),
+        ("Thumbnails/thumbnail.png", "png"),
+    ):
+        if member not in names:
+            continue
+        info = zf.getinfo(member)
+        if info.file_size > OFFICE_MAX_THUMB_BYTES:
+            continue
+        with zf.open(member) as fh:
+            return fh.read(OFFICE_MAX_THUMB_BYTES), kind
+    return None
+
+
+def _member_xml(zf, member: str):
+    """Parse one zip member as XML, bounded, with entities left unresolved."""
+    from xml.etree import ElementTree as ET
+
+    info = zf.getinfo(member)
+    if info.file_size > OFFICE_MAX_MEMBER_BYTES:
+        raise RuntimeError("%s is implausibly large" % member)
+    with zf.open(member) as fh:
+        data = fh.read(OFFICE_MAX_MEMBER_BYTES)
+    # ET's parser does not expand external entities and caps internal ones,
+    # so a billion-laughs document fails here rather than eating the worker.
+    return ET.fromstring(data)
+
+
+W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+SS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+ODF_TEXT = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
+
+
+def _office_text(zf, names, limit: int) -> str:
+    if "word/document.xml" in names:
+        root = _member_xml(zf, "word/document.xml")
+        return "\n".join(
+            "".join(node.text or "" for node in para.iter(W + "t"))
+            for para in root.iter(W + "p")
+        )
+    if any(n.startswith("ppt/slides/slide") for n in names):
+        slides = sorted(
+            n for n in names
+            if n.startswith("ppt/slides/slide") and n.endswith(".xml")
+        )
+        chunks, size = [], 0
+        for i, slide in enumerate(slides, 1):
+            root = _member_xml(zf, slide)
+            body = " ".join(
+                node.text or "" for node in root.iter(A + "t")
+            ).strip()
+            chunks.append("—— slide %d ——\n%s" % (i, body))
+            size += len(chunks[-1])
+            if size > limit:
+                break
+        return "\n\n".join(chunks)
+    if "xl/workbook.xml" in names:
+        shared = []
+        if "xl/sharedStrings.xml" in names:
+            root = _member_xml(zf, "xl/sharedStrings.xml")
+            shared = [
+                "".join(node.text or "" for node in item.iter(SS + "t"))
+                for item in root.iter(SS + "si")
+            ]
+        sheets = sorted(
+            n for n in names
+            if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")
+        )
+        rows, size = [], 0
+        for sheet in sheets:
+            root = _member_xml(zf, sheet)
+            for row in root.iter(SS + "row"):
+                cells = []
+                for cell in row.iter(SS + "c"):
+                    value = cell.find(SS + "v")
+                    if value is None or value.text is None:
+                        cells.append("")
+                    elif cell.get("t") == "s":
+                        # A shared-string cell should hold an integer index;
+                        # a malformed one must cost that cell, not the whole
+                        # document's preview.
+                        try:
+                            index = int(value.text)
+                        except ValueError:
+                            cells.append("")
+                            continue
+                        cells.append(
+                            shared[index] if 0 <= index < len(shared) else ""
+                        )
+                    else:
+                        cells.append(value.text)
+                rows.append("\t".join(cells))
+                size += len(rows[-1])
+                if size > limit:
+                    return "\n".join(rows)
+        return "\n".join(rows)
+    if "content.xml" in names:  # ODF
+        root = _member_xml(zf, "content.xml")
+        return "\n".join(
+            "".join(node.itertext()).strip()
+            for node in root.iter(ODF_TEXT + "p")
+        )
+    return ""
+
+
+def office_pages(fd: int, name: str, page_w: int, max_pages: int, start: int = 0):
+    """Yield (page_count, png_bytes) for an office document, as page images.
+
+    Word-processor and spreadsheet documents are converted to the HTML subset
+    QTextDocument understands and laid out here: no office suite, no
+    subprocess, ~8 ms to convert and ~7 ms a page. Slide decks have no path
+    through this — their content is absolutely positioned graphics, which
+    QTextDocument cannot lay out — so they raise, and the caller falls back
+    to the thumbnail the deck embeds plus its text.
+    """
+    yield from _pages_via_qtextdocument(fd, name, page_w, max_pages, start)
+
+
+def _pages_via_qtextdocument(fd: int, name: str, page_w: int, max_pages: int,
+                             start: int = 0):
+    import zipfile
+
+    from PySide6.QtCore import QRectF, QSizeF, Qt, QUrl
+    from PySide6.QtGui import QImage, QPainter, QTextDocument
+
+    page_h = int(page_w * PAGE_RATIO)
+    with _rewound(fd) as fh:
+        if not zipfile.is_zipfile(fh):
+            raise RuntimeError("not an office document")
+        fh.seek(0)
+        with zipfile.ZipFile(fh) as zf:
+            names = set(zf.namelist())
+            body, images = _office_html(zf, names)
+            if not body:
+                raise RuntimeError("no layout for this document type")
+
+            doc = QTextDocument()
+            doc.setDocumentMargin(page_w * 0.06)
+            for key, data in images.items():
+                img = QImage.fromData(data)
+                if not img.isNull():
+                    doc.addResource(
+                        QTextDocument.ResourceType.ImageResource,
+                        QUrl(key), img,
+                    )
+            doc.setHtml(body)
+            doc.setPageSize(QSizeF(page_w, page_h))
+            count = min(doc.pageCount(), max_pages)
+            for index in range(max(start, 0), count):
+                page = QImage(page_w, page_h, QImage.Format.Format_RGB32)
+                page.fill(Qt.GlobalColor.white)
+                painter = QPainter(page)
+                painter.translate(0, -index * page_h)
+                painter.setClipRect(QRectF(0, index * page_h, page_w, page_h))
+                doc.drawContents(
+                    painter, QRectF(0, index * page_h, page_w, page_h)
+                )
+                painter.end()
+                page.setText("QuickView:PageCount", str(doc.pageCount()))
+                yield count, _encode(page)
+
+
+def _office_html(zf, names) -> tuple:
+    """(html, images) for the document types QTextDocument can lay out."""
+    if "word/document.xml" in names:
+        return _docx_html(zf, names)
+    if "xl/workbook.xml" in names:
+        return _xlsx_html(zf, names), {}
+    if "content.xml" in names and "styles.xml" in names:
+        return _odf_html(zf, names)
+    return "", {}  # slide decks land here: nothing to lay out, only a thumbnail
+
+
+_HTML_HEAD = (
+    "<body style='font-family:serif; font-size:11pt; color:#111;'>"
+)
+
+
+def _escape(text: str) -> str:
+    import html
+
+    return html.escape(text or "")
+
+
+def _docx_html(zf, names) -> tuple:
+    R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    rels, images = {}, {}
+    if "word/_rels/document.xml.rels" in names:
+        root = _member_xml(zf, "word/_rels/document.xml.rels")
+        for rel in root:
+            target = rel.get("Target", "")
+            member = "word/" + target.lstrip("./")
+            if member in names and member.startswith("word/media/"):
+                rels[rel.get("Id")] = member
+
+    root = _member_xml(zf, "word/document.xml")
+    parts = []
+    for block in root.iter():
+        if block.tag == W + "p":
+            parts.append(_docx_paragraph(block, rels, images, zf))
+        elif block.tag == W + "tbl":
+            parts.append(_docx_table(block, rels, images, zf))
+    return _HTML_HEAD + "".join(p for p in parts if p) + "</body>", images
+
+
+def _docx_paragraph(para, rels, images, zf) -> str:
+    style_node = para.find(W + "pPr/" + W + "pStyle")
+    style = style_node.get(W + "val", "") if style_node is not None else ""
+    pieces = []
+    for run in para.iter(W + "r"):
+        text = "".join(node.text or "" for node in run.iter(W + "t"))
+        if text:
+            props = run.find(W + "rPr")
+            markup = _escape(text)
+            if props is not None:
+                if props.find(W + "b") is not None:
+                    markup = "<b>%s</b>" % markup
+                if props.find(W + "i") is not None:
+                    markup = "<i>%s</i>" % markup
+                if props.find(W + "u") is not None:
+                    markup = "<u>%s</u>" % markup
+            pieces.append(markup)
+        for blip in run.iter(
+            "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
+        ):
+            member = rels.get(blip.get(
+                "{http://schemas.openxmlformats.org/officeDocument/2006/"
+                "relationships}embed"
+            ))
+            if member and _stash_image(zf, member, images):
+                pieces.append("<img src='%s' width='420'>" % member)
+    body = "".join(pieces)
+    if not body:
+        return "<p>&nbsp;</p>"
+    if style.startswith("Title"):
+        return "<h1 style='text-align:center'>%s</h1>" % body
+    if style.startswith("Heading"):
+        level = style[-1] if style[-1].isdigit() else "2"
+        return "<h%s>%s</h%s>" % (min(int(level), 4), body, min(int(level), 4))
+    if style.startswith("ListParagraph"):
+        return "<p style='margin-left:24px'>• %s</p>" % body
+    return "<p>%s</p>" % body
+
+
+def _docx_table(table, rels, images, zf) -> str:
+    rows = []
+    for row in table.iter(W + "tr"):
+        cells = []
+        for cell in row.iter(W + "tc"):
+            inner = "".join(
+                _docx_paragraph(para, rels, images, zf)
+                for para in cell.iter(W + "p")
+            )
+            cells.append("<td style='padding:4px'>%s</td>" % inner)
+        rows.append("<tr>%s</tr>" % "".join(cells))
+    return (
+        "<table border='1' cellspacing='0' width='100%%'>%s</table>"
+        % "".join(rows)
+    )
+
+
+def _stash_image(zf, member: str, images: dict) -> bool:
+    if member in images:
+        return True
+    try:
+        info = zf.getinfo(member)
+    except KeyError:
+        return False
+    if info.file_size > OFFICE_MAX_THUMB_BYTES:
+        return False
+    with zf.open(member) as fh:
+        images[member] = fh.read(OFFICE_MAX_THUMB_BYTES)
+    return True
+
+
+def _xlsx_html(zf, names) -> str:
+    shared = []
+    if "xl/sharedStrings.xml" in names:
+        root = _member_xml(zf, "xl/sharedStrings.xml")
+        shared = [
+            "".join(node.text or "" for node in item.iter(SS + "t"))
+            for item in root.iter(SS + "si")
+        ]
+    tables = []
+    sheets = sorted(
+        n for n in names
+        if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")
+    )
+    for number, sheet in enumerate(sheets, 1):
+        root = _member_xml(zf, sheet)
+        rows = []
+        for row in root.iter(SS + "row"):
+            cells = []
+            for cell in row.iter(SS + "c"):
+                value = cell.find(SS + "v")
+                if value is None or value.text is None:
+                    text = ""
+                elif cell.get("t") == "s":
+                    try:  # see _office_text: one bad cell, not one bad file
+                        index = int(value.text)
+                    except ValueError:
+                        index = -1
+                    text = shared[index] if 0 <= index < len(shared) else ""
+                else:
+                    text = value.text
+                cells.append(
+                    "<td style='padding:3px 6px'>%s</td>" % _escape(text)
+                )
+            rows.append("<tr>%s</tr>" % "".join(cells))
+            if len(rows) > 500:  # a preview, not the whole workbook
+                break
+        if rows:
+            tables.append(
+                "<h3>Sheet %d</h3><table border='1' cellspacing='0'>%s</table>"
+                % (number, "".join(rows))
+            )
+    return _HTML_HEAD + "".join(tables) + "</body>" if tables else ""
+
+
+def _odf_html(zf, names) -> tuple:
+    ODF_H = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}h"
+    ODF_TABLE = "{urn:oasis:names:tc:opendocument:xmlns:table:1.0}"
+    images = {}
+    root = _member_xml(zf, "content.xml")
+    parts = []
+    for node in root.iter():
+        if node.tag == ODF_TEXT + "p":
+            text = _escape("".join(node.itertext()).strip())
+            parts.append("<p>%s</p>" % (text or "&nbsp;"))
+        elif node.tag == ODF_H:
+            parts.append("<h2>%s</h2>" % _escape("".join(node.itertext())))
+        elif node.tag == ODF_TABLE + "table":
+            rows = []
+            for row in node.iter(ODF_TABLE + "table-row"):
+                cells = [
+                    "<td style='padding:3px 6px'>%s</td>"
+                    % _escape("".join(cell.itertext()))
+                    for cell in row.iter(ODF_TABLE + "table-cell")
+                ]
+                rows.append("<tr>%s</tr>" % "".join(cells))
+            parts.append(
+                "<table border='1' cellspacing='0'>%s</table>" % "".join(rows)
+            )
+    return _HTML_HEAD + "".join(parts) + "</body>", images

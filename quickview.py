@@ -25,6 +25,7 @@ different file switches the preview.
 """
 
 import array
+import base64
 import faulthandler
 import hashlib
 import html
@@ -47,7 +48,7 @@ from PySide6.QtCore import (
     QTimer, QFileInfo, QMimeDatabase, QStandardPaths, Signal,
 )
 from PySide6.QtGui import (
-    QAction, QFont, QGuiApplication, QImage, QKeySequence, QRegion,
+    QAction, QFont, QGuiApplication, QIcon, QImage, QKeySequence, QRegion,
     QPainter, QPixmap, QShortcut, QColor, QDesktopServices,
     QTextCharFormat, QTextCursor,
 )
@@ -64,6 +65,27 @@ TEXT_PREVIEW_LIMIT = 1024 * 1024  # 1 MiB
 # one-dark's own background (#282C34) is a shade off the panel's #222226,
 # so its palette sits in this panel without recolouring anything.
 CODE_STYLE = os.environ.get("QUICKVIEW_CODE_STYLE", "one-dark")
+
+# Listed by container, not by application: a preview of any of these is a
+# listing of what is inside, never an extraction.
+ARCHIVE_MIMES = (
+    "application/zip", "application/vnd.rar", "application/x-7z-compressed",
+    "application/x-compressed-tar", "application/x-tar", "application/gzip",
+    "application/x-xz-compressed-tar", "application/x-bzip-compressed-tar",
+    "application/vnd.debian.binary-package", "application/x-cd-image",
+)
+ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z", ".tar", ".tgz", ".txz", ".tbz2"}
+# OOXML and ODF documents that paginate: zip containers full of XML, laid
+# out with the standard library alone. Slide decks are deliberately absent —
+# their content is absolutely positioned graphics that nothing here can lay
+# out, and half a preview is worse than the honest metadata card. The legacy
+# binary formats (.doc/.xls/.ppt) are absent for the same reason.
+OFFICE_MIMES = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.oasis.opendocument.text",
+    "application/vnd.oasis.opendocument.spreadsheet",
+)
 
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".rst", ".log", ".ini", ".cfg", ".conf", ".toml",
@@ -733,7 +755,8 @@ class SandboxJob(QObject):
     length-prefixed the same way the standalone helpers stream them.
     """
 
-    def __init__(self, pool, path, job, on_frame, on_done, parent=None):
+    def __init__(self, pool, path, job, on_frame, on_done, parent=None,
+                 timeout_ms: int = JOB_TIMEOUT_MS):
         super().__init__(parent)
         self._on_frame = on_frame
         self._on_done = on_done
@@ -771,7 +794,8 @@ class SandboxJob(QObject):
         self._watchdog.timeout.connect(
             lambda: self._finish(False, "timed out")
         )
-        self._watchdog.start(JOB_TIMEOUT_MS)
+        self._timeout_ms = timeout_ms
+        self._watchdog.start(timeout_ms)
 
         payload = json.dumps(job).encode()
         try:
@@ -806,7 +830,7 @@ class SandboxJob(QObject):
                 # be reported as a complete render.
                 self._finish(False, "worker stopped before finishing")
             return
-        self._watchdog.start(JOB_TIMEOUT_MS)
+        self._watchdog.start(self._timeout_ms)
         self._buf += chunk
         while len(self._buf) >= 4:
             (n,) = struct.unpack(">I", self._buf[:4])
@@ -901,7 +925,7 @@ class TitleBar(QWidget):
         # HTML only: flips between rendered preview and source view.
         self.mode_btn = QPushButton("Code")
         self.mode_btn.setObjectName("openBtn")
-        self.mode_btn.clicked.connect(window.toggle_html_mode)
+        self.mode_btn.clicked.connect(window.toggle_mode)
         self.mode_btn.hide()
 
         lay = QHBoxLayout(self)
@@ -963,6 +987,8 @@ class QuickView(QWidget):
         self._pdf_labels = []  # one placeholder per page of the open PDF
         self._text_readers = set()  # readers still on a pool thread
         self._html_rendered = True  # HTML mode: rendered page vs. source
+        self._office_text = False   # office mode: thumbnail vs. extracted text
+        self._office_doc = None     # (path, payload) so the toggle is instant
         self._web_profile = None  # lazy; one hardened profile for all pages
 
         self.panel = QFrame(self)
@@ -1281,6 +1307,10 @@ class QuickView(QWidget):
                 self.show_html(path)
             elif mime.startswith(("video/", "audio/")):
                 self.show_media(path, video=mime.startswith("video/"))
+            elif mime in ARCHIVE_MIMES or ext in ARCHIVE_EXTENSIONS:
+                self.show_archive(path, mime)
+            elif mime in OFFICE_MIMES:
+                self.show_office(path, mime)
             elif mime.startswith("text/") or ext in TEXT_EXTENSIONS:
                 self.show_text(path)
             else:
@@ -1645,7 +1675,8 @@ class QuickView(QWidget):
         label.setStyleSheet("")
 
     def _pdf_show_cached(
-        self, path: str, page_key, page_w: int, total: int, img0: QImage
+        self, path: str, page_key, page_w: int, total: int, img0: QImage,
+        op: str = "pdf", extra: dict = None
     ):
         # Fill cached pages one per event-loop turn: page 1 paints
         # immediately and a 50-page reopen never freezes input.
@@ -1682,7 +1713,9 @@ class QuickView(QWidget):
                 # what is on screen and jump the reader back to the top.
                 log.debug("pdf cache incomplete at page %d: %s", i, path)
                 self._pdf_gen = None  # stop this stepper; the job takes over
-                self._pdf_render(path, page_key, page_w, start=i, lay=lay)
+                self._pdf_render(
+                    path, page_key, page_w, start=i, lay=lay, op=op, extra=extra
+                )
                 return
             self._pdf_fill_page(i, img)
             state["i"] = i + 1
@@ -1691,7 +1724,8 @@ class QuickView(QWidget):
         step()
 
     def _pdf_render(self, path: str, page_key, page_w: int, start: int = 0,
-                    lay=None):
+                    lay=None, op: str = "pdf", extra: dict = None,
+                    on_doc=None):
         """Render pages start.. into the view, streaming from the jail.
 
         With lay given the pages append to an existing page column (a
@@ -1713,6 +1747,12 @@ class QuickView(QWidget):
 
         def on_frame(png: bytes):
             if self._render_job is not state["job"] or path != self.current_path:
+                return
+            if on_doc is not None and state["job"].header.get("kind") == "doc":
+                # Not page images: a thumbnail-and-text payload, which is
+                # what a slide deck answers with.
+                on_doc(png)
+                state["shown"] += 1
                 return
             page = start + state["got"]
             state["got"] += 1
@@ -1745,18 +1785,21 @@ class QuickView(QWidget):
                 return
             self._render_job = None
             if state["shown"] == 0 and start == 0:
-                log.warning("pdf render failed: %s (%s)", path, error[:500])
+                log.warning("%s render failed: %s (%s)", op, path, error[:500])
                 self._clear_widgets()
-                self.show_fallback(path, "application/pdf")
+                self.show_fallback(
+                    path, self.mime_db.mimeTypeForFile(path).name()
+                )
             elif not ok:
                 # Keep the pages that made it; just note the truncation.
                 log.warning("pdf render truncated: %s (%s)", path, error[:500])
 
+        job = {"op": op, "page_w": page_w, "max_pages": PDF_MAX_PAGES,
+               "start": start}
+        if extra:
+            job.update(extra)
         state["job"] = self._render_job = SandboxJob(
-            self.pool, path,
-            {"op": "pdf", "page_w": page_w, "max_pages": PDF_MAX_PAGES,
-             "start": start},
-            on_frame, on_done, self,
+            self.pool, path, job, on_frame, on_done, self,
         )
 
     # ------------------------------------------------------------ media
@@ -2013,10 +2056,21 @@ class QuickView(QWidget):
             btn.setText("Preview")
             self.show_text(path)
 
-    def toggle_html_mode(self):
-        self._html_rendered = not self._html_rendered
-        if self.current_path:
-            self.show_file(self.current_path)
+    def toggle_mode(self):
+        """The titlebar's second button: HTML rendered/source, office
+        thumbnail/text. Which one it means depends on what is open."""
+        path = self.current_path
+        if not path:
+            return
+        if self.mime_db.mimeTypeForFile(path).name() in OFFICE_MIMES:
+            self._office_text = not self._office_text
+            cached = self._office_doc
+            if self._office_text and cached and cached[0] == path:
+                self._render_office(path, cached[1])  # no second decode
+                return
+        else:
+            self._html_rendered = not self._html_rendered
+        self.show_file(path)
 
     def _show_html_rendered(self, path: str):
         from PySide6.QtWebEngineCore import (
@@ -2086,6 +2140,191 @@ class QuickView(QWidget):
         self.content.addWidget(wrap)
         self.set_panel_size(520, 560)
 
+    # ------------------------------------------------------------ archives
+    # A listing, not an extraction: the worker reads headers only, so an
+    # archive that expands to terabytes costs nothing. zip and tar go through
+    # the standard library; rar, 7z and the rest through bsdtar/7z/unrar,
+    # which read the archive from /dev/fd — the jail has the descriptor and
+    # no filesystem to find a path in.
+
+    def show_archive(self, path: str, mime: str):
+        self.show_message("Loading preview…")
+        state = {"job": None, "shown": False}
+
+        def on_frame(payload: bytes):
+            if self._render_job is not state["job"] or path != self.current_path:
+                return
+            try:
+                listing = json.loads(payload)
+                entries = listing["entries"]
+            except (ValueError, TypeError, KeyError):
+                log.warning("archive worker sent a malformed listing: %s", path)
+                return
+            self._clear_widgets()
+            self._show_archive_widget(path, listing, entries)
+            state["shown"] = True
+
+        def on_done(ok: bool, error: str):
+            if self._render_job is not state["job"] or path != self.current_path:
+                return
+            self._render_job = None
+            if not state["shown"]:
+                # Encrypted, corrupt, or a format nothing here can list.
+                log.debug("no listing for %s (%s)", path, error[:200])
+                self._clear_widgets()
+                self.show_fallback(path, mime)
+
+        state["job"] = self._render_job = SandboxJob(
+            self.pool, path,
+            {"op": "archive", "name": os.path.basename(path)},
+            on_frame, on_done, self,
+        )
+
+    def _show_archive_widget(self, path: str, listing: dict, entries: list):
+        rows = []
+        for entry in entries:
+            try:
+                name, size = entry
+            except (TypeError, ValueError):
+                continue
+            rows.append(
+                f"{name}    {human_size(size)}" if size else str(name)
+            )
+        if listing.get("truncated"):
+            # count is a floor, not a total, when the lister stopped early —
+            # subtracting from it would invent a number.
+            if listing.get("count_exact", True):
+                rows.append(f"... and {listing.get('count', 0) - len(rows)} more")
+            else:
+                rows.append("... and more")
+
+        wrap = QWidget()
+        lay = QVBoxLayout(wrap)
+        head = QLabel()
+        head.setAlignment(Qt.AlignCenter)
+        # The themed mime icon (a package for archives), falling back to the
+        # provider's generic one when the icon theme has nothing.
+        mime = self.mime_db.mimeTypeForFile(path)
+        themed = QIcon.fromTheme(mime.iconName())
+        if themed.isNull():
+            themed = QIcon.fromTheme(mime.genericIconName())
+        if themed.isNull():
+            themed = self.icon_provider.icon(QFileInfo(path))
+        head.setPixmap(themed.pixmap(96, 96))
+        count = listing.get("count", len(rows))
+        exact = listing.get("count_exact", True)
+        summary = f"{count} items" if exact else f"{count}+ items"
+        if listing.get("total"):
+            size = human_size(listing["total"])
+            summary += f"  ·  {size} uncompressed" if exact else (
+                f"  ·  over {size} uncompressed"
+            )
+        sub = QLabel(summary)
+        sub.setAlignment(Qt.AlignCenter)
+        body = QPlainTextEdit()
+        body.setReadOnly(True)
+        body.setPlainText("\n".join(rows))
+        body.setFrameShape(QFrame.NoFrame)
+        lay.addWidget(head)
+        lay.addWidget(sub)
+        lay.addWidget(body, 1)
+        self.content.addWidget(wrap)
+        self.set_panel_size(640, 620)
+
+    # -------------------------------------------------------------- office
+    # OOXML and ODF are zip containers full of XML, so no office suite is
+    # needed — or wanted, since one would have to run where the jail's
+    # guarantees hold. The worker prefers the thumbnail the authoring
+    # application embedded (its own rendering of page one, for the cost of
+    # unzipping a member) and extracts text when there is none.
+
+    def show_office(self, path: str, mime: str):
+        # Laid out as pages, cached page by page, and shown by the same code
+        # that shows a PDF — a document with pages gets the page view. Slide
+        # decks have no layout path here, so for those the worker answers
+        # with the thumbnail the deck embeds plus its text instead.
+        if self._office_text and self._office_doc and self._office_doc[0] == path:
+            self._render_office(path, self._office_doc[1])
+            return
+        avail = self.screen_avail()
+        page_w = max(int(avail.width() * 0.55) - 44, 400)
+        try:
+            st = os.stat(path)
+        except OSError as exc:
+            self.show_message(str(exc))
+            return
+
+        def page_key(i: int) -> str:
+            return cache_key(path, st, page_w, 0, f"off{i}v1")
+
+        def on_doc(payload: bytes):
+            try:
+                doc = json.loads(payload)
+            except ValueError:
+                log.warning("office worker sent a malformed payload: %s", path)
+                return
+            self._office_doc = (path, doc)
+            self._render_office(path, doc)
+
+        png0 = cache_read(page_key(0))
+        img0 = QImage.fromData(png0) if png0 is not None else QImage()
+        total = 0
+        if not img0.isNull():
+            try:
+                total = int(img0.text("QuickView:PageCount"))
+            except ValueError:
+                pass
+        extra = {"name": os.path.basename(path), "limit": TEXT_PREVIEW_LIMIT}
+        if total > 0:
+            log.debug("disk cache hit (office): %s", path)
+            self._pdf_show_cached(
+                path, page_key, page_w, total, img0, op="office", extra=extra
+            )
+            return
+        if png0 is not None:
+            cache_remove(page_key(0))
+        self._pdf_render(
+            path, page_key, page_w, op="office", extra=extra, on_doc=on_doc
+        )
+
+    def _render_office(self, path: str, doc: dict):
+        """Show the cached payload in whichever mode is selected."""
+        image = doc.get("image_b64")
+        text = doc.get("text") or ""
+        btn = self.titlebar.mode_btn
+        # The button only appears when there is something to switch to.
+        btn.setVisible(bool(image) and bool(text))
+        if image and not self._office_text:
+            btn.setText("Text")
+            img = QImage.fromData(base64.b64decode(image))
+            if not img.isNull():
+                max_w, max_h = self.image_fit_box()
+                # Embedded thumbnails are small — 256x144 for a PowerPoint
+                # deck — and a slide shown at that size reads as a mistake.
+                # Enlarge to fill the panel, but never past 3x, beyond which
+                # it stops looking like a slide and starts looking like mush.
+                scale = min(
+                    max_w / img.width(), max_h / img.height(), 3.0
+                )
+                if scale > 1.0 or img.width() > max_w or img.height() > max_h:
+                    img = img.scaled(
+                        int(img.width() * min(scale, 3.0)),
+                        int(img.height() * min(scale, 3.0)),
+                        Qt.KeepAspectRatio, Qt.SmoothTransformation,
+                    )
+                self._display_image(
+                    path, QPixmap.fromImage(img), f"{img.width()}×{img.height()}"
+                )
+                btn.setVisible(bool(text))
+                return
+            log.warning("office thumbnail did not decode: %s", path)
+        btn.setText("Preview")
+        if doc.get("truncated"):
+            text += "\n\n[... truncated ...]"
+        self._clear_widgets()
+        self._show_text_widget(text)
+        self.set_title(os.path.basename(path))
+
     def show_fallback(self, path: str, mime: str):
         info = QFileInfo(path)
         icon = self.icon_provider.icon(info)
@@ -2122,7 +2361,10 @@ def forward_to_running_instance(paths: list) -> bool:
     sock = connect_to_daemon()
     if sock is None:
         return False
-    sock.write(ipc.encode_paths(paths))
+    # Already-normalized absolute paths, sent through the same request
+    # format the other clients use; normalize_arg is idempotent on them,
+    # so the daemon re-running it is a no-op.
+    sock.write(ipc.encode_request(os.getcwd(), paths))
     sock.flush()
     sock.waitForBytesWritten(500)
     sock.disconnectFromServer()
@@ -2215,7 +2457,7 @@ def main():
         def on_done():
             buf.extend(bytes(conn.readAll()))
             conn.deleteLater()
-            new_paths = ipc.decode_paths(bytes(buf))
+            new_paths = ipc.decode_request(bytes(buf))
             if not new_paths:
                 return
             if (

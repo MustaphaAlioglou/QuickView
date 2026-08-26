@@ -130,6 +130,44 @@ def main() -> int:
             )
             header(1)
             send(sock, json.dumps(doc).encode())
+        elif op == "archive":
+            # Takes the raw descriptor, not the QFile: zipfile/tarfile want a
+            # Python file object and the external listers read /dev/fd.
+            header(1)
+            send(sock, json.dumps(
+                renderers.list_archive(fd, job.get("name", ""))
+            ).encode())
+        elif op == "office":
+            # Two shapes of answer, and the header says which: laid-out
+            # page images when the document can be rendered, or a JSON
+            # payload (embedded thumbnail plus text) when it cannot, which
+            # is what happens for a slide deck.
+            first = True
+            try:
+                for count, png in renderers.office_pages(
+                    fd, job.get("name", ""), job["page_w"],
+                    job["max_pages"], job.get("start", 0),
+                ):
+                    if first:
+                        state["header"] = True
+                        send(sock, json.dumps(
+                            {"ok": True, "count": count, "kind": "pages"}
+                        ).encode())
+                        first = False
+                    send(sock, png)
+            except Exception as exc:
+                if not first:
+                    raise  # already streaming: the trailer's absence reports it
+                print("office_pages: %s" % exc, file=sys.stderr)
+            if first:  # nothing rendered — fall back to thumbnail and text
+                doc = renderers.office_preview(
+                    fd, job.get("name", ""), job["limit"]
+                )
+                state["header"] = True
+                send(sock, json.dumps(
+                    {"ok": True, "count": 1, "kind": "doc"}
+                ).encode())
+                send(sock, json.dumps(doc).encode())
         elif op == "anim":
             first = True
             for count, delay, png in renderers.render_anim(

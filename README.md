@@ -25,6 +25,8 @@ just like Quick Look on a multi-file selection.
 | HTML                | Rendered page (JS off, network blocked) — titlebar button flips to source view |
 | Video / audio       | Plays inline with a seek bar               |
 | Text / code / CSV   | Monospace view with syntax highlighting (first 1 MiB) |
+| Archives (zip, rar, 7z, tar…) | Contents listing with sizes — nothing is extracted |
+| Office docs (docx, xlsx, odt, ods) | Laid out as pages, like a PDF — headings, tables and images |
 | Folders             | Item count and contents listing            |
 | Everything else     | Icon, type, size and modified date         |
 
@@ -100,6 +102,25 @@ now; a cached preview is ~2 ms.
   holds, so no animation parser runs in this process.
 - **Text and code** — read and lexed in the jail; what comes back is the
   text plus colour spans, so no lexer runs in this process.
+- **Archives** — headers only, never an extraction, so an archive that
+  expands to terabytes costs nothing. zip and tar are read by Python's
+  standard library; rar, 7z and the rest by whichever of `bsdtar`, `7z` or
+  `unrar` exists. Those read the archive through `/dev/fd`, so the jail
+  still needs no path and no copy. Nothing to list (encrypted headers, a
+  corrupt file, no lister installed) falls back to the metadata card.
+- **Office documents** — laid out as page images in the jail and shown by
+  the same page view PDFs use, so they scroll, cache and stream identically.
+  Word-processor and spreadsheet documents (docx, odt, xlsx, ods) are
+  converted to the HTML subset `QTextDocument` lays out — headings, bold and
+  italic, tables, embedded images — which needs nothing but Qt and Python's
+  standard library. Not pixel-identical to Word, but a page rather than a
+  wall of text.
+
+  Slide decks (`.pptx`, `.odp`) are not previewed: their content is
+  absolutely positioned graphics that `QTextDocument` cannot lay out, and
+  the only thing that can is a full office suite. Legacy binary `.doc`,
+  `.xls` and `.ppt` are out for the same reason. Both show the metadata
+  card.
 - **Audio and video** — `media_worker.py` runs the whole pipeline in the
   jail and plays the audio itself through PipeWire (the one extra socket
   bound in). Because it owns the audio clock, Qt does A/V sync in there;
@@ -153,6 +174,13 @@ Honest list — these are the reads that never reach a jail:
   installs PySide6 into it; no system packages are touched.
 - **Pygments**, optional — installed into the same virtualenv by
   `install.sh`. Without it, code previews are plain text.
+- **Rust** (`rustc`), optional — `install.sh` uses it to build the small
+  fast-path client that hands a path to the daemon in under a millisecond.
+  No crates and no Cargo, just `rustc`. Without it the Python client does
+  the same job about 15 ms slower, which is the only difference.
+- **`bsdtar`, `7z` or `unrar`**, optional — used to list rar, 7z and other
+  archives that Python's standard library cannot read. zip and tar need
+  none of them. With none installed, those archives show the metadata card.
 - PipeWire or PulseAudio, if you want sound in video/audio previews.
 
 ## Install
@@ -164,9 +192,9 @@ cd QuickView
 ```
 
 `install.sh` checks for `bwrap`, builds the virtualenv, installs PySide6
-(a few hundred MB on first run), registers the Dolphin service menu, puts a
-`quickview` launcher on your `PATH`, and enables the background daemon as a
-systemd user service.
+(a few hundred MB on first run), compiles the fast-path client if `rustc` is
+present, registers the Dolphin service menu, puts a `quickview` launcher on
+your `PATH`, and enables the background daemon as a systemd user service.
 
 Then bind Space in Dolphin (one-time):
 **Menu → Configure → Configure Keyboard Shortcuts… → search "Quick Look" → Custom → Space**
@@ -175,8 +203,15 @@ Then bind Space in Dolphin (one-time):
 
 - `quickview.py` — the PySide6 app; runs as a resident daemon (systemd user
   service `quickview.service`, started at login) so previews open in ~20 ms
-- `client.py` — fast path: sends the path(s) to the daemon over a Unix
-  socket without loading Qt
+- `client.rs` — fast path: sends the path(s) to the daemon over a Unix
+  socket in under a millisecond, no Qt and no interpreter. Built by
+  `install.sh` (plain `rustc`, no crates, no Cargo). It deliberately parses
+  nothing — filenames are untrusted input and this is the only part of
+  QuickView outside the jail, so decoding happens daemon-side in `ipc.py`
+- `client.py` — the same fast path in Python, used when no Rust toolchain
+  was available at install time. Correct, just ~15 ms slower per preview
+- `ipc.py` — the client↔daemon wire format, and the single implementation
+  of path normalization
 - `worker.py` — the jailed preview worker: images, PDF pages and animation
   frames, decoding from a passed file descriptor
 - `media_worker.py` — the jailed player: decodes and plays audio/video, and
@@ -185,7 +220,8 @@ Then bind Space in Dolphin (one-time):
   standalone scripts
 - `render.py`, `render_pdf.py` — standalone one-shot versions of the image
   and PDF renderers, kept for reproducing a render by hand
-- `bin/quickview` — launcher: fast path first, full launch as fallback
+- `bin/quickview` — launcher: compiled fast path, then `client.py`, then a
+  full launch as fallback
 - `quickview-servicemenu.desktop` — Dolphin service menu ("Quick Look")
 - `.venv/` — self-contained PySide6 install, created by `install.sh` (no
   system packages touched)

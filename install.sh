@@ -57,6 +57,25 @@ fi
 
 chmod +x "$DIR/bin/quickview"
 
+# Optional: the compiled fast-path client. It hands a path to the running
+# daemon in under a millisecond, where starting a Python interpreter to do
+# the same costs ~15 ms — the whole of the perceived delay on a warm
+# preview. No crates, so plain rustc builds it without Cargo; a missing
+# toolchain costs those milliseconds and nothing else, so this is not fatal.
+# Cleared first, unconditionally: bin/quickview prefers this binary whenever
+# it is executable, so a leftover from a previous install would outrank
+# client.py — and keep talking the old wire format — if the build below never
+# replaced it. rustc writes a fresh one on success.
+rm -f "$DIR/bin/quickview-client"
+if command -v rustc >/dev/null 2>&1; then
+    echo "Building the fast-path client..."
+    rustc -O -C strip=symbols -C panic=abort --edition 2021 \
+        -o "$DIR/bin/quickview-client" "$DIR/client.rs" ||
+        echo "  (build failed — falling back to client.py, ~15 ms slower per preview)"
+else
+    echo "rustc not found — using client.py (previews stay correct, ~15 ms slower)."
+fi
+
 # Dolphin context-menu entry ("Quick Look"), rendered from the template so
 # the repo can live at any path. KDE requires the .desktop file in
 # servicemenus to carry the executable bit.
