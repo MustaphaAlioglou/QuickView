@@ -1,4 +1,4 @@
-# QuickView
+# QuickView for KDE Plasma 6
 
 A macOS **Quick Look**–style file previewer for KDE Plasma. Select a file in
 Dolphin, press **Space**, and a floating dark preview panel appears. Press
