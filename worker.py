@@ -176,6 +176,74 @@ def main() -> int:
             send(sock, json.dumps(
                 renderers.list_archive(fd, job.get("name", ""))
             ).encode())
+        elif op == "epub":
+            # Page images like the office path, but the header carries the
+            # book's table of contents as well: the chapters are a property
+            # of the layout that produced the pages, so they are computed
+            # once, in here, and travel with the first frame.
+            first = True
+            for info, png in renderers.epub_pages(
+                fd, job.get("name", ""), job["page_w"],
+                job["max_pages"], job.get("start", 0),
+                theme=job.get("theme", renderers.DEFAULT_BOOK_THEME),
+            ):
+                if first:
+                    state["header"] = True
+                    send(sock, json.dumps({
+                        "ok": True, "count": info["count"], "kind": "pages",
+                        "toc": info["chapters"], "title": info.get("title", ""),
+                    }).encode())
+                    first = False
+                send(sock, png)
+            if first:
+                raise RuntimeError("no pages laid out")
+        elif op == "markdown":
+            # Page images, like the office and epub paths: Qt's Markdown
+            # parser runs in here, and the daemon only ever sees pixels.
+            first = True
+            for info, png in renderers.markdown_pages(
+                fd, job.get("name", ""), job["page_w"], job["max_pages"],
+                job.get("start", 0),
+                job.get("theme", renderers.DEFAULT_BOOK_THEME),
+            ):
+                if first:
+                    # The headings travel with the pages, as a book's
+                    # chapters do — same header, same sidebar.
+                    state["header"] = True
+                    send(sock, json.dumps({
+                        "ok": True, "count": info["count"], "kind": "pages",
+                        "toc": info["chapters"],
+                    }).encode())
+                    first = False
+                send(sock, png)
+            if first:
+                raise RuntimeError("nothing to render")
+        elif op == "epubsearch":
+            # The book equivalent of "pdfsearch", and the same answer
+            # shape: the daemon paints rectangles without knowing which
+            # kind of document produced them.
+            header(1)
+            send(sock, json.dumps(renderers.search_epub(
+                fd, job.get("query", ""),
+                job["page_w"], job["max_pages"],
+                job.get("theme", renderers.DEFAULT_BOOK_THEME),
+            )).encode())
+        elif op == "pdfoutline":
+            # The bookmarks, for the sidebar. A separate op rather than a
+            # field on the render's header: the render streams from a
+            # generator that has already sent its header by the time a
+            # second parse of the document could finish.
+            header(1)
+            send(sock, json.dumps(renderers.pdf_outline(
+                src, job["page_w"], job.get("max_pages", 50)
+            )).encode())
+        elif op == "sheets":
+            # A workbook as a grid of text, one entry per sheet: the daemon
+            # shows it in a table with tabs rather than as page images.
+            header(1)
+            send(sock, json.dumps(
+                renderers.read_workbook(fd, job.get("name", ""))
+            ).encode())
         elif op == "office":
             # Two shapes of answer, and the header says which: laid-out
             # page images when the document can be rendered, or a JSON

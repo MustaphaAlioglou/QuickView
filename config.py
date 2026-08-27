@@ -41,6 +41,8 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "quickview.conf")
 _SETTINGS = {
     "code_style": ("preview", str, "one-dark", "QUICKVIEW_CODE_STYLE",
                    None, None),
+    "book_theme": ("preview", str, "paper", "QUICKVIEW_BOOK_THEME",
+                   None, None),
     "text_limit_kb": ("preview", int, 1024, "QUICKVIEW_TEXT_LIMIT_KB",
                       1, 1024 * 64),
     "pdf_max_pages": ("preview", int, 50, "QUICKVIEW_PDF_MAX_PAGES", 1, 2000),
@@ -62,6 +64,11 @@ DEFAULT_FILE = """\
 # native, solarized-dark … anything Pygments ships.
 code_style = one-dark
 
+# Page colours for EPUB books: paper, sepia, dark, gruvbox-dark,
+# gruvbox-light. Only the page is themed; the panel around it does not
+# change.
+book_theme = paper
+
 # How much of a text file to read, in KiB. Bigger files are shown
 # truncated — the highlighter's cost climbs with length.
 text_limit_kb = 1024
@@ -77,6 +84,16 @@ disk_cache_mb = 256
 # resident Qt process costs.
 memory_cache_mb = 96
 """
+
+
+# Settings whose value has to be one of a known set. A style name is
+# free-form (Pygments owns that list and ships dozens), but a page palette
+# is not: an unrecognised one would silently render every book white.
+# The palettes themselves live in renderers.BOOK_THEMES, which runs in the
+# jail — this is the list a person may type, and a test keeps the two equal.
+_CHOICES = {
+    "book_theme": ("paper", "sepia", "dark", "gruvbox-dark", "gruvbox-light"),
+}
 
 
 def _clamp(value, low, high):
@@ -110,7 +127,11 @@ def load(path: str = CONFIG_FILE) -> dict:
             except ValueError:
                 out[name] = default
         else:
-            out[name] = raw or default
+            choices = _CHOICES.get(name)
+            if choices and raw.lower() not in choices:
+                out[name] = default  # a typo reads as "the default", not as
+                continue             # a book with no colours at all
+            out[name] = raw.lower() if choices else (raw or default)
     return out
 
 

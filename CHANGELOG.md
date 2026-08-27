@@ -5,10 +5,153 @@ project has no version tags yet, so entries are dated.
 
 [kac]: https://keepachangelog.com/en/1.1.0/
 
+## 2026-08-27
+
+### Added
+
+- **EPUB previews.** Books used to get the metadata card. They are now laid
+  out as pages by the same pipeline PDFs and office documents use: the spine
+  is converted to the HTML subset `QTextDocument` understands and inserted
+  chapter by chapter through a cursor, with each spine document starting a
+  new page the way a chapter does in print. No reader engine is involved and
+  nothing new runs outside the jail.
+- **Markdown renders**, on the same titlebar button HTML uses: rendered
+  pages by default, the highlighted source behind **Code**, and the choice
+  is remembered for the session. Qt parses Markdown itself (md4c, behind
+  `QTextDocument.setMarkdown`), so this needs no library and no HTML
+  engine — the parse runs in the jail like every other one, a `markdown`
+  op streams page images, and they scroll and cache exactly like a PDF's.
+  Tables, task lists and fenced code all render, and the page palette
+  (`book_theme`) applies here too, so Markdown is themed with the books.
+
+  **Its headings are the sidebar**, nested by their hashes and carrying the
+  page each lands on, on the same ☰ button as a PDF's bookmarks and a
+  book's chapters. A Markdown file has no table of contents of its own, so
+  its headings are it.
+
+  Three things happen to a document before it is painted, all of them
+  fixes for things that looked broken:
+
+  - **Raw HTML tags are stripped outside code.** Qt hands an HTML block to
+    its rich-text importer mid-parse, and an unbalanced one — a
+    `<p align="center">` wrapping two `<img>` tags, the way half of
+    GitHub's READMEs open — swallows the rest of the document. This
+    project's own README imported as 2,420 characters of the 22,222 it
+    has, with every paragraph after the block silently gone. Fenced blocks
+    and inline code keep their tags, so a README documenting HTML still
+    shows it.
+  - **Images are replaced by a note naming them.** A Markdown file's images
+    sit next to it on disk and the jail has no disk — the file arrives as a
+    descriptor. Qt resolves those relative paths against the worker's
+    working directory, so an image loaded only when the document happened
+    to live inside this application's own folder: right for the project's
+    README, wrong for every file a person actually previews.
+  - **Fenced code is allowed to wrap.** Qt imports it as unbreakable lines,
+    and a page cannot scroll sideways: a long line was simply cut off at
+    the margin. Wrapping reads slightly wrong; losing half the line reads
+    as a bug.
+
+### Fixed
+
+- **Clicking a contents entry scrolled to the page, not to the heading.** A
+  rendered page here is routinely taller than the window — 2326 px against
+  a 1451 px viewport on a 3072×1728 screen — so an entry that carried only
+  a page number scrolled to the top of that page: every section of one
+  chapter went to the same place, and clicking one whose heading was
+  already on screen did nothing at all. Entries now carry where on the page
+  they sit, taken from the bookmark's own destination for a PDF and from
+  the layout that produced the pages for a book or a Markdown file, and the
+  view scrolls there. Contents cached by the previous version are
+  superseded rather than reused, since they have no offsets in them.
+- **A cached document with no cached contents re-rendered on every open.**
+  The contents entry is now written even when a document has no headings at
+  all, so "none" is stored as an answer rather than read back as "unknown".
+  Affected books and Markdown files alike.
+
+- **Ctrl+F works in EPUB previews**, with the same highlighting, the same
+  Enter / Shift+Enter stepping and the same match counter as a PDF. The
+  route there is different: a book has no text layer to extract, so a new
+  `epubsearch` op lays the book out again in the jail — same page width,
+  same style sheet, so the same layout the pages were painted from — and
+  measures each match against it line by line. What comes back is what the
+  PDF search returns, `{"matches": [{"page", "rects"}], "capped"}`, so the
+  daemon paints both with the code it already had. A match that wraps gets
+  one rectangle per line rather than one slab across the gap, and a match
+  on a page past the render cap is dropped rather than highlighted where
+  nobody can scroll.
+
+  Laying the book out twice (once to render, once to search) is deliberate:
+  a rectangle only means something in a layout, and the alternative — the
+  daemon holding a parsed book — is exactly what the jail exists to
+  prevent. Office documents still have no find, for the same reason they
+  never did: nothing re-lays them out to search.
+- **`book_theme`, a page palette for EPUB previews**: `paper` (the default),
+  `sepia`, `dark`, `gruvbox-dark` and `gruvbox-light`. The worker paints the
+  page background, body text, headings and quotations from the chosen
+  palette — only the page, never the panel around it, which is application
+  chrome. Books are also laid out in a serif at 11pt now, matching the
+  office path. The theme name goes into the page cache key, so switching
+  themes re-renders instead of serving back the old theme's pages, and an
+  unknown name in the config file reads as the default rather than as a
+  book with no colours at all.
+- **A contents sidebar, on a ☰ button top left.** It lists a PDF's bookmarks
+  or a book's chapters — nested, with page numbers — and clicking an entry
+  scrolls to that page. The button appears only for documents that have a
+  table of contents, and the sidebar stays open across files once opened.
+
+  The two sources are different but the sidebar is not. A PDF's outline
+  comes from a new `pdfoutline` op that walks Qt's bookmark model in the
+  jail; a book's chapters come out of the layout pass that produced its
+  pages (the cursor position where each chapter was inserted is what makes
+  a page number possible), so they ride on the render's header instead of
+  costing a second parse. Both are cached next to the page images, so
+  reopening a document brings its sidebar back without a worker. Entries
+  pointing past the last rendered page are dropped rather than shown as
+  rows that scroll nowhere.
+
+  Both kinds of EPUB table of contents are read — the EPUB 3 navigation
+  document and the EPUB 2 NCX — and a book with neither still gets a
+  chapter list, built from each spine file's first heading. A contents
+  entry pointing at a fragment *inside* a file splits that file at the
+  fragment, so books that keep several chapters in one document still land
+  on the right page.
+
+- **Spreadsheets are previewed as a grid, with a tab per sheet.** `.xlsx`,
+  `.xlsm` and `.ods` used to be poured into the office page view, which
+  turned a workbook into an undifferentiated wall of bordered rows labelled
+  "Sheet 1", "Sheet 2" — the sheets' real names were never read. They now go
+  to a new `sheets` worker op that reads the cells in the jail, and the
+  daemon shows them in a table: the sheet names on tabs along the bottom,
+  the workbook's own column letters and row numbers in the gutters, numeric
+  columns aligned right, and the header row picked out when the first row
+  looks like one. Hidden sheets are skipped, as they are in Excel.
+
+  Cells are now placed by their own reference rather than by the order they
+  appear in, so a sparse row — one that omits its empty cells, which is what
+  the format writes — keeps its columns instead of sliding every value to
+  the left. Dates and percentages in xlsx are ordinary numbers wearing a
+  number format, so `styles.xml` is read as well, including custom format
+  codes; without it every date in a workbook showed as a five-digit serial.
+  Floats print rounded (`15.7`, not `15.700000000000001`).
+
+  Each sheet is bounded — 2000 rows, 64 columns, 512 characters a cell, 24
+  sheets — so a million-row workbook costs what a small one does. A file
+  that will not parse as a grid still falls back to the office page view,
+  and from there to the metadata card.
+
 ## 2026-08-26
 
 ### Added
 
+- **A test suite**: `python -m unittest discover -s tests`. 51 checks in
+  about a second, no display required — the wire format (including the
+  non-UTF-8 filenames that used to fail silently), the settings parser, the
+  raw-frame bounds guard, cache encoding and keys, and the PDF search's text
+  flattening and geometry.
+- **`uninstall.sh`**, which reverses what `install.sh` did: the daemon and
+  its unit, the Dolphin service menu, the launcher on `PATH`, the cache and
+  the logs. Settings are kept unless `--purge` is passed, and the checkout is
+  never touched.
 - **A settings file at `~/.config/quickview/quickview.conf`**, written with
   its defaults commented in the first time the daemon starts and never
   rewritten afterwards. It carries the syntax-highlighting style, the text
@@ -84,6 +227,18 @@ project has no version tags yet, so entries are dated.
 
 ### Fixed
 
+- **Opaque images are cached as JPEG again.** The format check used
+  `hasAlphaChannel()`, which answers about the image *format* and not its
+  pixels — so screenshots and most PNGs, which decode to ARGB32 while being
+  fully opaque, were cached as multi-megabyte PNGs. The pixels are now
+  actually checked (~2 ms, in the worker, after the image is on screen): one
+  sample PNG's cache entry went from 190 KB to 76 KB.
+- **Preview cache entries now carry a format version.** Keys were built from
+  the source file's path, mtime, size and fit box — nothing about *how* it
+  was rendered — so changing a renderer left the old output being served for
+  ever. The PDF path had been working around this with hand-bumped `v2`
+  strings in its variant names; a single `CACHE_VERSION` now covers every
+  entry.
 - **Filenames that are not valid UTF-8 now preview instead of silently
   failing.** The wire format decoded with `errors="replace"`, which turned
   an undecodable byte into U+FFFD — a path that does not exist. Both

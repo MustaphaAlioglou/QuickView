@@ -27,15 +27,33 @@ just like Quick Look on a multi-file selection.
   Chromium's own renderer sandbox instead. The daemon holds the window, the
   socket and the cache, and no decoder at all.
 - **← / →** walks the folder, or pages through a multi-file selection.
-- **Find in PDFs.** **Ctrl+F** searches the text and highlights matches in
-  place; **Enter** / **Shift+Enter** step through them. Phrases work,
-  including across line breaks.
+- **Find in PDFs and books.** **Ctrl+F** searches the text and highlights
+  matches in place; **Enter** / **Shift+Enter** step through them. Phrases
+  work, including across line breaks.
+- **Contents sidebar.** The **☰** button top left lists a PDF's bookmarks, a
+  book's chapters or a Markdown file's headings — nested and with page
+  numbers; clicking one jumps to that heading, not merely to the page it is
+  on. The button only appears when the
+  document actually has a table of contents.
+- **EPUB books are read, not listed.** The spine is laid out as pages with
+  each chapter starting on its own page, and the book's own table of
+  contents becomes the sidebar. The page colours are a setting —
+  `book_theme = gruvbox-dark` (or `gruvbox-light`, `sepia`, `dark`, the
+  default `paper`).
+- **Markdown renders**, with a titlebar button flipping between the
+  rendered pages and the highlighted source, and its headings in the
+  contents sidebar. It uses the page palette too, so
+  `book_theme = gruvbox-dark` themes both books and Markdown.
 - **Syntax highlighting** for source files, lexed by Pygments inside the
   jail and themeable with any Pygments style.
 - **Archives are listed, never extracted**, so an archive that expands to
   terabytes costs nothing to look at.
 - **Office documents are laid out as pages**, like a PDF, rather than shown
   as a wall of text.
+- **Spreadsheets open as a real grid**, one tab per sheet, with the column
+  letters and row numbers the file actually uses, dates and percentages
+  formatted the way the workbook formats them, and numeric columns aligned
+  right.
 - **Media plays inline** with a seek bar, decoded and mixed in the jail.
 - **HTML renders** with JavaScript off and the network blocked, and the
   titlebar flips to source view.
@@ -56,12 +74,15 @@ just like Quick Look on a multi-file selection.
 |---------------------|--------------------------------------------|
 | Images (PNG, JPG, WebP, SVG, …) | Scaled to fit, shows dimensions |
 | Animated GIFs       | Played inline                              |
-| PDFs                | Scrollable multi-page view                 |
+| PDFs                | Scrollable multi-page view, Ctrl+F, bookmarks sidebar |
+| EPUB books          | Laid out as pages, Ctrl+F, chapter sidebar with page numbers |
 | HTML                | Rendered page (JS off, network blocked) — titlebar button flips to source view |
 | Video / audio       | Plays inline with a seek bar               |
+| Markdown            | Rendered pages with a headings sidebar — titlebar button flips to the highlighted source |
 | Text / code / CSV   | Monospace view with syntax highlighting (first 1 MiB) |
 | Archives (zip, rar, 7z, tar…) | Contents listing with sizes — nothing is extracted |
-| Office docs (docx, xlsx, odt, ods) | Laid out as pages, like a PDF — headings, tables and images |
+| Spreadsheets (xlsx, xlsm, ods) | A table per sheet, with tabs along the bottom |
+| Office docs (docx, odt)  | Laid out as pages, like a PDF — headings, tables and images |
 | Folders             | Item count and contents listing            |
 | Everything else     | Icon, type, size and modified date         |
 
@@ -140,6 +161,29 @@ now; a cached preview is ~2 ms.
   holds, so no animation parser runs in this process.
 - **Text and code** — read and lexed in the jail; what comes back is the
   text plus colour spans, so no lexer runs in this process.
+- **Markdown** — Qt parses Markdown itself (md4c, behind
+  `QTextDocument.setMarkdown`), so a rendered preview needs no library and
+  no HTML engine. The parse happens in the jail like every other one and
+  the daemon receives page images; the titlebar button flips to the
+  highlighted source, and the page palette applies here too.
+
+  The headings become the sidebar, nested by their hashes and carrying the
+  page each one landed on — a Markdown file has no table of contents of its
+  own, and its headings are the closest thing to one.
+
+  Three things are done to the document before it is painted. Raw HTML tags
+  are stripped outside code, because Qt hands an HTML block to its rich-text
+  importer mid-parse and an unbalanced one — `<p align="center">` around two
+  `<img>` tags, the way half of GitHub's READMEs open — swallows the rest of
+  the file: this project's own README imported as 2,420 of its 22,222
+  characters, every later paragraph silently gone. And images are replaced
+  by a note naming them, since a Markdown file's images sit next to it on
+  disk and the jail has no disk — Qt would otherwise resolve those relative
+  paths against the worker's working directory, which loads an image only
+  when the document happens to live inside this application's own folder.
+  Finally, fenced code is imported as unbreakable lines, which a page cannot
+  scroll sideways to show, so it is allowed to wrap: a wrapped line reads
+  slightly wrong, a line cut off at the margin reads as a bug.
 - **Archives** — headers only, never an extraction, so an archive that
   expands to terabytes costs nothing. zip and tar are read by Python's
   standard library; rar, 7z and the rest by whichever of `bsdtar`, `7z` or
@@ -148,11 +192,70 @@ now; a cached preview is ~2 ms.
   corrupt file, no lister installed) falls back to the metadata card.
 - **Office documents** — laid out as page images in the jail and shown by
   the same page view PDFs use, so they scroll, cache and stream identically.
-  Word-processor and spreadsheet documents (docx, odt, xlsx, ods) are
-  converted to the HTML subset `QTextDocument` lays out — headings, bold and
-  italic, tables, embedded images — which needs nothing but Qt and Python's
-  standard library. Not pixel-identical to Word, but a page rather than a
-  wall of text.
+  They have no find: a document laid out through `QTextDocument` has no
+  text layer, and unlike a book nothing here re-lays it out to search it.
+  Word-processor documents (docx, odt) are converted to the HTML subset
+  `QTextDocument` lays out — headings, bold and italic, tables, embedded
+  images — which needs nothing but Qt and Python's standard library. Not
+  pixel-identical to Word, but a page rather than a wall of text.
+
+  Spreadsheets take a different route, because a workbook is a grid rather
+  than a page: a `sheets` op reads the cells in the jail and the daemon
+  shows them in a table with a tab per sheet, hidden sheets left out. Dates
+  and percentages are numbers wearing a number format in xlsx, so the
+  format codes are read too — otherwise every date shows up as a five-digit
+  serial. Cells are placed by their own reference, so a sparse row keeps its
+  columns. Each sheet is bounded (2000 rows, 64 columns, 512 characters a
+  cell), so a million-row workbook costs what a small one does. Anything
+  that will not parse as a grid — encrypted, corrupt, an unusual shape —
+  falls back to the page view above.
+- **EPUB books** — a book is a zip of XHTML with a reading order, which is
+  close enough to what `QTextDocument` lays out that no reader engine is
+  needed. The spine is converted to the same HTML subset the office path
+  uses and inserted chunk by chunk through a cursor; the cursor's position
+  at each chunk is what turns the book's table of contents into page
+  numbers, and every spine document starts a new page, the way a chapter
+  does in print. Both kinds of contents are read — the EPUB 3 navigation
+  document and the EPUB 2 NCX — and a book with neither gets a chapter list
+  built from each file's first heading. Books are full of HTML entities
+  (`&nbsp;`, `&mdash;`) that no XML parser is required to know, so those are
+  resolved before parsing; a chapter that still will not parse is skipped
+  rather than taking the book down with it.
+
+  **Ctrl+F works in a book** the same way it does in a PDF, but by a
+  different route: there is no text layer to extract, so an `epubsearch`
+  op lays the book out again — same width, same style sheet — and measures
+  each match against that layout, line by line, into the page rectangles
+  the daemon paints. Because it is the layout the pages were rendered
+  from, a highlight lands exactly on its words; a match that wraps gets one
+  rectangle per line, and one on a page past the render cap is dropped.
+
+  A book is something a person reads for minutes rather than glances at, so
+  the page has a palette: `book_theme` picks one of paper, sepia, dark,
+  gruvbox-dark and gruvbox-light, and the worker paints the page background,
+  body text, headings and quotations from it. Only the page is themed — the
+  panel around it is application chrome. The theme name is part of the page
+  cache key, so switching themes re-renders rather than serving back the
+  pages of the old one.
+- **The contents sidebar** — one sidebar for three kinds of document. A
+  PDF's bookmarks come from a `pdfoutline` op that walks Qt's bookmark model
+  in the jail and answers with `[{title, level, page}]`; a book's chapters
+  and a Markdown file's headings come from the same layout pass that
+  produced their pages, so they ride on the render's header. Either way the daemon receives a flat list with page
+  numbers, caches it beside the page images (so a reopened document keeps
+  its sidebar without a second parse — including when the answer is "this
+  document has no headings", which is an answer worth not asking for twice),
+  and shows it in one tree.
+
+  Each entry carries where on its page it sits, not just which page. A page
+  is routinely taller than the window — 2326 px against 1451 on a
+  3072×1728 screen — so page-granular jumps make every section of one
+  chapter scroll to the same place, which from the outside looks like the
+  sidebar doing nothing. The offset comes from the bookmark's own
+  destination for a PDF, and from the layout that produced the pages for a
+  book or a Markdown file. Entries
+  pointing past the last rendered page are dropped in the jail: a sidebar
+  row that scrolls nowhere is worse than no row.
 
   Slide decks (`.pptx`, `.odp`) are not previewed: their content is
   absolutely positioned graphics that `QTextDocument` cannot lay out, and
@@ -214,16 +317,18 @@ systemctl --user restart quickview.service
 | Setting | Default | What it does |
 |---------|---------|--------------|
 | `[preview] code_style` | `one-dark` | Pygments style for source files |
+| `[preview] book_theme` | `paper` | Page colours for EPUB books and rendered Markdown: `paper`, `sepia`, `dark`, `gruvbox-dark`, `gruvbox-light` |
 | `[preview] text_limit_kb` | `1024` | How much of a text file to read before truncating |
 | `[preview] pdf_max_pages` | `50` | Pages rendered from a PDF or office document |
 | `[cache] disk_cache_mb` | `256` | Rendered previews kept on disk; `0` disables it |
 | `[cache] memory_cache_mb` | `96` | Decoded pixmaps kept in memory |
 
 Each has a matching `QUICKVIEW_*` environment variable (`QUICKVIEW_CODE_STYLE`,
-`QUICKVIEW_PDF_MAX_PAGES`, …) that wins over the file, which is handy for
-trying a value without editing anything. Out-of-range numbers are clamped and
-an unreadable file falls back to the defaults, so a typo never stops the
-daemon starting.
+`QUICKVIEW_BOOK_THEME`, `QUICKVIEW_PDF_MAX_PAGES`, …) that wins over the file,
+which is handy for trying a value without editing anything. Out-of-range
+numbers are clamped, an unknown theme name reads as the default, and an
+unreadable file falls back to the defaults — so a typo never stops the daemon
+starting.
 
 Everything else in the code is a safety bound on untrusted input — frame
 sizes, frame counts, worker timeouts — and is deliberately not configurable.
@@ -258,6 +363,9 @@ git clone https://github.com/MustaphaAlioglou/QuickView.git
 cd QuickView
 ./install.sh
 ```
+
+`./uninstall.sh` reverses all of it (add `--purge` to drop your settings and
+the virtualenv too); the checkout itself is never touched.
 
 `install.sh` checks for `bwrap`, builds the virtualenv, installs PySide6
 (a few hundred MB on first run), compiles the fast-path client if `rustc` is
@@ -309,6 +417,36 @@ keeping Qt loaded is what makes previews open in ~20 ms instead of ~1 s.
   `~/.local/share/kio/servicemenus/quickview-servicemenu.desktop`,
   `~/.local/bin/quickview`, and the cache/log dirs
   `~/.cache/quickview` and `~/.local/share/quickview`.
+
+## Tests
+
+```bash
+.venv/bin/python -m unittest discover -s tests
+```
+
+121 checks, about a second, no display needed — the Qt ones run offscreen.
+They cover the client↔daemon wire format, the settings parser, the raw-frame
+guard that stops a malformed worker header reading past a buffer, cache
+encoding and keys, the spreadsheet grid reader (cell placement, date and
+percentage formats, and the bounds that keep a hostile workbook cheap), the
+EPUB reader (package document, both kinds of table of contents, entity
+handling, chapter-to-page mapping and the search's match geometry), the
+Markdown import (raw HTML, images, theming, headings and code wrapping), and
+the PDF search's text flattening and geometry.
+
+Eleven of them want a real PDF and skip without one — point them at your own:
+
+```bash
+QUICKVIEW_TEST_PDF=~/any/bookmarked.pdf .venv/bin/python -m unittest discover -s tests
+```
+
+`QUICKVIEW_TEST_PDF` can be any PDF that has bookmarks (the outline cases).
+`QUICKVIEW_SEARCH_PDF` is separate because those checks assert match counts
+for one particular document, so only its author can run them.
+
+What they cannot check is whether a highlight box lands on the right word,
+or whether the panel looks right — that stays a matter of opening a file and
+looking at it.
 
 ## Contributing
 

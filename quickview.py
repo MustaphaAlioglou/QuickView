@@ -55,9 +55,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
-    QApplication, QFileIconProvider, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
-    QSlider, QStackedLayout, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QFileIconProvider, QFrame, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea,
+    QSizePolicy, QSlider, QStackedLayout, QTableWidget, QTableWidgetItem,
+    QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
     QGraphicsDropShadowEffect,
 )
 
@@ -67,6 +68,11 @@ SOCKET_PATH = ipc.socket_path()
 SETTINGS = config.load()
 
 TEXT_PREVIEW_LIMIT = SETTINGS["text_limit_kb"] * 1024
+# Page colours for EPUB books — see renderers.BOOK_THEMES for the palettes.
+# The name is passed to the worker (which owns the colours) and folded into
+# the page cache key, so switching themes re-renders instead of serving the
+# old one's pages back.
+BOOK_THEME = SETTINGS["book_theme"]
 # Any Pygments style name: dracula, gruvbox-dark, nord, monokai, native…
 # one-dark's own background (#282C34) is a shade off the panel's #222226,
 # so its palette sits in this panel without recolouring anything.
@@ -93,6 +99,33 @@ OFFICE_MIMES = (
     "application/vnd.oasis.opendocument.spreadsheet",
 )
 
+# Markdown gets both views: rendered pages (Qt's own Markdown parser, run
+# in the jail like every other one) and the highlighted source, with the
+# titlebar button flipping between them the way it does for HTML.
+MARKDOWN_MIMES = ("text/markdown", "text/x-markdown")
+MARKDOWN_EXTENSIONS = {".md", ".markdown", ".mdown", ".mkd", ".mkdn"}
+
+# Spreadsheets take a different route from the rest of OFFICE_MIMES: a
+# workbook is a grid, so it gets a real table with a tab per sheet instead of
+# being poured into page images. A file that will not parse as one falls back
+# to the office page view, which is why these stay in OFFICE_MIMES too.
+SPREADSHEET_MIMES = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel.sheet.macroEnabled.12",
+    "application/vnd.oasis.opendocument.spreadsheet",
+)
+SPREADSHEET_EXTENSIONS = {".xlsx", ".xlsm", ".ods"}
+
+# A book is a zip of XHTML with a reading order, which the office page
+# pipeline can lay out — see renderers.epub_pages. What it gets on top of a
+# document is a table of contents, and the sidebar that lists it.
+EPUB_MIMES = ("application/epub+zip",)
+EPUB_EXTENSIONS = {".epub"}
+# The chapter sidebar, in pixels. The panel grows by this much when the
+# sidebar opens rather than squeezing the pages, which are already rendered
+# at a fixed width and would only start scrolling sideways.
+TOC_WIDTH = 260
+
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".rst", ".log", ".ini", ".cfg", ".conf", ".toml",
     ".yaml", ".yml", ".json", ".xml", ".html", ".htm", ".css", ".js",
@@ -112,6 +145,14 @@ CACHE_DIR = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
     "quickview", "previews",
 )
+# Every cache key carries this. Entries are keyed on the source file's
+# path, mtime, size and the box it was fitted to — nothing about *how* it
+# was rendered — so without a version, changing a renderer would leave the
+# old output being served for ever. Bump it whenever a change alters the
+# bytes a preview produces. This replaces bumping variant strings by hand,
+# which is what the PDF path's "v2" used to be.
+CACHE_VERSION = 3
+
 CACHE_CAP_BYTES = SETTINGS["disk_cache_mb"] * 1024 * 1024
 # The memory tier holds screen-sized pixmaps (~25 MB each on a 4K display),
 # so it must be bounded by bytes, not entry count, in a process that never
@@ -177,9 +218,12 @@ def setup_logging():
 def cache_key(
     path: str, st: os.stat_result, max_w: int, max_h: int, variant: str = ""
 ) -> str:
-    raw = f"{path}\0{st.st_mtime_ns}\0{st.st_size}\0{max_w}x{max_h}"
-    if variant:  # e.g. "pdf3v2" — page 3 of a PDF at this width
+    raw = (f"{CACHE_VERSION}\0{path}\0{st.st_mtime_ns}\0{st.st_size}"
+           f"\0{max_w}x{max_h}")
+    if variant:  # e.g. "pdf3" — page 3 of a PDF at this width
         raw += f"\0{variant}"
+    # The .png suffix is part of an opaque key, not a claim about the
+    # contents: an image entry is JPEG whenever it has no alpha.
     return hashlib.sha256(raw.encode()).hexdigest() + ".png"
 
 
@@ -1004,6 +1048,16 @@ class TitleBar(QWidget):
         self.open_btn.setObjectName("openBtn")
         self.open_btn.clicked.connect(window.open_externally)
 
+        # Documents with a table of contents: opens the chapter sidebar.
+        # Top left, next to the close button, where every reader puts it.
+        self.toc_btn = QPushButton("☰")
+        self.toc_btn.setObjectName("tocBtn")
+        self.toc_btn.setFixedSize(24, 24)
+        self.toc_btn.setCheckable(True)
+        self.toc_btn.setToolTip("Contents")
+        self.toc_btn.clicked.connect(window.toggle_toc)
+        self.toc_btn.hide()
+
         # HTML only: flips between rendered preview and source view.
         self.mode_btn = QPushButton("Code")
         self.mode_btn.setObjectName("openBtn")
@@ -1013,6 +1067,7 @@ class TitleBar(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 8, 12, 8)
         lay.addWidget(self.close_btn)
+        lay.addWidget(self.toc_btn)
         lay.addWidget(self.title, 1)
         lay.addWidget(self.mode_btn)
         lay.addWidget(self.open_btn)
@@ -1070,7 +1125,8 @@ class QuickView(QWidget):
         self._pdf_overlays = []  # a MatchOverlay per page, for find results
         self._find_bar = None    # the Ctrl+F row, while a PDF is showing
         self._find_scroll = None  # the page column's QScrollArea
-        self._find_path = None   # the PDF find is currently bound to
+        self._find_path = None   # the document find is currently bound to
+        self._find_op = None     # which search op that document needs
         self._find_hits = []     # [[page, x, y, w, h], ...] for the query
         self._find_of = None     # the query _find_hits belongs to
         self._find_loose = False  # hits came from the spaces-ignored pass
@@ -1079,8 +1135,16 @@ class QuickView(QWidget):
         self._find_job = None
         self._text_readers = set()  # readers still on a pool thread
         self._html_rendered = True  # HTML mode: rendered page vs. source
+        self._md_rendered = True    # Markdown mode: rendered pages vs. source
         self._office_text = False   # office mode: thumbnail vs. extracted text
         self._office_doc = None     # (path, payload) so the toggle is instant
+        self._toc_entries = []   # chapters/bookmarks of the open document
+        self._toc_sidebar = None  # the tree widget, while one is showing
+        self._toc_body = None     # layout it lives in, for a late arrival
+        self._toc_open = False    # sidebar shown? remembered across files
+        self._toc_job = None      # the PDF outline fetch, while in flight
+        self._page_scroll = None  # the page column, for scroll-to-page
+        self._page_size = None    # panel size without the sidebar
         self._web_profile = None  # lazy; one hardened profile for all pages
 
         self.panel = QFrame(self)
@@ -1133,6 +1197,13 @@ class QuickView(QWidget):
                 font-size: 12px;
             }
             #openBtn:hover { background-color: #4a4a4d; }
+            #tocBtn {
+                background-color: #38383c; color: #d0d0d4;
+                border: none; border-radius: 6px;
+                font-size: 12px; font-weight: bold;
+            }
+            #tocBtn:hover { background-color: #4a4a4d; }
+            #tocBtn:checked { background-color: #4f6a99; color: #ffffff; }
             QPlainTextEdit {
                 background-color: #222226; color: #dcdcde;
                 border: none; padding: 8px 14px;
@@ -1308,6 +1379,14 @@ class QuickView(QWidget):
 
     def clear_content(self):
         self._cancel_render()
+        # A table of contents belongs to one document. Cleared here rather
+        # than in _clear_widgets(), which also runs mid-render when the
+        # page column replaces the loading card — and would throw away a
+        # sidebar the worker has already delivered.
+        self._toc_entries = []
+        if self._toc_job is not None:
+            self._toc_job.cancel()
+            self._toc_job = None
         if self.media is not None:
             # Killing the worker is the whole teardown: the decoder, the
             # audio stream and the frame buffer all live in that process, so
@@ -1328,11 +1407,18 @@ class QuickView(QWidget):
         self._pdf_gen = None
         self._pdf_labels = []  # they are about to be deleted with the view
         self._pdf_overlays = []
+        # The sidebar is a child of the view being torn down; the entries
+        # themselves belong to the file and are cleared by clear_content().
+        self._toc_sidebar = None
+        self._toc_body = None
+        self._page_scroll = None
+        self._page_size = None
         # The find row is a child of the view being torn down, so drop every
         # reference to it rather than leaving Ctrl+F pointed at a dead widget.
         self._find_bar = None
         self._find_scroll = None
         self._find_path = None
+        self._find_op = None
         self._find_hits = []
         self._find_of = None
         self._find_at = -1
@@ -1395,6 +1481,7 @@ class QuickView(QWidget):
         name = os.path.basename(path) or path
         self.set_title(name)
         self.titlebar.mode_btn.setVisible(False)  # show_html() re-enables
+        self.titlebar.toc_btn.setVisible(False)   # _set_toc() re-enables
 
         if not os.path.exists(path):
             self.show_message(f"File not found:\n{path}")
@@ -1423,10 +1510,16 @@ class QuickView(QWidget):
                 self.show_html(path)
             elif mime.startswith(("video/", "audio/")):
                 self.show_media(path, video=mime.startswith("video/"))
+            elif mime in EPUB_MIMES or ext in EPUB_EXTENSIONS:
+                self.show_epub(path)
             elif mime in ARCHIVE_MIMES or ext in ARCHIVE_EXTENSIONS:
                 self.show_archive(path, mime)
+            elif mime in SPREADSHEET_MIMES or ext in SPREADSHEET_EXTENSIONS:
+                self.show_sheets(path, mime)
             elif mime in OFFICE_MIMES:
                 self.show_office(path, mime)
+            elif mime in MARKDOWN_MIMES or ext in MARKDOWN_EXTENSIONS:
+                self.show_markdown(path)
             elif mime.startswith("text/") or ext in TEXT_EXTENSIONS:
                 self.show_text(path)
             else:
@@ -1770,7 +1863,21 @@ class QuickView(QWidget):
             return
 
         def page_key(i: int) -> str:
-            return cache_key(path, st, page_w, 0, f"pdf{i}v2")
+            return cache_key(path, st, page_w, 0, f"pdf{i}")
+
+        # The bookmarks, for the sidebar. Cached like a page is, because
+        # the alternative is a second worker on every open of every PDF —
+        # and most of the cost of one is the spawn, not the parse.
+        toc_key = cache_key(path, st, page_w, 0, "toc2")
+        cached_toc = cache_read(toc_key)
+        if cached_toc is not None:
+            try:
+                self._toc_entries = json.loads(cached_toc)
+            except ValueError:
+                cache_remove(toc_key)
+                cached_toc = None
+        if cached_toc is None:
+            self._fetch_outline(path, toc_key, page_w)
 
         png0 = cache_read(page_key(0))
         img0 = QImage.fromData(png0) if png0 is not None else QImage()
@@ -1789,7 +1896,7 @@ class QuickView(QWidget):
             self._pdf_render(path, page_key, page_w)
 
     def _pdf_begin_view(self, path: str, total: int, sizes: list,
-                        searchable: bool = False, page_w: int = 0):
+                        op: str = "pdf", page_w: int = 0):
         """Swap in the page column, at its full height from the start.
 
         Every page gets a placeholder of its real size before any pixels
@@ -1822,19 +1929,27 @@ class QuickView(QWidget):
         scroll.setStyleSheet("background: #222226;")
         scroll.setWidget(col)
         # Wrapper so the find row can sit above the pages and scroll with
-        # neither of them.
+        # neither of them, and the contents sidebar beside both.
         holder = QWidget()
         hlay = QVBoxLayout(holder)
         hlay.setContentsMargins(0, 0, 0, 0)
         hlay.setSpacing(0)
         find_bar = self._build_find_bar()
         hlay.addWidget(find_bar)
-        hlay.addWidget(scroll, 1)
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(scroll, 1)
+        hlay.addLayout(body, 1)
         self.content.addWidget(holder)
-        # Find is only wired up for real PDFs: office documents share this
-        # view but are laid out through QTextDocument, which getAllText
-        # knows nothing about.
-        if searchable:
+        self._page_scroll = scroll
+        self._toc_body = body
+        # Find works for documents whose text the jail can locate on a
+        # page: a PDF through its text layer, a book through the layout it
+        # was rendered from. Office documents share this view but have
+        # neither, so for them the row stays hidden.
+        self._find_op = {"pdf": "pdfsearch", "epub": "epubsearch"}.get(op)
+        if self._find_op:
             self._find_bar = find_bar
             self._find_scroll = scroll
             self._find_path = path
@@ -1842,12 +1957,328 @@ class QuickView(QWidget):
         else:
             find_bar.hide()
         avail = self.screen_avail()
-        self.set_panel_size(int(avail.width() * 0.55), int(avail.height() * 0.85))
+        self._page_size = (
+            int(avail.width() * 0.55), int(avail.height() * 0.85)
+        )
+        # Built after the panel has a size so the tree is laid out once.
+        self._refresh_toc()
+        self.titlebar.toc_btn.setVisible(bool(self._toc_entries))
+        self.titlebar.toc_btn.setChecked(
+            self._toc_open and bool(self._toc_entries)
+        )
+        self._size_page_view()
         pages = f"{total} pages"
         if total > PDF_MAX_PAGES:
             pages += f" (showing first {PDF_MAX_PAGES})"
         self.set_title(f"{os.path.basename(path)}  —  {pages}")
         return lay
+
+    # ------------------------------------------------------------ markdown
+    # Two views of the same file, on the titlebar button: rendered pages by
+    # default, the highlighted source behind "Code". The render goes through
+    # the page pipeline — Qt's Markdown parser runs in the jail and the
+    # daemon receives page images, exactly as it does for a PDF.
+
+    def show_markdown(self, path: str):
+        btn = self.titlebar.mode_btn
+        btn.setVisible(True)
+        if not self._md_rendered:
+            btn.setText("Preview")
+            self.show_text(path)
+            return
+        btn.setText("Code")
+
+        avail = self.screen_avail()
+        page_w = max(int(avail.width() * 0.55) - 44, 400)
+        try:
+            st = os.stat(path)
+        except OSError as exc:
+            self.show_message(str(exc))
+            return
+
+        def page_key(i: int) -> str:
+            return cache_key(path, st, page_w, 0, f"md-{BOOK_THEME}{i}")
+
+        toc_key = cache_key(path, st, page_w, 0, "toc2")
+        cached_toc = cache_read(toc_key)
+        if cached_toc is not None:
+            try:
+                self._toc_entries = json.loads(cached_toc)
+            except ValueError:
+                cache_remove(toc_key)
+                cached_toc = None
+
+        png0 = cache_read(page_key(0))
+        img0 = QImage.fromData(png0) if png0 is not None else QImage()
+        total = 0
+        if not img0.isNull():
+            try:
+                total = int(img0.text("QuickView:PageCount"))
+            except ValueError:
+                pass
+        extra = {"name": os.path.basename(path), "theme": BOOK_THEME}
+        # Pages and headings are produced together, so a cache holding one
+        # without the other is half a preview: re-render instead. The
+        # contents entry is written even when a document has no headings at
+        # all, so "no entry" means unknown rather than none.
+        if total > 0 and cached_toc is not None:
+            log.debug("disk cache hit (markdown): %s", path)
+            self._pdf_show_cached(
+                path, page_key, page_w, total, img0, op="markdown", extra=extra
+            )
+            return
+        if png0 is not None:
+            cache_remove(page_key(0))
+        self._pdf_render(
+            path, page_key, page_w, op="markdown", extra=extra, toc_key=toc_key
+        )
+
+    # ---------------------------------------------------------------- epub
+    # A book goes through the page pipeline PDFs and office documents use:
+    # the jail lays the spine out as pages and streams them, and the header
+    # of that stream carries the table of contents, which is a property of
+    # the layout that produced the pages and so can only be computed there.
+
+    def show_epub(self, path: str):
+        avail = self.screen_avail()
+        page_w = max(int(avail.width() * 0.55) - 44, 400)
+        try:
+            st = os.stat(path)
+        except OSError as exc:
+            self.show_message(str(exc))
+            return
+
+        def page_key(i: int) -> str:
+            return cache_key(path, st, page_w, 0, f"epub-{BOOK_THEME}{i}")
+
+        toc_key = cache_key(path, st, page_w, 0, "toc2")
+        cached_toc = cache_read(toc_key)
+        if cached_toc is not None:
+            try:
+                self._toc_entries = json.loads(cached_toc)
+            except ValueError:
+                cache_remove(toc_key)
+
+        png0 = cache_read(page_key(0))
+        img0 = QImage.fromData(png0) if png0 is not None else QImage()
+        total = 0
+        if not img0.isNull():
+            try:
+                total = int(img0.text("QuickView:PageCount"))
+            except ValueError:
+                pass
+        extra = {"name": os.path.basename(path), "theme": BOOK_THEME}
+        # A cached book with no cached contents is a cache from before the
+        # sidebar existed (or a pruned entry): re-render rather than show a
+        # book with its chapters missing, since the two are produced
+        # together and there is no cheaper way to get one back. An empty
+        # contents *entry* is an answer, though — see show_markdown.
+        if total > 0 and cached_toc is not None:
+            log.debug("disk cache hit (epub): %s", path)
+            self._pdf_show_cached(
+                path, page_key, page_w, total, img0, op="epub", extra=extra
+            )
+            return
+        if png0 is not None:
+            cache_remove(page_key(0))
+        self._pdf_render(
+            path, page_key, page_w, op="epub", extra=extra, toc_key=toc_key,
+        )
+
+    # ------------------------------------------------------------ contents
+    # One sidebar for two kinds of document: a PDF's bookmarks (op
+    # "pdfoutline") and a book's chapters (folded into the "epub" render's
+    # header). Both arrive as [{title, level, page}] and are shown by the
+    # same tree, so the reader gets the same button in the same corner
+    # whichever one is open.
+
+    TOC_STYLE = """
+        QWidget { background-color: #26262b; }
+        #tocHead {
+            color: #8e8e98; font-size: 11px; font-weight: 600;
+            padding: 10px 12px 6px 12px; letter-spacing: 1px;
+        }
+        QTreeWidget {
+            background-color: #26262b; color: #c8c8ce; border: none;
+            border-right: 1px solid #34343a; font-size: 12px;
+            outline: none; padding: 6px 0;
+        }
+        QTreeWidget::item { padding: 4px 2px; border-radius: 4px; }
+        QTreeWidget::item:hover { background-color: #303036; }
+        QTreeWidget::item:selected { background-color: #3f4f70; color: #fff; }
+        QTreeWidget::branch { background: transparent; }
+        QScrollBar:vertical { background: #26262b; border: none; width: 10px; }
+        QScrollBar::handle:vertical {
+            background: #4a4a51; border-radius: 5px; min-height: 30px;
+        }
+        QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
+        QScrollBar::add-page, QScrollBar::sub-page { background: none; }
+    """
+
+    def _fetch_outline(self, path: str, toc_key: str, page_w: int):
+        """Ask the jail for a PDF's bookmarks, alongside the page render.
+
+        page_w goes with the request because a bookmark's destination comes
+        back as an offset into the rendered page, which only means anything
+        at the width the pages are rendered at.
+        """
+        if self._toc_job is not None:
+            self._toc_job.cancel()
+            self._toc_job = None
+        got = {"blob": None, "job": None}
+
+        def on_frame(payload: bytes):
+            got["blob"] = payload
+
+        def on_done(ok: bool, error: str):
+            if self._toc_job is not got["job"]:
+                return
+            self._toc_job = None
+            if not ok:
+                log.debug("no outline for %s (%s)", path, error[:200])
+                return
+            try:
+                entries = json.loads(got["blob"] or b"[]")
+            except ValueError:
+                log.warning("outline worker sent malformed json: %s", path)
+                return
+            self._set_toc(path, entries, toc_key)
+
+        got["job"] = self._toc_job = SandboxJob(
+            self.pool, path,
+            {"op": "pdfoutline", "page_w": page_w,
+             "max_pages": PDF_MAX_PAGES},
+            on_frame, on_done, self,
+        )
+
+    def _set_toc(self, path: str, entries: list, toc_key: str = None):
+        """Adopt a table of contents, cache it, and show its button."""
+        if path != self.current_path:
+            return  # the reader moved on while the worker was parsing
+        entries = [e for e in entries if isinstance(e, dict)]
+        self._toc_entries = entries
+        if toc_key:
+            # Cached even when empty: that a document has no contents is
+            # itself the answer, and one worth not asking for twice.
+            cache_write(toc_key, json.dumps(entries).encode())
+        self.titlebar.toc_btn.setVisible(bool(entries))
+        self.titlebar.toc_btn.setChecked(self._toc_open and bool(entries))
+        self._refresh_toc()
+
+    def _refresh_toc(self):
+        """Rebuild the sidebar for whatever is in _toc_entries."""
+        if self._toc_body is None:
+            return  # nothing that can hold a sidebar is showing
+        if self._toc_sidebar is not None:
+            self._toc_body.removeWidget(self._toc_sidebar)
+            self._toc_sidebar.deleteLater()
+            self._toc_sidebar = None
+        if not self._toc_entries:
+            return
+        self._toc_sidebar = self._build_toc(self._toc_entries)
+        self._toc_body.insertWidget(0, self._toc_sidebar)
+        self._toc_sidebar.setVisible(self._toc_open)
+        self._size_page_view()
+
+    def _build_toc(self, entries: list) -> QWidget:
+        tree = QTreeWidget()
+        tree.setHeaderHidden(True)
+        tree.setColumnCount(2)
+        tree.setIndentation(12)
+        tree.setFocusPolicy(Qt.NoFocus)  # keys stay with the preview
+        # Levels come from the document, so they can skip a step (a level-3
+        # bookmark under a level-1 one) or start deep. Each entry hangs off
+        # the nearest shallower one that came before it, which is what the
+        # document meant however it numbered things.
+        last = {}
+        for entry in entries:
+            title = str(entry.get("title", "")).strip()
+            if not title:
+                continue
+            try:
+                page = int(entry.get("page", 0))
+                level = max(0, int(entry.get("level", 0)))
+            except (TypeError, ValueError):
+                continue
+            parent = None
+            for depth in range(level - 1, -1, -1):
+                if depth in last:
+                    parent = last[depth]
+                    break
+            item = QTreeWidgetItem(parent) if parent else QTreeWidgetItem(tree)
+            item.setText(0, title)
+            item.setText(1, str(page + 1))
+            item.setToolTip(0, f"{title}  ·  page {page + 1}")
+            item.setForeground(1, QColor("#7e7e88"))
+            item.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+            try:
+                offset = max(0, int(entry.get("y", 0)))
+            except (TypeError, ValueError):
+                offset = 0
+            item.setData(0, Qt.UserRole, (page, offset))
+            last[level] = item
+            for deeper in [d for d in last if d > level]:
+                del last[deeper]
+        tree.expandAll()
+        # The page-number column takes what it needs and the titles get the
+        # rest. Without turning the last section's stretch off, Qt gives the
+        # slack to the numbers and elides every title at half width.
+        tree.header().setStretchLastSection(False)
+        tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        tree.itemClicked.connect(self._toc_clicked)
+        tree.itemActivated.connect(self._toc_clicked)
+
+        panel = QWidget()
+        panel.setStyleSheet(self.TOC_STYLE)
+        panel.setFixedWidth(TOC_WIDTH)
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        head = QLabel("Contents")
+        head.setObjectName("tocHead")
+        lay.addWidget(head)
+        lay.addWidget(tree, 1)
+        return panel
+
+    def _toc_clicked(self, item, _column: int = 0):
+        where = item.data(0, Qt.UserRole)
+        if isinstance(where, (tuple, list)) and len(where) == 2:
+            self.scroll_to_page(int(where[0]), int(where[1]))
+
+    def toggle_toc(self):
+        """The titlebar's ☰ : show or hide the chapter sidebar."""
+        self._toc_open = not self._toc_open
+        self.titlebar.toc_btn.setChecked(self._toc_open)
+        if self._toc_sidebar is not None:
+            self._toc_sidebar.setVisible(self._toc_open)
+        self._size_page_view()
+
+    def scroll_to_page(self, page: int, offset: int = 0):
+        """Put a point on a page at the top of the view.
+
+        offset is how far down that page the entry actually sits. Scrolling
+        to the top of the page is not enough: a page here is routinely
+        taller than the window (2326 px against 1451 on a 3072x1728 screen),
+        so five sections of one chapter would all scroll to the same place
+        and clicking any of them would look like nothing happening.
+        """
+        if self._page_scroll is None or not 0 <= page < len(self._pdf_labels):
+            return
+        label = self._pdf_labels[page]
+        top = label.mapTo(self._page_scroll.widget(), QPoint(0, 0)).y()
+        # Never past the end of the page it belongs to.
+        top += max(0, min(offset, label.height() - 1))
+        bar = self._page_scroll.verticalScrollBar()
+        bar.setValue(max(0, top - 14))  # 14 = the column's top margin
+
+    def _size_page_view(self):
+        """Size the panel for the page column, plus the sidebar if open."""
+        if self._page_size is None:
+            return
+        w, h = self._page_size
+        showing = self._toc_sidebar is not None and self._toc_open
+        self.set_panel_size(w + (TOC_WIDTH if showing else 0), h)
 
     # ------------------------------------------------------------ find
     # Ctrl+F over a PDF. The daemon owns no parser, so the query goes to a
@@ -1987,11 +2418,15 @@ class QuickView(QWidget):
                 payload.get("capped", False), payload.get("loose", False)
             )
 
+        job = {"op": self._find_op, "query": query,
+               "page_w": self._find_page_w, "max_pages": PDF_MAX_PAGES}
+        if self._find_op == "epubsearch":
+            # The book has to be laid out again to place a match, and a
+            # different palette is a different style sheet — so the search
+            # is told which one the pages on screen were rendered with.
+            job["theme"] = BOOK_THEME
         self._find_job = SandboxJob(
-            self.pool, self._find_path,
-            {"op": "pdfsearch", "query": query, "page_w": self._find_page_w,
-             "max_pages": PDF_MAX_PAGES},
-            on_frame, on_done, self,
+            self.pool, self._find_path, job, on_frame, on_done, self,
         )
 
     def _update_find_label(self, capped: bool = False, loose: bool = None):
@@ -2085,7 +2520,7 @@ class QuickView(QWidget):
             head = cache_read_head(page_key(i))
             sizes.append((head and png_size(head)) or fallback)
         lay = self._pdf_begin_view(
-            path, total, sizes, searchable=(op == "pdf"), page_w=page_w
+            path, total, sizes, op=op, page_w=page_w
         )
         gen = object()
         self._pdf_gen = gen
@@ -2121,7 +2556,7 @@ class QuickView(QWidget):
 
     def _pdf_render(self, path: str, page_key, page_w: int, start: int = 0,
                     lay=None, op: str = "pdf", extra: dict = None,
-                    on_doc=None):
+                    on_doc=None, toc_key: str = None):
         """Render pages start.. into the view, streaming from the jail.
 
         With lay given the pages append to an existing page column (a
@@ -2170,9 +2605,15 @@ class QuickView(QWidget):
                 # the column is its full height before the reader scrolls.
                 count = min(total, PDF_MAX_PAGES)
                 log.debug("pdf first page: %s", path)
+                # A book's chapters ride on the render's header: they come
+                # out of the same layout pass that produced these pages, so
+                # they are here before the view that shows them is built.
+                header_toc = state["job"].header.get("toc")
+                if header_toc is not None:
+                    self._set_toc(path, header_toc, toc_key)
                 state["lay"] = self._pdf_begin_view(
                     path, total, [(img.width(), img.height())] * count,
-                    searchable=(op == "pdf"), page_w=page_w,
+                    op=op, page_w=page_w,
                 )
             cache_write(page_key(page), png)
             self._pdf_fill_page(page, img)
@@ -2460,12 +2901,16 @@ class QuickView(QWidget):
         path = self.current_path
         if not path:
             return
-        if self.mime_db.mimeTypeForFile(path).name() in OFFICE_MIMES:
+        mime = self.mime_db.mimeTypeForFile(path).name()
+        ext = os.path.splitext(path)[1].lower()
+        if mime in OFFICE_MIMES:
             self._office_text = not self._office_text
             cached = self._office_doc
             if self._office_text and cached and cached[0] == path:
                 self._render_office(path, cached[1])  # no second decode
                 return
+        elif mime in MARKDOWN_MIMES or ext in MARKDOWN_EXTENSIONS:
+            self._md_rendered = not self._md_rendered
         else:
             self._html_rendered = not self._html_rendered
         self.show_file(path)
@@ -2653,7 +3098,7 @@ class QuickView(QWidget):
             return
 
         def page_key(i: int) -> str:
-            return cache_key(path, st, page_w, 0, f"off{i}v1")
+            return cache_key(path, st, page_w, 0, f"off{i}")
 
         def on_doc(payload: bytes):
             try:
@@ -2722,6 +3167,237 @@ class QuickView(QWidget):
         self._clear_widgets()
         self._show_text_widget(text)
         self.set_title(os.path.basename(path))
+
+    # -------------------------------------------------------- spreadsheets
+    # A workbook shown as what it is: a grid per sheet, with the sheet tabs
+    # along the bottom the way the authoring application draws them. The
+    # cells are parsed in the jail and arrive as text, so nothing here
+    # evaluates a formula or touches the file.
+
+    SHEET_CELL_MAX_W = 300
+    SHEET_STYLE = """
+        QTableWidget {
+            background-color: #222226; alternate-background-color: #26262b;
+            color: #dcdcde; gridline-color: #34343a; border: none;
+            font-size: 12px;
+        }
+        QTableWidget::item { padding: 2px 6px; }
+        QTableWidget::item:selected {
+            background-color: #3a4a63; color: #ffffff;
+        }
+        QHeaderView { background-color: #2b2b30; }
+        QHeaderView::section {
+            background-color: #2b2b30; color: #9a9aa2; border: none;
+            border-right: 1px solid #34343a;
+            border-bottom: 1px solid #34343a;
+            padding: 3px 6px; font-size: 11px;
+        }
+        QTableCornerButton::section {
+            background-color: #2b2b30; border: none;
+            border-right: 1px solid #34343a;
+            border-bottom: 1px solid #34343a;
+        }
+        QTabWidget::pane { border: none; }
+        QTabBar { qproperty-drawBase: 0; }
+        QTabBar::tab {
+            background-color: #2b2b30; color: #b6b6bd;
+            border: 1px solid #34343a; border-top: none;
+            border-bottom-left-radius: 6px; border-bottom-right-radius: 6px;
+            padding: 4px 14px; margin-right: 3px; font-size: 12px;
+        }
+        QTabBar::tab:selected { background-color: #3c3c44; color: #ffffff; }
+        QTabBar::tab:hover:!selected { background-color: #34343a; }
+        QScrollBar:vertical, QScrollBar:horizontal {
+            background: #222226; border: none;
+        }
+        QScrollBar:vertical { width: 10px; }
+        QScrollBar:horizontal { height: 10px; }
+        QScrollBar::handle {
+            background: #4a4a51; border-radius: 5px; min-height: 30px;
+            min-width: 30px;
+        }
+        QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
+        QScrollBar::add-page, QScrollBar::sub-page { background: none; }
+    """
+
+    def show_sheets(self, path: str, mime: str):
+        self.show_message("Loading preview…")
+        state = {"job": None, "shown": False}
+
+        def on_frame(payload: bytes):
+            if self._render_job is not state["job"] or path != self.current_path:
+                return
+            try:
+                book = json.loads(payload)
+                sheets = [s for s in book["sheets"] if s.get("rows")]
+            except (ValueError, TypeError, KeyError):
+                log.warning("sheet worker sent a malformed workbook: %s", path)
+                return
+            if not sheets:
+                return  # on_done falls back to the page view
+            self._clear_widgets()
+            self._show_sheets_widget(sheets, book.get("clipped", False))
+            state["shown"] = True
+
+        def on_done(ok: bool, error: str):
+            if self._render_job is not state["job"] or path != self.current_path:
+                return
+            self._render_job = None
+            if not state["shown"]:
+                # Encrypted, corrupt, or a shape this parser does not know.
+                # The office path can still lay it out, or show its thumbnail.
+                log.debug("no grid for %s (%s)", path, error[:200])
+                self._clear_widgets()
+                if mime in OFFICE_MIMES:
+                    self.show_office(path, mime)
+                else:
+                    self.show_fallback(path, mime)
+
+        state["job"] = self._render_job = SandboxJob(
+            self.pool, path,
+            {"op": "sheets", "name": os.path.basename(path)},
+            on_frame, on_done, self,
+        )
+
+    def _show_sheets_widget(self, sheets: list, clipped: bool):
+        wrap = QWidget()
+        lay = QVBoxLayout(wrap)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        wrap.setStyleSheet(self.SHEET_STYLE)
+
+        status = QLabel()
+        status.setStyleSheet(
+            "color:#8e8e96; font-size:11px; padding:5px 12px;"
+            "background-color:#222226;"
+        )
+
+        widths = []
+        if len(sheets) == 1:
+            table, width = self._sheet_table(sheets[0])
+            widths.append(width)
+            lay.addWidget(table, 1)
+        else:
+            tabs = QTabWidget()
+            # Tabs at the bottom, as a spreadsheet draws them.
+            tabs.setTabPosition(QTabWidget.South)
+            tabs.setDocumentMode(True)
+            for sheet in sheets:
+                table, width = self._sheet_table(sheet)
+                widths.append(width)
+                tabs.addTab(table, sheet.get("name") or "Sheet")
+            # The line under the tabs describes the sheet being looked at,
+            # not the first one in the book.
+            tabs.currentChanged.connect(
+                lambda index: status.setText(
+                    self._sheet_summary(sheets, clipped, index)
+                )
+            )
+            lay.addWidget(tabs, 1)
+
+        status.setText(self._sheet_summary(sheets, clipped, 0))
+        lay.addWidget(status)
+
+        self.content.addWidget(wrap)
+        rows = max(len(sheet["rows"]) for sheet in sheets)
+        self.set_panel_size(
+            min(max(widths) + 24, 1400),
+            min(rows * 24 + 96, 900),
+        )
+
+    @staticmethod
+    def _sheet_summary(sheets: list, clipped: bool, index: int = 0) -> str:
+        sheet = sheets[index] if 0 <= index < len(sheets) else sheets[0]
+        parts = []
+        if len(sheets) > 1:
+            parts.append(f"{len(sheets)} sheets")
+        parts.append(
+            "%d rows × %d columns" % (len(sheet["rows"]), sheet.get("cols", 0))
+        )
+        if clipped or sheet.get("clipped"):
+            parts.append("preview truncated")
+        return "  ·  ".join(parts)
+
+    def _sheet_table(self, sheet: dict):
+        """One sheet as a table, plus the width it would like to be.
+
+        Columns keep their spreadsheet letters and rows their real numbers,
+        so a cell in the preview is the same cell the user would find in
+        Excel — the trimmed-away empty margin included.
+        """
+        rows = sheet["rows"]
+        cols = sheet.get("cols") or (len(rows[0]) if rows else 0)
+        align = sheet.get("align") or []
+        first_col = int(sheet.get("first_col", 0))
+        first_row = int(sheet.get("first_row", 1))
+
+        table = QTableWidget(len(rows), cols)
+        table.setHorizontalHeaderLabels(
+            [self._column_letters(first_col + c) for c in range(cols)]
+        )
+        table.setVerticalHeaderLabels(
+            [str(first_row + r) for r in range(len(rows))]
+        )
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setAlternatingRowColors(True)
+        table.setShowGrid(True)
+        table.setWordWrap(False)
+        table.setFrameShape(QFrame.NoFrame)
+        table.verticalHeader().setDefaultSectionSize(24)
+
+        header_row = self._looks_like_header(rows)
+        bold = QFont()
+        bold.setBold(True)
+        for r, row in enumerate(rows):
+            for c in range(cols):
+                text = row[c] if c < len(row) else ""
+                item = QTableWidgetItem(text)
+                if r == 0 and header_row:
+                    item.setFont(bold)
+                    item.setForeground(QColor("#f2f2f5"))
+                    item.setBackground(QColor("#2f2f36"))
+                    item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                elif (align[c] if c < len(align) else "l") == "r":
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                else:
+                    item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                table.setItem(r, c, item)
+
+        table.resizeColumnsToContents()
+        width = table.verticalHeader().width() + 2
+        for c in range(cols):
+            # Wide enough to read, never so wide that one paragraph-sized
+            # cell pushes every other column off the panel.
+            size = min(max(table.columnWidth(c) + 12, 64), self.SHEET_CELL_MAX_W)
+            table.setColumnWidth(c, size)
+            width += size
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        return table, width
+
+    @staticmethod
+    def _looks_like_header(rows: list) -> bool:
+        """Row one is a header when it is full of text and there is data
+        under it — the shape almost every real workbook has."""
+        if len(rows) < 2:
+            return False
+        first = [cell for cell in rows[0] if cell]
+        if len(first) < max(1, len(rows[0]) // 2):
+            return False
+        return not any(
+            cell.replace(".", "", 1).replace("-", "", 1).isdigit()
+            for cell in first
+        )
+
+    @staticmethod
+    def _column_letters(index: int) -> str:
+        """0 -> "A", 26 -> "AA"."""
+        letters = ""
+        index += 1
+        while index > 0:
+            index, rest = divmod(index - 1, 26)
+            letters = chr(65 + rest) + letters
+        return letters
 
     def show_fallback(self, path: str, mime: str):
         info = QFileInfo(path)
