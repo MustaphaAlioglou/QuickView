@@ -126,6 +126,15 @@ EPUB_EXTENSIONS = {".epub"}
 # at a fixed width and would only start scrolling sideways.
 TOC_WIDTH = 260
 
+# Painting formats Qt cannot read, which renderers.decode_image falls back
+# to its own readers for once Qt reports no handler — see _decode_native.
+# The extensions are listed because their MIME types are not all image/*
+# (a .kra is application/x-krita, a .psb is usually nothing at all), so
+# without this they would land on the metadata card rather than in the
+# branch that can read them.
+LAYERED_EXTENSIONS = {".psd", ".psb", ".kra", ".ora"}
+AI_EXTENSIONS = {".ai"}
+
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".rst", ".log", ".ini", ".cfg", ".conf", ".toml",
     ".yaml", ".yml", ".json", ".xml", ".html", ".htm", ".css", ".js",
@@ -1500,9 +1509,11 @@ class QuickView(QWidget):
             allow_webengine = os.environ.get("QUICKVIEW_STRICT_SANDBOX") != "1"
             if mime in ANIM_MIMES:
                 self.show_anim(path)
-            elif mime.startswith("image/"):
+            elif mime.startswith("image/") or ext in LAYERED_EXTENSIONS:
                 self.show_image(path)
-            elif mime == "application/pdf":
+            elif mime == "application/pdf" or (
+                ext in AI_EXTENSIONS and self.is_pdf(path)
+            ):
                 self.show_pdf(path)
             elif (
                 mime == "text/html" or ext in (".html", ".htm")
@@ -1535,6 +1546,22 @@ class QuickView(QWidget):
         self.show()
         self.raise_()
         self.activateWindow()
+
+    def is_pdf(self, path: str) -> bool:
+        """Does this file start with %PDF?
+
+        Illustrator has written PDF-compatible .ai files by default since
+        version 9 — the artwork is in there as PDF pages, which the existing
+        page view renders for free. Older, PostScript-only .ai files are not,
+        and get the metadata card as before. Reading four bytes is a sniff
+        rather than a parse, so it does not put a decoder back in the daemon;
+        QPdfDocument still runs in the jail like every other one.
+        """
+        try:
+            with open(path, "rb") as fh:
+                return fh.read(4) == b"%PDF"
+        except OSError:
+            return False
 
     def show_message(self, text: str):
         label = QLabel(text)
@@ -1720,7 +1747,10 @@ class QuickView(QWidget):
             # Only what show_image() would render: animations take the
             # show_anim() path (whose frames this key is never read for)
             # and everything else has no cache tier to warm.
-            if not mime.startswith("image/") or mime in ANIM_MIMES:
+            if mime in ANIM_MIMES or not (
+                mime.startswith("image/")
+                or os.path.splitext(p)[1].lower() in LAYERED_EXTENSIONS
+            ):
                 continue
             try:
                 st = os.stat(p)

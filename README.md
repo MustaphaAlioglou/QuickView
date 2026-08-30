@@ -73,8 +73,11 @@ just like Quick Look on a multi-file selection.
 | Type                | How                                        |
 |---------------------|--------------------------------------------|
 | Images (PNG, JPG, WebP, SVG, …) | Scaled to fit, shows dimensions |
+| Photoshop (PSD, PSB) | The flattened composite, scaled to fit — no layer is parsed |
+| Krita / OpenRaster (KRA, ORA) | The flattened composite stored in the file |
 | Animated GIFs       | Played inline                              |
 | PDFs                | Scrollable multi-page view, Ctrl+F, bookmarks sidebar |
+| Illustrator (AI)    | Rendered as the PDF it is, in the same page view |
 | EPUB books          | Laid out as pages, Ctrl+F, chapter sidebar with page numbers |
 | HTML                | Rendered page (JS off, network blocked) — titlebar button flips to source view |
 | Video / audio       | Plays inline with a seek bar               |
@@ -154,6 +157,42 @@ spare instead of by you. Measured on a 1-page PDF: 583 ms before, ~120 ms
 now; a cached preview is ~2 ms.
 
 - **Images** — decoded to a PNG that the daemon caches and displays.
+- **Photoshop files** — Qt has no PSD handler, so this one format QuickView
+  parses itself, in the jail with everything else and using nothing but the
+  standard library. It reads the flattened composite Photoshop already stores
+  alongside the layers and never touches a layer, so the expensive half of the
+  format is the half a preview skips. The compressed image data carries a table
+  of every scanline's length, which means rows can be *seeked past* rather than
+  decoded: a 6000x4000 document shown in a 1600 px box decodes about a third of
+  its rows and a third of each one: 95 ms against 281 ms for the same decode
+  undecimated, and unlike the full decode the cost barely moves as the
+  document grows, because what it tracks is the size of the preview.
+
+  How busy the artwork is matters more than how big it is. A scanline of
+  photographic noise codes as a few dozen long PackBits opcodes, but one of
+  dithered or high-frequency two-colour artwork codes as thousands of short
+  ones, and costs around 25x as much to walk in Python — the same 12
+  megapixels take 95 ms in the first case and 733 ms in the second. Both are
+  cached after the first look; the only way to close that gap would be a C
+  extension, and this stays a project you install without a compiler.
+
+  A file saved without "Maximize Compatibility" has no
+  composite at all, and falls back to the JPEG thumbnail in its image
+  resources. PSB, 16-bit, CMYK, greyscale and indexed files all decode; Lab and
+  1-bit bitmaps fall back to the thumbnail.
+- **Krita and OpenRaster files** — a `.kra` is a zip with the flattened image
+  inside it as an ordinary PNG (`mergedimage.png`), which Krita writes so that
+  thumbnailers never have to understand a layer stack. Reading that one member
+  is the entire decoder, and it is handed back to the image path so it gets the
+  scaled read and the dimensions like any other PNG. OpenRaster's specification
+  requires the same member, so `.ora` comes along for free; `preview.png` is
+  the fallback, and the member is bounded before and after it is read so a zip
+  bomb is refused rather than decompressed.
+- **Illustrator files** — an `.ai` has been a PDF since Illustrator 9, so one
+  is handed to the PDF path above and streams, scrolls and caches identically.
+  The daemon reads four bytes to check for `%PDF` before it does — a sniff, not
+  a parse — and a PostScript-only `.ai` from before that still gets the
+  metadata card.
 - **PDFs** — pages stream one at a time, so page 1 appears while the rest
   (capped at 50) render; each page is cached individually.
 - **Animations** (GIF/APNG) — every frame is decoded in the jail and

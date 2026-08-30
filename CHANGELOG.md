@@ -5,6 +5,64 @@ project has no version tags yet, so entries are dated.
 
 [kac]: https://keepachangelog.com/en/1.1.0/
 
+## 2026-08-30
+
+### Added
+
+- **Photoshop previews (`.psd`, `.psb`).** Qt ships no PSD handler, so these
+  used to fail with "unsupported or corrupt" — a .psd matches `image/*` and
+  went to the image path, which could not read it. QuickView now parses the
+  format itself, in the jail with every other parser and using nothing but
+  the standard library.
+
+  It reads the flattened composite Photoshop already stores next to the
+  layers and never looks at a layer, so the expensive half of the format is
+  the half a preview skips. The compressed image data is preceded by a table
+  of every scanline's length, which means rows can be *seeked past* rather
+  than decoded — so the cost tracks the size of the preview rather than the
+  size of the document, the same bargain the image path already strikes with
+  libjpeg's DCT scaling. On a 6000x4000 file, 95 ms against 281 ms for the
+  same decode undecimated, and the gap widens with the document. How busy the
+  artwork is matters more than how big it is: dithered or high-frequency
+  two-colour scanlines code as thousands of short PackBits opcodes rather
+  than dozens of long ones and cost around 25x as much to walk, so the same
+  12 megapixels range from 95 ms to 733 ms.
+
+  RGB, greyscale, indexed, CMYK and duotone all decode, at 8 or 16 bits, in
+  PSD and PSB, RLE-compressed or raw. CMYK is converted by drawing the black
+  plate over the other three with a multiply blend, which is exactly the
+  formula and leaves the per-pixel work to Qt. A file saved without "Maximize
+  Compatibility" has no composite at all and falls back to the JPEG thumbnail
+  in its image resources; Lab and 1-bit bitmaps do the same.
+
+  Because the fallback lives inside `decode_image` rather than in a branch of
+  its own, PSD inherits the two-tier cache, the raw-ARGB32 wire frame, the
+  neighbour prefetch and the document's real dimensions in the titlebar
+  without any of them knowing the format exists.
+
+- **Krita and OpenRaster previews (`.kra`, `.ora`).** Both are a zip holding
+  the flattened image as an ordinary PNG, which Krita writes precisely so a
+  thumbnailer never has to understand a layer stack. Reading that one member
+  is the whole decoder, and it is handed back to the image path so it gets
+  the scaled read and the dimensions like any other PNG. `preview.png` is the
+  fallback for a file saved without the merged image.
+
+- **Illustrator previews (`.ai`).** An `.ai` has been a PDF since Illustrator
+  9, so it is handed to the PDF page view and streams, scrolls, searches and
+  caches identically. The daemon reads four bytes to check for `%PDF` first —
+  a sniff, not a parse, so no decoder moves back into the daemon — and a
+  PostScript-only `.ai` from before that still gets the metadata card.
+
+### Security
+
+- The PSD reader is the first format QuickView parses by hand, so every
+  length field in it is checked against the real file size before anything is
+  allocated or skipped, and the canvas, channel count, resource walk,
+  thumbnail resource and decimated result are each capped. The zip member a
+  `.kra` preview comes from is bounded both by its declared size and by what
+  it actually yields, so a lying header buys nothing. A malformed file still
+  only takes down its own throwaway worker.
+
 ## 2026-08-27
 
 ### Added
