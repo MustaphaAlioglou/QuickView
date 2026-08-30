@@ -9,6 +9,24 @@ project has no version tags yet, so entries are dated.
 
 ### Added
 
+- **A Breeze panel theme**, behind `panel_theme = breeze` in the new
+  `[appearance]` section. The panel has always been a Quick Look impression
+  — a fixed dark window, close button top left, indifferent to the Plasma
+  colour scheme — and that is still the default and still the point. The
+  alternative reads every colour from the running `QPalette`, so it follows
+  the user's own scheme, light or dark, accent included, rather than being a
+  second hardcoded theme that happens to resemble today's Breeze. It also
+  squares the corners and moves the close button to the right.
+
+  The colours used to be written into eleven stylesheets as some thirty
+  literals. They now go through one set of tokens in `theme.py`, which is
+  what makes a second theme possible at all — and the default palette is
+  those same literals, so the default look is unchanged: a test compares the
+  built stylesheet against the previous one declaration by declaration.
+
+- **Playback speed and mute** on video and audio, at 0.25x through 2x. Both
+  are new ops on the jailed player, and the rate is clamped worker-side.
+
 - **Photoshop previews (`.psd`, `.psb`).** Qt ships no PSD handler, so these
   used to fail with "unsupported or corrupt" — a .psd matches `image/*` and
   went to the image path, which could not read it. QuickView now parses the
@@ -52,6 +70,15 @@ project has no version tags yet, so entries are dated.
   caches identically. The daemon reads four bytes to check for `%PDF` first —
   a sniff, not a parse, so no decoder moves back into the daemon — and a
   PostScript-only `.ai` from before that still gets the metadata card.
+
+### Fixed
+
+- **Clicking the seek bar seeks there.** A QSlider's groove is a page-step
+  control by default, so a click moved the handle a fixed nudge towards the
+  cursor and dragging it was the only way to get anywhere. The whole
+  timeline is now the target, as it is in every media player. Position
+  reports from the player are also ignored while the handle is held, which
+  stops it snapping back mid-drag.
 
 ### Security
 

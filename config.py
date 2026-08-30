@@ -43,6 +43,8 @@ _SETTINGS = {
                    None, None),
     "book_theme": ("preview", str, "paper", "QUICKVIEW_BOOK_THEME",
                    None, None),
+    "panel_theme": ("appearance", str, "quicklook", "QUICKVIEW_PANEL_THEME",
+                    None, None),
     "text_limit_kb": ("preview", int, 1024, "QUICKVIEW_TEXT_LIMIT_KB",
                       1, 1024 * 64),
     "pdf_max_pages": ("preview", int, 50, "QUICKVIEW_PDF_MAX_PAGES", 1, 2000),
@@ -76,6 +78,17 @@ text_limit_kb = 1024
 # How many pages of a PDF or office document to render at most.
 pdf_max_pages = 50
 
+[appearance]
+# How the panel itself is painted.
+#
+#   quicklook  the default: a fixed dark panel with the close button top
+#              left, the same on every desktop and independent of your
+#              Plasma colour scheme.
+#   breeze     takes its colours from your Plasma colour scheme instead —
+#              light or dark, with your accent colour — and puts the close
+#              button on the right, where Plasma's own windows put it.
+panel_theme = quicklook
+
 [cache]
 # Rendered previews kept on disk, in MiB. 0 disables the disk cache.
 disk_cache_mb = 256
@@ -93,6 +106,9 @@ memory_cache_mb = 96
 # jail — this is the list a person may type, and a test keeps the two equal.
 _CHOICES = {
     "book_theme": ("paper", "sepia", "dark", "gruvbox-dark", "gruvbox-light"),
+    # The panel's own colours. Same reasoning as book_theme: a typo here
+    # would otherwise leave the window with no palette at all.
+    "panel_theme": ("quicklook", "breeze"),
 }
 
 

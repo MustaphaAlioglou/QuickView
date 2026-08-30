@@ -40,9 +40,11 @@ import struct
 import subprocess
 import sys
 from collections import OrderedDict
+from string import Template
 
 import config
 import ipc
+import theme
 
 from PySide6.QtCore import (
     Qt, QUrl, QPoint, QRect, QSize, QObject, QSocketNotifier, QThreadPool,
@@ -56,8 +58,9 @@ from PySide6.QtGui import (
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QFileIconProvider, QFrame, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizePolicy, QSlider, QStackedLayout, QTableWidget, QTableWidgetItem,
+    QHeaderView, QLabel, QLineEdit, QMenu, QPlainTextEdit, QPushButton,
+    QScrollArea, QSizePolicy, QSlider, QStackedLayout, QStyle,
+    QStyleOptionSlider, QTableWidget, QTableWidgetItem,
     QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
     QGraphicsDropShadowEffect,
 )
@@ -183,6 +186,14 @@ JPEG_MAGIC = b"\xff\xd8\xff"
 MAX_FRAME_BYTES = 64 * 1024 * 1024
 # Frame slots the media worker cycles through in shared memory.
 MEDIA_SLOTS = 2
+# Playback speeds offered by the speed button, slowest first. The worker
+# clamps whatever it is sent; this is only the menu.
+PLAYBACK_RATES = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0)
+# The speed and mute buttons, which are sized together so they match. Wide
+# enough for "0.25×", which needs 59 px of the 12 px label plus the 28 px
+# of padding #openBtn carries.
+MEDIA_BUTTON_W = 68
+MEDIA_BUTTON_H = 28
 # The worker caps frames too, but it is the untrusted side of the socket:
 # 512 screen-sized pixmaps is gigabytes of daemon memory, so the frames a
 # preview will actually hold are bounded here as well.
@@ -234,6 +245,109 @@ def cache_key(
     # The .png suffix is part of an opaque key, not a claim about the
     # contents: an image entry is JPEG whenever it has no alpha.
     return hashlib.sha256(raw.encode()).hexdigest() + ".png"
+
+
+# The panel's own stylesheet. A Template rather than a literal so both
+# themes can fill it — see theme.py for the tokens.
+PANEL_STYLE = Template("""
+        #panel {
+            background-color: $bg;
+            border-radius: $radius_panel;
+            border: 1px solid $border;
+        }
+        #titleLabel {
+            color: $text; font-size: 13px; font-weight: 600;
+        }
+        #closeBtn {
+            background-color: $close_bg; color: $text_soft;
+            border: none; border-radius: $radius_close;
+            font-size: 11px; font-weight: bold;
+        }
+        #closeBtn:hover {
+            background-color: $close_hover; color: $close_hover_text;
+        }
+        #openBtn {
+            background-color: $btn; color: $text;
+            border: none; border-radius: $radius_btn; padding: 4px 14px;
+            font-size: 12px;
+        }
+        #openBtn:hover { background-color: $btn_hover; }
+        /* No dropdown arrow on the speed button: the label already says
+           what it is set to, and the arrow only steals room from it. */
+        #openBtn::menu-indicator { image: none; width: 0; }
+        #tocBtn {
+            background-color: $btn; color: $text_soft;
+            border: none; border-radius: $radius_btn;
+            font-size: 12px; font-weight: bold;
+        }
+        #tocBtn:hover { background-color: $btn_hover; }
+        #tocBtn:checked { background-color: $accent; color: $accent_text; }
+        /* The speed menu is a popup window, so it takes the desktop
+           theme rather than the panel unless it is styled here. */
+        QMenu {
+            background-color: $surface; color: $text;
+            border: 1px solid $border; border-radius: $radius_btn;
+            padding: 4px;
+        }
+        QMenu::item { padding: 4px 24px 4px 24px; border-radius: 4px; }
+        QMenu::item:selected { background-color: $btn_hover; }
+        QMenu::indicator { width: 12px; height: 12px; left: 6px; }
+        QPlainTextEdit {
+            background-color: $bg; color: $text_dim;
+            border: none; padding: 8px 14px;
+            font-family: monospace; font-size: 12px;
+        }
+        QLabel { color: $text_dim; }
+        QSlider::groove:horizontal {
+            height: 4px; background: $slider_groove; border-radius: 2px;
+        }
+        QSlider::handle:horizontal {
+            width: 12px; margin: -4px 0; border-radius: 6px;
+            background: $slider_handle;
+        }
+    """)
+
+
+class SeekSlider(QSlider):
+    """A slider that seeks to where you click, not one page nearer to it.
+
+    A QSlider's groove is a page-step control by default: clicking it moves
+    the handle a fixed amount towards the cursor, which on a seek bar means
+    a click halfway through a film moves it a few seconds and the only way
+    to get anywhere is to drag the handle. Every media player treats the
+    whole timeline as the target, so this does too.
+
+    The press is turned into a value and the handle moved there *before*
+    the base class sees the event, so the handle is under the cursor by the
+    time Qt starts its drag — one press then either seeks or begins a drag,
+    with no special case for which the user meant.
+    """
+
+    def _value_at(self, x: int) -> int:
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        groove = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider, opt,
+            QStyle.SubControl.SC_SliderGroove, self,
+        )
+        handle = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider, opt,
+            QStyle.SubControl.SC_SliderHandle, self,
+        )
+        # The handle has width, so the travel is shorter than the groove and
+        # the usable span starts half a handle in. Without both corrections
+        # a click at either end lands short of the end of the file.
+        span = groove.width() - handle.width()
+        pos = x - groove.x() - handle.width() // 2
+        return QStyle.sliderValueFromPosition(
+            self.minimum(), self.maximum(), pos, max(span, 1)
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.maximum() > self.minimum():
+            self.setSliderPosition(self._value_at(int(event.position().x())))
+            self.sliderMoved.emit(self.value())
+        super().mousePressEvent(event)
 
 
 class MatchOverlay(QWidget):
@@ -1075,11 +1189,22 @@ class TitleBar(QWidget):
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 8, 12, 8)
-        lay.addWidget(self.close_btn)
-        lay.addWidget(self.toc_btn)
-        lay.addWidget(self.title, 1)
-        lay.addWidget(self.mode_btn)
-        lay.addWidget(self.open_btn)
+        # Quick Look puts the close button top left, next to the traffic
+        # lights it borrows its colour from; a Plasma window decoration puts
+        # it on the right. This is the one part of the theme that is layout
+        # rather than paint, which is why it lives here and not in the
+        # stylesheet.
+        if window.theme["close_side"] == "left":
+            order = (self.close_btn, self.toc_btn, None,
+                     self.mode_btn, self.open_btn)
+        else:
+            order = (self.toc_btn, None, self.mode_btn,
+                     self.open_btn, self.close_btn)
+        for widget in order:
+            if widget is None:
+                lay.addWidget(self.title, 1)   # the stretch, wherever it falls
+            else:
+                lay.addWidget(widget)
 
     # The window is a full-screen overlay, so there is nothing for the
     # compositor to move: dragging the titlebar slides the panel inside it.
@@ -1117,6 +1242,11 @@ class QuickView(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle("QuickView")
 
+        # Resolved first: the titlebar's layout and every stylesheet below
+        # read from it. QApplication.palette() is the running desktop's,
+        # which is what "breeze" follows — so this has to happen after the
+        # application exists, not at import time with the rest of SETTINGS.
+        self.theme = theme.load(SETTINGS["panel_theme"], QApplication.palette())
         self.mime_db = QMimeDatabase()
         self.icon_provider = QFileIconProvider()
         self.current_path = None
@@ -1185,47 +1315,7 @@ class QuickView(QWidget):
         # on above — it is what lets the rounded corners and the drop shadow
         # composite against the desktop — but nothing shows through the panel
         # itself any more.
-        self.setStyleSheet("""
-            #panel {
-                background-color: #222226;
-                border-radius: 12px;
-                border: 1px solid #3c3c40;
-            }
-            #titleLabel {
-                color: #e8e8ea; font-size: 13px; font-weight: 600;
-            }
-            #closeBtn {
-                background-color: #5a5a5f; color: #d0d0d4;
-                border: none; border-radius: 12px;
-                font-size: 11px; font-weight: bold;
-            }
-            #closeBtn:hover { background-color: #ff5f57; color: #4b0d0a; }
-            #openBtn {
-                background-color: #38383c; color: #e8e8ea;
-                border: none; border-radius: 6px; padding: 4px 14px;
-                font-size: 12px;
-            }
-            #openBtn:hover { background-color: #4a4a4d; }
-            #tocBtn {
-                background-color: #38383c; color: #d0d0d4;
-                border: none; border-radius: 6px;
-                font-size: 12px; font-weight: bold;
-            }
-            #tocBtn:hover { background-color: #4a4a4d; }
-            #tocBtn:checked { background-color: #4f6a99; color: #ffffff; }
-            QPlainTextEdit {
-                background-color: #222226; color: #dcdcde;
-                border: none; padding: 8px 14px;
-                font-family: monospace; font-size: 12px;
-            }
-            QLabel { color: #dcdcde; }
-            QSlider::groove:horizontal {
-                height: 4px; background: #454548; border-radius: 2px;
-            }
-            QSlider::handle:horizontal {
-                width: 12px; margin: -4px 0; border-radius: 6px; background: #e8e8ea;
-            }
-        """)
+        self.setStyleSheet(PANEL_STYLE.substitute(self.theme))
 
         # Kept in a list because every one of them is a *single* key, and a
         # QShortcut outranks the key events of a focused child widget: with
@@ -1946,7 +2036,8 @@ class QuickView(QWidget):
         for w, h in sizes:
             label = QLabel()
             label.setFixedSize(w, h)
-            label.setStyleSheet("background: #2a2a2e;")  # an unfilled page
+            # An unfilled page, before its render arrives.
+            label.setStyleSheet(f"background: {self.theme['surface_alt']};")
             lay.addWidget(label, 0, Qt.AlignHCenter)
             self._pdf_labels.append(label)
             overlay = MatchOverlay(label)
@@ -1956,7 +2047,7 @@ class QuickView(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet("background: #222226;")
+        scroll.setStyleSheet(f"background: {self.theme['bg']};")
         scroll.setWidget(col)
         # Wrapper so the find row can sit above the pages and scroll with
         # neither of them, and the contents sidebar beside both.
@@ -2122,28 +2213,30 @@ class QuickView(QWidget):
     # same tree, so the reader gets the same button in the same corner
     # whichever one is open.
 
-    TOC_STYLE = """
-        QWidget { background-color: #26262b; }
+    TOC_STYLE = Template("""
+        QWidget { background-color: $bg_alt; }
         #tocHead {
-            color: #8e8e98; font-size: 11px; font-weight: 600;
+            color: $text_head; font-size: 11px; font-weight: 600;
             padding: 10px 12px 6px 12px; letter-spacing: 1px;
         }
         QTreeWidget {
-            background-color: #26262b; color: #c8c8ce; border: none;
-            border-right: 1px solid #34343a; font-size: 12px;
+            background-color: $bg_alt; color: $tree_text; border: none;
+            border-right: 1px solid $line; font-size: 12px;
             outline: none; padding: 6px 0;
         }
         QTreeWidget::item { padding: 4px 2px; border-radius: 4px; }
-        QTreeWidget::item:hover { background-color: #303036; }
-        QTreeWidget::item:selected { background-color: #3f4f70; color: #fff; }
+        QTreeWidget::item:hover { background-color: $tree_hover; }
+        QTreeWidget::item:selected {
+            background-color: $sel_tree; color: $accent_text;
+        }
         QTreeWidget::branch { background: transparent; }
-        QScrollBar:vertical { background: #26262b; border: none; width: 10px; }
+        QScrollBar:vertical { background: $bg_alt; border: none; width: 10px; }
         QScrollBar::handle:vertical {
-            background: #4a4a51; border-radius: 5px; min-height: 30px;
+            background: $scroll_handle; border-radius: 5px; min-height: 30px;
         }
         QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
         QScrollBar::add-page, QScrollBar::sub-page { background: none; }
-    """
+    """)
 
     def _fetch_outline(self, path: str, toc_key: str, page_w: int):
         """Ask the jail for a PDF's bookmarks, alongside the page render.
@@ -2239,7 +2332,7 @@ class QuickView(QWidget):
             item.setText(0, title)
             item.setText(1, str(page + 1))
             item.setToolTip(0, f"{title}  ·  page {page + 1}")
-            item.setForeground(1, QColor("#7e7e88"))
+            item.setForeground(1, QColor(self.theme["text_muted"]))
             item.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
             try:
                 offset = max(0, int(entry.get("y", 0)))
@@ -2260,7 +2353,7 @@ class QuickView(QWidget):
         tree.itemActivated.connect(self._toc_clicked)
 
         panel = QWidget()
-        panel.setStyleSheet(self.TOC_STYLE)
+        panel.setStyleSheet(self.TOC_STYLE.substitute(self.theme))
         panel.setFixedWidth(TOC_WIDTH)
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -2346,8 +2439,9 @@ class QuickView(QWidget):
         self._find_input = QLineEdit()
         self._find_input.setPlaceholderText("Find in document…")
         self._find_input.setStyleSheet(
-            "QLineEdit { background:#2a2a2e; color:#e8e8ea; border:1px solid"
-            " #3a3a40; border-radius:6px; padding:5px 8px; }"
+            "QLineEdit {{ background:{surface_alt}; color:{text};"
+            " border:1px solid {input_border}; border-radius:{radius_btn};"
+            " padding:5px 8px; }}".format(**self.theme)
         )
         # The nav shortcuts are single keys and outrank this field's own key
         # events, so they are off precisely while it holds focus.
@@ -2362,7 +2456,7 @@ class QuickView(QWidget):
             self._find_input.keyPressEvent
         )
         self._find_label = QLabel("")
-        self._find_label.setStyleSheet("color:#9a9aa2;")
+        self._find_label.setStyleSheet(f"color:{self.theme['text_faint']};")
         prev_btn = QPushButton("‹")
         next_btn = QPushButton("›")
         close_btn = QPushButton("✕")
@@ -2373,9 +2467,11 @@ class QuickView(QWidget):
         ):
             b.setFixedWidth(28)
             b.setStyleSheet(
-                "QPushButton { background:#2a2a2e; color:#e8e8ea; border:1px"
-                " solid #3a3a40; border-radius:6px; padding:4px; }"
-                "QPushButton:hover { background:#35353b; }"
+                "QPushButton {{ background:{surface_alt}; color:{text};"
+                " border:1px solid {input_border};"
+                " border-radius:{radius_btn}; padding:4px; }}"
+                "QPushButton:hover {{ background:{input_hover}; }}"
+                .format(**self.theme)
             )
             b.setFocusPolicy(Qt.NoFocus)  # never steal focus from the field
             b.clicked.connect(fn)
@@ -2707,12 +2803,29 @@ class QuickView(QWidget):
         controls.setContentsMargins(14, 0, 14, 0)
         play_btn = QPushButton("⏸")
         play_btn.setObjectName("openBtn")
-        play_btn.setFixedWidth(40)
-        slider = QSlider(Qt.Horizontal)
+        slider = SeekSlider(Qt.Horizontal)
         time_lbl = QLabel("0:00 / 0:00")
+        speed_btn = QPushButton("1×")
+        speed_btn.setObjectName("openBtn")
+        speed_menu = QMenu(speed_btn)
+        speed_btn.setMenu(speed_menu)
+        mute_btn = QPushButton("🔊")
+        mute_btn.setObjectName("openBtn")
+        # Sized by hand rather than from sizeHint(). A button's natural
+        # height follows the glyphs in its own label, and a pause bar, a
+        # text label and an emoji do not agree — left to themselves the
+        # three came out 29, 25 and 20 pixels tall in the same row. The
+        # hints are not stable either: they report one width before the
+        # stylesheet is applied and another after, so measuring at build
+        # time gives whichever the timing happens to produce.
+        play_btn.setFixedSize(40, MEDIA_BUTTON_H)
+        speed_btn.setFixedSize(MEDIA_BUTTON_W, MEDIA_BUTTON_H)
+        mute_btn.setFixedSize(MEDIA_BUTTON_W, MEDIA_BUTTON_H)
         controls.addWidget(play_btn)
         controls.addWidget(slider, 1)
         controls.addWidget(time_lbl)
+        controls.addWidget(speed_btn)
+        controls.addWidget(mute_btn)
         lay.addLayout(controls)
 
         self.content.addWidget(wrap)
@@ -2725,7 +2838,7 @@ class QuickView(QWidget):
             s = max(int(ms), 0) // 1000
             return f"{s // 60}:{s % 60:02d}"
 
-        state = {"duration": 0, "playing": True}
+        state = {"duration": 0, "playing": True, "rate": 1.0, "muted": False}
 
         def on_frame(img: QImage):
             if surface is None:
@@ -2743,6 +2856,11 @@ class QuickView(QWidget):
 
         def on_position(msg):
             p = msg.get("position", 0)
+            if slider.isSliderDown():
+                # Mid-drag: the player is still reporting where it was, and
+                # writing that back would drag the handle out from under the
+                # cursor until the seek lands.
+                return
             slider.blockSignals(True)
             slider.setValue(p)
             slider.blockSignals(False)
@@ -2773,7 +2891,30 @@ class QuickView(QWidget):
             self.media.send({"t": "play" if state["playing"] else "pause"})
             play_btn.setText("⏸" if state["playing"] else "▶")
 
+        def set_rate(rate: float):
+            state["rate"] = rate
+            # %g so 1.0 reads as "1×" and 1.25 keeps its decimals.
+            speed_btn.setText(f"{rate:g}×")
+            for act in speed_menu.actions():
+                act.setChecked(act.data() == rate)
+            self.media.send({"t": "rate", "rate": rate})
+
+        for rate in PLAYBACK_RATES:
+            action = speed_menu.addAction(f"{rate:g}×")
+            action.setCheckable(True)
+            action.setChecked(rate == 1.0)
+            action.setData(rate)
+            action.triggered.connect(
+                lambda _checked=False, r=rate: set_rate(r)
+            )
+
+        def toggle_mute():
+            state["muted"] = not state["muted"]
+            mute_btn.setText("🔇" if state["muted"] else "🔊")
+            self.media.send({"t": "mute", "muted": state["muted"]})
+
         play_btn.clicked.connect(toggle)
+        mute_btn.clicked.connect(toggle_mute)
         slider.sliderMoved.connect(
             lambda p: self.media.send({"t": "seek", "position": p})
         )
@@ -3205,50 +3346,53 @@ class QuickView(QWidget):
     # evaluates a formula or touches the file.
 
     SHEET_CELL_MAX_W = 300
-    SHEET_STYLE = """
+    SHEET_STYLE = Template("""
         QTableWidget {
-            background-color: #222226; alternate-background-color: #26262b;
-            color: #dcdcde; gridline-color: #34343a; border: none;
+            background-color: $bg; alternate-background-color: $bg_alt;
+            color: $text_dim; gridline-color: $line; border: none;
             font-size: 12px;
         }
         QTableWidget::item { padding: 2px 6px; }
         QTableWidget::item:selected {
-            background-color: #3a4a63; color: #ffffff;
+            background-color: $sel_table; color: $accent_text;
         }
-        QHeaderView { background-color: #2b2b30; }
+        QHeaderView { background-color: $surface; }
         QHeaderView::section {
-            background-color: #2b2b30; color: #9a9aa2; border: none;
-            border-right: 1px solid #34343a;
-            border-bottom: 1px solid #34343a;
+            background-color: $surface; color: $text_faint; border: none;
+            border-right: 1px solid $line;
+            border-bottom: 1px solid $line;
             padding: 3px 6px; font-size: 11px;
         }
         QTableCornerButton::section {
-            background-color: #2b2b30; border: none;
-            border-right: 1px solid #34343a;
-            border-bottom: 1px solid #34343a;
+            background-color: $surface; border: none;
+            border-right: 1px solid $line;
+            border-bottom: 1px solid $line;
         }
         QTabWidget::pane { border: none; }
         QTabBar { qproperty-drawBase: 0; }
         QTabBar::tab {
-            background-color: #2b2b30; color: #b6b6bd;
-            border: 1px solid #34343a; border-top: none;
-            border-bottom-left-radius: 6px; border-bottom-right-radius: 6px;
+            background-color: $surface; color: $tab_text;
+            border: 1px solid $line; border-top: none;
+            border-bottom-left-radius: $radius_btn;
+            border-bottom-right-radius: $radius_btn;
             padding: 4px 14px; margin-right: 3px; font-size: 12px;
         }
-        QTabBar::tab:selected { background-color: #3c3c44; color: #ffffff; }
-        QTabBar::tab:hover:!selected { background-color: #34343a; }
+        QTabBar::tab:selected {
+            background-color: $tab_sel; color: $tab_sel_text;
+        }
+        QTabBar::tab:hover:!selected { background-color: $line; }
         QScrollBar:vertical, QScrollBar:horizontal {
-            background: #222226; border: none;
+            background: $bg; border: none;
         }
         QScrollBar:vertical { width: 10px; }
         QScrollBar:horizontal { height: 10px; }
         QScrollBar::handle {
-            background: #4a4a51; border-radius: 5px; min-height: 30px;
+            background: $scroll_handle; border-radius: 5px; min-height: 30px;
             min-width: 30px;
         }
         QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
         QScrollBar::add-page, QScrollBar::sub-page { background: none; }
-    """
+    """)
 
     def show_sheets(self, path: str, mime: str):
         self.show_message("Loading preview…")
@@ -3294,12 +3438,12 @@ class QuickView(QWidget):
         lay = QVBoxLayout(wrap)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-        wrap.setStyleSheet(self.SHEET_STYLE)
+        wrap.setStyleSheet(self.SHEET_STYLE.substitute(self.theme))
 
         status = QLabel()
         status.setStyleSheet(
-            "color:#8e8e96; font-size:11px; padding:5px 12px;"
-            "background-color:#222226;"
+            "color:{text_status}; font-size:11px; padding:5px 12px;"
+            "background-color:{bg};".format(**self.theme)
         )
 
         widths = []
@@ -3385,8 +3529,8 @@ class QuickView(QWidget):
                 item = QTableWidgetItem(text)
                 if r == 0 and header_row:
                     item.setFont(bold)
-                    item.setForeground(QColor("#f2f2f5"))
-                    item.setBackground(QColor("#2f2f36"))
+                    item.setForeground(QColor(self.theme["text_bright"]))
+                    item.setBackground(QColor(self.theme["surface_head"]))
                     item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
                 elif (align[c] if c < len(align) else "l") == "r":
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)

@@ -63,7 +63,8 @@ just like Quick Look on a multi-file selection.
 - **Anything it cannot preview** still gets a card with its icon, type, size
   and modified date, so Space is never a dead key.
 - **Configurable** through `~/.config/quickview/quickview.conf`, written with
-  its defaults commented in on first run.
+  its defaults commented in on first run — including a **Breeze theme** that
+  drops the Quick Look look and follows your Plasma colour scheme instead.
 - **Self-contained.** `install.sh` builds a virtualenv and touches no system
   packages. **Enter** opens the file in its real application whenever the
   preview is not enough.
@@ -120,6 +121,31 @@ See [Settings](#settings) below. Without Pygments installed the preview is
 plain text — nothing breaks.
 
 [pyg]: https://pygments.org/
+
+## Panel theme
+
+The panel is a Quick Look impression by default: a fixed dark window with a
+round close button top left, drawn the same on every desktop and deliberately
+ignoring your Plasma colour scheme. That is what the project set out to look
+like and it stays the default.
+
+If you would rather it matched the rest of your desktop:
+
+```ini
+# ~/.config/quickview/quickview.conf
+[appearance]
+panel_theme = breeze   # or the default, quicklook
+```
+
+Breeze takes every colour from the running `QPalette`, which under Plasma is
+your own colour scheme — so it follows a light theme, a dark one and your
+accent colour without being configured further. It also squares the corners
+off and moves the close button to the right, where a Plasma window
+decoration puts it.
+
+Both themes fill the same set of tokens (`theme.py`), so there is one
+stylesheet rather than two to keep in step, and a test checks that every
+sheet can be filled by both.
 
 ## Preview cache
 

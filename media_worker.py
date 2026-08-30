@@ -201,6 +201,16 @@ def main() -> int:
                 player.setPosition(int(msg["position"]))
             elif op == "volume":
                 audio.setVolume(float(msg["volume"]))
+            elif op == "mute":
+                # setMuted, not volume 0: the volume the user picked is
+                # still there when they unmute.
+                audio.setMuted(bool(msg.get("muted")))
+            elif op == "rate":
+                # Clamped here rather than trusted: this is the untrusted
+                # side of the socket only in principle, but a rate of 0
+                # stalls the player and a huge one spins the decoder.
+                rate = float(msg.get("rate", 1.0))
+                player.setPlaybackRate(min(max(rate, 0.1), 4.0))
             elif op == "ack":
                 # The daemon has copied that slot out; it can be filled
                 # again now, and not one frame earlier.
