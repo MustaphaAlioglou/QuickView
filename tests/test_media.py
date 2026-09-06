@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from PySide6.QtCore import QPoint, Qt  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication, QPushButton  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton  # noqa: E402
 
 import quickview  # noqa: E402
 
@@ -32,8 +32,11 @@ _app = QApplication.instance()
 class FakePlayer:
     """Stands in for MediaSession, recording what the controls send."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, window, path, max_w, max_h, handlers):
         self.sent = []
+        # The controls talk back through these; a test that wants to act
+        # like the player reports a position calls one of them.
+        self.handlers = handlers
 
     def send(self, msg):
         self.sent.append(msg)
@@ -98,11 +101,33 @@ class SeekBar(MediaControls):
 
     def test_the_player_does_not_fight_a_drag(self):
         # While the handle is held, position reports are the player saying
-        # where it still is; writing them back yanks the handle away.
-        self.slider.setValue(0)
+        # where it still is; writing them back yanks the handle away. This
+        # has to go through the handler the session actually calls — setting
+        # the slider directly would pass with the guard deleted.
         self.slider.setSliderDown(True)
-        self.window.findChild(quickview.SeekSlider).setValue(90_000)
+        self.slider.setValue(90_000)
+        self.player.handlers["position"]({"position": 5_000})
         self.assertEqual(self.slider.value(), 90_000)
+
+    def test_a_position_report_moves_the_handle_once_the_drag_ends(self):
+        self.slider.setSliderDown(False)
+        self.player.handlers["position"]({"position": 5_000})
+        self.assertEqual(self.slider.value(), 5_000)
+
+    def test_the_readout_follows_the_handle_mid_drag(self):
+        # The guard above is on the slider write only: freezing the elapsed
+        # time as well leaves a long drag with no clue where it will land.
+        self.player.handlers["meta"]({"duration": 100_000})
+        self.slider.setSliderDown(True)
+        self.slider.setValue(90_000)
+        self.player.handlers["position"]({"position": 5_000})
+        self.assertIn("1:30", self.readout().text())
+
+    def readout(self):
+        for label in self.window.findChildren(QLabel):
+            if "/" in label.text():
+                return label
+        self.fail("no elapsed-time readout")
 
 
 class SpeedMenu(MediaControls):

@@ -21,6 +21,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from PySide6.QtCore import QCoreApplication  # noqa: E402
+from PySide6.QtGui import QColor, QPalette  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import config  # noqa: E402
@@ -112,8 +114,10 @@ class DefaultLookUnchanged(unittest.TestCase):
             self.assertIn(name, config.DEFAULT_FILE)
 
 
-class ThemedWindow(unittest.TestCase):
-    """The widgets built with .format(**theme) rather than a Template."""
+class BuildsWindows:
+    """Builds a QuickView under a named theme. A mixin rather than a base
+    TestCase: subclassing a TestCase to reach a helper re-runs every test
+    it declares."""
 
     def build(self, name):
         original = quickview.SETTINGS["panel_theme"]
@@ -124,6 +128,10 @@ class ThemedWindow(unittest.TestCase):
             quickview.SETTINGS["panel_theme"] = original
         self.addCleanup(window.deleteLater)
         return window
+
+
+class ThemedWindow(BuildsWindows, unittest.TestCase):
+    """The widgets built with .format(**theme) rather than a Template."""
 
     def test_the_find_bar_builds_under_both_themes(self):
         for name in THEMES:
@@ -149,6 +157,41 @@ class ThemedWindow(unittest.TestCase):
                 self.assertIs(
                     bar.layout().itemAt(stretch[0]).widget(), bar.title
                 )
+
+
+class ASchemeChange(BuildsWindows, unittest.TestCase):
+    """The daemon is resident: breeze has to follow a live scheme change."""
+
+    def send_palette_change(self, window, palette):
+        app = QApplication.instance()
+        original = app.palette()
+        app.setPalette(palette)
+        self.addCleanup(app.setPalette, original)
+        # Delivered by Qt, not handed to the window directly: the whole
+        # question is whether the handler is on the method Qt actually
+        # calls, and posting the event by hand answers it the wrong way.
+        QCoreApplication.processEvents()
+
+    def dark_palette(self):
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Window, QColor("#1b1e20"))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor("#fcfcfc"))
+        return palette
+
+    def test_breeze_repaints_from_the_new_scheme(self):
+        window = self.build("breeze")
+        before = window.theme["bg"]
+        self.send_palette_change(window, self.dark_palette())
+        self.assertNotEqual(window.theme["bg"], before)
+        self.assertEqual(window.theme["bg"], "#1b1e20")
+
+    def test_quicklook_ignores_it(self):
+        # The whole point of the default theme is that it looks the same
+        # whatever the desktop is set to.
+        window = self.build("quicklook")
+        before = dict(window.theme)
+        self.send_palette_change(window, self.dark_palette())
+        self.assertEqual(window.theme, before)
 
 
 if __name__ == "__main__":

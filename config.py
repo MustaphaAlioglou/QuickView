@@ -87,6 +87,10 @@ pdf_max_pages = 50
 #   breeze     takes its colours from your Plasma colour scheme instead —
 #              light or dark, with your accent colour — and puts the close
 #              button on the right, where Plasma's own windows put it.
+#
+# On a light Plasma scheme, pair breeze with a light code_style above: the
+# two settings are independent, and the default one-dark is written for a
+# dark background, so its greys are close to unreadable on a pale one.
 panel_theme = quicklook
 
 [cache]

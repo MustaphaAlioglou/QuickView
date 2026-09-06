@@ -139,9 +139,20 @@ panel_theme = breeze   # or the default, quicklook
 
 Breeze takes every colour from the running `QPalette`, which under Plasma is
 your own colour scheme — so it follows a light theme, a dark one and your
-accent colour without being configured further. It also squares the corners
-off and moves the close button to the right, where a Plasma window
-decoration puts it.
+accent colour without being configured further, and it re-reads that palette
+when you change schemes rather than waiting for a restart. It also squares
+the corners off and moves the close button to the right, where a Plasma
+window decoration puts it.
+
+One thing it does not follow is `code_style`: the colours in a highlighted
+source file come from Pygments, in the sandboxed worker, and the default
+`one-dark` is built for a dark background. On a **light** Plasma scheme, set
+a light style to go with it:
+
+```ini
+[preview]
+code_style = solarized-light   # or one of Pygments' other light styles
+```
 
 Both themes fill the same set of tokens (`theme.py`), so there is one
 stylesheet rather than two to keep in step, and a test checks that every
@@ -454,6 +465,9 @@ Then bind Space in Dolphin (one-time):
 - `ipc.py` — the client↔daemon wire format, and the single implementation
   of path normalization
 - `config.py` — the handful of user settings, and their defaults
+- `theme.py` — the panel palettes: the fixed Quick Look one, and the breeze
+  one derived from the running Plasma colour scheme. Both fill the same
+  tokens, so `quickview.py` carries one stylesheet rather than two
 - `worker.py` — the jailed preview worker: images, PDF pages and animation
   frames, decoding from a passed file descriptor
 - `media_worker.py` — the jailed player: decodes and plays audio/video, and
@@ -486,10 +500,14 @@ keeping Qt loaded is what makes previews open in ~20 ms instead of ~1 s.
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest discover -s tests
+.venv/bin/python -m unittest discover -s tests -t .
 ```
 
-121 checks, about a second, no display needed — the Qt ones run offscreen.
+177 checks, about a second, no display needed — the Qt ones run offscreen.
+Run it from the repo root, and keep the `-t .`: without it the files are
+imported as top-level modules, `tests/__init__.py` never runs, and the Qt
+cases crash on the `QApplication` it is there to create.
+
 They cover the client↔daemon wire format, the settings parser, the raw-frame
 guard that stops a malformed worker header reading past a buffer, cache
 encoding and keys, the spreadsheet grid reader (cell placement, date and
@@ -502,7 +520,7 @@ the PDF search's text flattening and geometry.
 Eleven of them want a real PDF and skip without one — point them at your own:
 
 ```bash
-QUICKVIEW_TEST_PDF=~/any/bookmarked.pdf .venv/bin/python -m unittest discover -s tests
+QUICKVIEW_TEST_PDF=~/any/bookmarked.pdf .venv/bin/python -m unittest discover -s tests -t .
 ```
 
 `QUICKVIEW_TEST_PDF` can be any PDF that has bookmarks (the outline cases).

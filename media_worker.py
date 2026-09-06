@@ -30,8 +30,8 @@ Here, the whole pipeline runs in the jail:
 Wire protocol on the socket, both directions: 4-byte big-endian length +
 JSON. The daemon sends {"op": "media", ...} once (with the media fd and the
 frame memfd attached), then control messages ("play", "pause", "seek",
-"volume", "ack"). This side replies with "meta", "frame", "position", "eof"
-and "error" messages.
+"volume", "mute", "rate", "ack"). This side replies with "meta", "frame",
+"position", "eof" and "error" messages.
 """
 
 import array

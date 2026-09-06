@@ -47,8 +47,8 @@ import ipc
 import theme
 
 from PySide6.QtCore import (
-    Qt, QUrl, QPoint, QRect, QSize, QObject, QSocketNotifier, QThreadPool,
-    QTimer, QFileInfo, QMimeDatabase, QStandardPaths, Signal,
+    Qt, QUrl, QEvent, QPoint, QRect, QSize, QObject, QSocketNotifier,
+    QThreadPool, QTimer, QFileInfo, QMimeDatabase, QStandardPaths, Signal,
 )
 from PySide6.QtGui import (
     QAction, QFont, QGuiApplication, QIcon, QImage, QKeySequence, QRegion,
@@ -570,16 +570,32 @@ def _font_binds() -> list:
     return binds
 
 
+def _toplevel_binds() -> list:
+    """Recreate the host's /lib, /lib64, /bin, /sbin inside the jail.
+
+    Only /usr is bound, so the loader's own path has to be rebuilt. Where
+    these point differs per distro — /lib64 -> usr/lib on Arch, but
+    usr/lib64 on Fedora and Debian, where guessing "usr/lib" leaves the
+    jail with no ld.so and every helper dies before main() — so copy the
+    host's real link target rather than assume one. A distro that never
+    merged /usr has these as real directories: bind those read-only.
+    """
+    flags = []
+    for path in ("/lib", "/lib64", "/bin", "/sbin"):
+        if os.path.islink(path):
+            flags += ["--symlink", os.readlink(path), path]
+        elif os.path.isdir(path):
+            flags += ["--ro-bind", path, path]
+    return flags
+
+
 def sandbox_flags(bwrap: str) -> list:
     """The jail every helper runs in: read-only /usr + this app dir, no
     network, no writes, no capabilities, its own everything."""
     return [
         bwrap,
         "--ro-bind", "/usr", "/usr",
-        "--symlink", "usr/lib", "/lib",
-        "--symlink", "usr/lib", "/lib64",
-        "--symlink", "usr/bin", "/bin",
-        "--symlink", "usr/bin", "/sbin",
+        *_toplevel_binds(),
         "--proc", "/proc",
         "--dev", "/dev",
         "--tmpfs", "/tmp",
@@ -1246,7 +1262,8 @@ class QuickView(QWidget):
         # read from it. QApplication.palette() is the running desktop's,
         # which is what "breeze" follows — so this has to happen after the
         # application exists, not at import time with the rest of SETTINGS.
-        self.theme = theme.load(SETTINGS["panel_theme"], QApplication.palette())
+        self.theme_name = SETTINGS["panel_theme"]
+        self.theme = theme.load(self.theme_name, QApplication.palette())
         self.mime_db = QMimeDatabase()
         self.icon_provider = QFileIconProvider()
         self.current_path = None
@@ -1356,6 +1373,28 @@ class QuickView(QWidget):
     def closeEvent(self, event):
         event.ignore()
         self.dismiss("window closed")
+
+    def event(self, event):
+        # Handled here rather than in changeEvent() because changeEvent()
+        # never sees it: QWidget.event() consumes ApplicationPaletteChange
+        # itself and passes on only the widget-level PaletteChange, which
+        # also arrives mid-__init__ and on every stylesheet re-polish.
+        #
+        # The daemon outlives any number of colour-scheme changes: there is
+        # one QuickView for its whole lifetime, so a theme resolved once in
+        # __init__ would keep the scheme that happened to be set at login.
+        # Only breeze reads the palette, so only breeze has to be redone.
+        if (event.type() == QEvent.ApplicationPaletteChange
+                and getattr(self, "theme_name", None) == "breeze"):
+            self.theme = theme.load("breeze", QApplication.palette())
+            # The panel only. Content widgets carry stylesheets built when
+            # the preview was made, and the sole way to recolour those is to
+            # re-render, which would lose the scroll position, the PDF page,
+            # the EPUB chapter. A preview lasts seconds and nobody reaches
+            # System Settings past it — the next one is built from the new
+            # palette anyway.
+            self.setStyleSheet(PANEL_STYLE.substitute(self.theme))
+        return super().event(event)
 
     # ---------------------------------------------------------------- helpers
 
@@ -2838,7 +2877,21 @@ class QuickView(QWidget):
             s = max(int(ms), 0) // 1000
             return f"{s // 60}:{s % 60:02d}"
 
+        def fit_time_lbl():
+            # The readout follows the handle during a drag, so a clip
+            # crossing 9:59 into 10:00 would widen the label, shrink the
+            # slider next to it and move the value out from under the
+            # cursor. Widened once per duration instead — the position
+            # never formats longer than the duration does — which happens
+            # before playback starts and never mid-drag. Measured after
+            # the panel stylesheet is on, unlike the buttons above.
+            longest = f"{fmt(state['duration'])} / {fmt(state['duration'])}"
+            time_lbl.setFixedWidth(
+                time_lbl.fontMetrics().horizontalAdvance(longest) + 4
+            )
+
         state = {"duration": 0, "playing": True, "rate": 1.0, "muted": False}
+        fit_time_lbl()
 
         def on_frame(img: QImage):
             if surface is None:
@@ -2853,17 +2906,20 @@ class QuickView(QWidget):
         def on_meta(msg):
             state["duration"] = msg.get("duration", 0)
             slider.setRange(0, state["duration"])
+            fit_time_lbl()
 
         def on_position(msg):
             p = msg.get("position", 0)
             if slider.isSliderDown():
                 # Mid-drag: the player is still reporting where it was, and
                 # writing that back would drag the handle out from under the
-                # cursor until the seek lands.
-                return
-            slider.blockSignals(True)
-            slider.setValue(p)
-            slider.blockSignals(False)
+                # cursor until the seek lands. The readout still follows the
+                # handle, so the drag shows where it is going to land.
+                p = slider.value()
+            else:
+                slider.blockSignals(True)
+                slider.setValue(p)
+                slider.blockSignals(False)
             time_lbl.setText(f"{fmt(p)} / {fmt(state['duration'])}")
 
         def on_eof(_msg=None):
