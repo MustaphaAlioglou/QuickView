@@ -161,6 +161,8 @@ when you change schemes rather than waiting for a restart. It also squares
 the corners off and moves the close button to the right, where a Plasma
 window decoration puts it.
 
+![The breeze panel theme on a dark Plasma colour scheme, with a PDF's contents sidebar open](docs/screenshots/breeze.png)
+
 One thing it does not follow is `code_style`: the colours in a highlighted
 source file come from Pygments, in the sandboxed worker, and the default
 `one-dark` is built for a dark background. On a **light** Plasma scheme, set
