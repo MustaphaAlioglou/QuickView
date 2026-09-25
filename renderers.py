@@ -897,7 +897,8 @@ def _scan(doc, pages: list, query: str, page_w: int, max_hits: int,
     return {"matches": matches, "capped": False, "loose": False}
 
 
-def render_pdf(source, page_w: int, max_pages: int, start: int = 0):
+def render_pdf(source, page_w: int, max_pages: int, start: int = 0,
+               scale: float = 1.0):
     """Yield (page_count, png_bytes) for pages start..max_pages-1.
 
     Every yielded page carries the document's real page count in a
@@ -906,6 +907,11 @@ def render_pdf(source, page_w: int, max_pages: int, start: int = 0):
     caller can show page 1 before the rest exist. start skips pages the
     caller already has (a partially cached document resumes there instead
     of re-rendering the prefix).
+
+    scale is the screen's device pixel ratio: the page keeps its page_w
+    geometry — the one search and the outline are measured in — but is
+    rendered with scale times the pixels, so a 1.5x screen shows it sharp
+    instead of stretching it. See _scaled_px.
     """
     from PySide6.QtCore import QSize, Qt
     from PySide6.QtGui import QImage, QPainter
@@ -915,7 +921,8 @@ def render_pdf(source, page_w: int, max_pages: int, start: int = 0):
     count = min(total, max_pages)
     for i in range(max(start, 0), count):
         w, h = _page_px(doc, i, page_w)
-        rendered = doc.render(i, QSize(w, h))
+        sw, sh, used = _scaled_px(w, h, scale)
+        rendered = doc.render(i, QSize(sw, sh))
         if rendered.isNull():
             raise RuntimeError(f"render failed on page {i}")
         # Qt renders onto transparency: a PDF paints its glyphs but almost
@@ -928,7 +935,26 @@ def render_pdf(source, page_w: int, max_pages: int, start: int = 0):
         painter.drawImage(0, 0, rendered)
         painter.end()
         img.setText("QuickView:PageCount", str(total))
+        img.setText("QuickView:Scale", "%.4f" % used)
         yield count, _encode(img)
+
+
+def _scaled_px(w: int, h: int, scale: float) -> tuple:
+    """(w, h, scale actually used) for a page drawn at a pixel ratio.
+
+    The ratio is clamped to [1, 4] — it comes from the daemon, but it is
+    still a number that sizes an allocation — and shrunk further if it
+    would take the page past PDF_MAX_PAGE_PX. The ratio used is what the
+    page's "QuickView:Scale" chunk records, so the daemon always divides by
+    the factor that was really applied rather than the one it asked for.
+    """
+    try:
+        scale = min(max(float(scale), 1.0), 4.0)
+    except (TypeError, ValueError):
+        scale = 1.0
+    # w and h are already within PDF_MAX_PAGE_PX, so this never goes below 1.
+    scale = max(1.0, min(scale, PDF_MAX_PAGE_PX / max(w, h, 1)))
+    return max(1, round(w * scale)), max(1, round(h * scale)), scale
 
 
 def pdf_outline(source, page_w: int, max_pages: int,
@@ -1442,7 +1468,7 @@ def _office_text(zf, names, limit: int) -> str:
 
 
 def office_pages(fd: int, name: str, page_w: int, max_pages: int, start: int = 0,
-                 engine: str = "libreoffice"):
+                 engine: str = "libreoffice", scale: float = 1.0):
     """Yield (page_count, png_bytes) for an office document, as page images.
 
     A word-processor document goes to LibreOffice when the system has one:
@@ -1469,7 +1495,8 @@ def office_pages(fd: int, name: str, page_w: int, max_pages: int, start: int = 0
     if engine != "builtin" and office_suite():
         sent = False
         try:
-            for item in _pages_via_office_suite(fd, page_w, max_pages, start):
+            for item in _pages_via_office_suite(fd, page_w, max_pages, start,
+                                                scale):
                 sent = True
                 yield item
             if sent:
@@ -1479,7 +1506,8 @@ def office_pages(fd: int, name: str, page_w: int, max_pages: int, start: int = 0
                 raise  # pages already out: a fallback would repeat them
             print("office suite: %s — using the built-in layout" % exc,
                   file=sys.stderr)
-    yield from _pages_via_qtextdocument(fd, name, page_w, max_pages, start)
+    yield from _pages_via_qtextdocument(fd, name, page_w, max_pages, start,
+                                        scale)
 
 
 # Only the distro's own LibreOffice: the jail binds /usr and nothing else,
@@ -1533,7 +1561,8 @@ def _office_suite_kind(fh) -> str:
     return ""
 
 
-def _pages_via_office_suite(fd: int, page_w: int, max_pages: int, start: int = 0):
+def _pages_via_office_suite(fd: int, page_w: int, max_pages: int, start: int = 0,
+                            scale: float = 1.0):
     """Convert with LibreOffice to PDF, then render that like any PDF.
 
     Everything happens under a private temporary directory in the jail's
@@ -1586,11 +1615,11 @@ def _pages_via_office_suite(fd: int, page_w: int, max_pages: int, start: int = 0
                 tail = err.decode("utf-8", "replace").strip()[-200:]
                 raise RuntimeError("no PDF produced (exit %s) %s"
                                    % (proc.returncode, tail))
-            yield from render_pdf(pdf, page_w, max_pages, start)
+            yield from render_pdf(pdf, page_w, max_pages, start, scale)
 
 
 def _pages_via_qtextdocument(fd: int, name: str, page_w: int, max_pages: int,
-                             start: int = 0):
+                             start: int = 0, scale: float = 1.0):
     import zipfile
 
     from PySide6.QtCore import QRectF, QSizeF, Qt, QUrl
@@ -1619,11 +1648,12 @@ def _pages_via_qtextdocument(fd: int, name: str, page_w: int, max_pages: int,
             doc.setHtml(body)
             doc.setPageSize(QSizeF(page_w, page_h))
             count = min(doc.pageCount(), max_pages)
-            yield from _document_pages(doc, page_w, page_h, count, start)
+            yield from _document_pages(doc, page_w, page_h, count, start,
+                                       scale=scale)
 
 
 def _document_pages(doc, page_w: int, page_h: int, count: int, start: int,
-                    background: str = "#ffffff"):
+                    background: str = "#ffffff", scale: float = 1.0):
     """Yield (count, png) for a laid-out QTextDocument, page by page.
 
     Shared by the office and EPUB paths: both end up with one long document
@@ -1636,15 +1666,23 @@ def _document_pages(doc, page_w: int, page_h: int, count: int, start: int,
     colour = QColor(background)
     if not colour.isValid():
         colour = QColor("#ffffff")
+    # The layout stays at page_w — that is what the headings, chapters and
+    # search positions are measured in — and only the painting is scaled,
+    # so a 1.5x screen gets the same page with 1.5x the pixels.
+    sw, sh, used = _scaled_px(page_w, page_h, scale)
     for index in range(max(start, 0), count):
-        page = QImage(page_w, page_h, QImage.Format.Format_RGB32)
+        page = QImage(sw, sh, QImage.Format.Format_RGB32)
         page.fill(colour)
         painter = QPainter(page)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.scale(sw / page_w, sh / page_h)
         painter.translate(0, -index * page_h)
         painter.setClipRect(QRectF(0, index * page_h, page_w, page_h))
         doc.drawContents(painter, QRectF(0, index * page_h, page_w, page_h))
         painter.end()
         page.setText("QuickView:PageCount", str(doc.pageCount()))
+        page.setText("QuickView:Scale", "%.4f" % used)
         yield count, _encode(page)
 
 
@@ -2603,7 +2641,8 @@ def _book_css(palette: dict) -> str:
 
 
 def epub_pages(fd: int, name: str, page_w: int, max_pages: int,
-               start: int = 0, theme: str = DEFAULT_BOOK_THEME):
+               start: int = 0, theme: str = DEFAULT_BOOK_THEME,
+               scale: float = 1.0):
     """Yield (info, png_bytes) for a book, as page images.
 
     info is the same dict on every page — {"count", "chapters", "title"} —
@@ -2623,7 +2662,7 @@ def epub_pages(fd: int, name: str, page_w: int, max_pages: int,
         ),
     }
     for _n, png in _document_pages(
-        doc, page_w, page_h, count, start, book["palette"]["bg"]
+        doc, page_w, page_h, count, start, book["palette"]["bg"], scale
     ):
         yield info, png
 
@@ -3171,7 +3210,8 @@ MARKDOWN_MAX_BYTES = 2 * 1024 * 1024
 
 
 def markdown_pages(fd: int, name: str, page_w: int, max_pages: int,
-                   start: int = 0, theme: str = DEFAULT_BOOK_THEME):
+                   start: int = 0, theme: str = DEFAULT_BOOK_THEME,
+                   scale: float = 1.0):
     """Yield (info, png_bytes) for a Markdown file, rendered as pages.
 
     info is {"count", "chapters"} and is the same dict on every page, like
@@ -3206,7 +3246,7 @@ def markdown_pages(fd: int, name: str, page_w: int, max_pages: int,
     count = min(doc.pageCount(), max_pages)
     info = {"count": count, "chapters": _markdown_headings(doc, page_h, count)}
     for _n, png in _document_pages(doc, page_w, page_h, count, start,
-                                   palette["bg"]):
+                                   palette["bg"], scale):
         yield info, png
 
 

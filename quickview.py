@@ -1295,6 +1295,7 @@ class QuickView(QWidget):
         self._find_loose = False  # hits came from the spaces-ignored pass
         self._find_at = -1       # index into _find_hits
         self._find_page_w = 0    # pixel width the hits were computed for
+        self._page_scale = 1.0   # device pixel ratio the page images are for
         self._find_job = None
         self._text_readers = set()  # readers still on a pool thread
         self._html_rendered = True  # HTML mode: rendered page vs. source
@@ -1408,6 +1409,22 @@ class QuickView(QWidget):
     def screen_avail(self) -> QSize:
         screen = self.screen() or QGuiApplication.primaryScreen()
         return screen.availableGeometry().size()
+
+    def page_scale(self) -> float:
+        """Device pixels per logical pixel, for rendering page images.
+
+        Pages were rendered at their logical width and then stretched by
+        the compositor on a scaled screen — 1.25x or 1.5x on a 4K monitor
+        — which is what made them blurry next to Okular. The window's own
+        ratio is asked first: under Wayland fractional scaling only the
+        window knows the exact 1.25; the screen reports it rounded up.
+        """
+        handle = self.windowHandle()
+        ratio = handle.devicePixelRatio() if handle else 0.0
+        if ratio <= 0:
+            screen = self.screen() or QGuiApplication.primaryScreen()
+            ratio = screen.devicePixelRatio() if screen else 1.0
+        return round(min(max(ratio, 1.0), 4.0), 2)
 
     def set_panel_size(self, w: int, h: int):
         avail = self.screen_avail()
@@ -2022,6 +2039,7 @@ class QuickView(QWidget):
     def show_pdf(self, path: str):
         avail = self.screen_avail()
         page_w = max(int(avail.width() * 0.55) - 44, 400)
+        self._page_scale = scale = self.page_scale()
         try:
             st = os.stat(path)
         except OSError as exc:
@@ -2029,7 +2047,7 @@ class QuickView(QWidget):
             return
 
         def page_key(i: int) -> str:
-            return cache_key(path, st, page_w, 0, f"pdf{i}")
+            return cache_key(path, st, page_w, 0, f"pdf{i}@{scale:g}")
 
         # The bookmarks, for the sidebar. Cached like a page is, because
         # the alternative is a second worker on every open of every PDF —
@@ -2079,7 +2097,11 @@ class QuickView(QWidget):
         lay.setSpacing(12)
         self._pdf_labels = []
         self._pdf_overlays = []
+        # Sizes come from the page images, which are in device pixels; the
+        # column is laid out in logical ones.
+        ratio = self._page_scale
         for w, h in sizes:
+            w, h = round(w / ratio), round(h / ratio)
             label = QLabel()
             label.setFixedSize(w, h)
             # An unfilled page, before its render arrives.
@@ -2157,6 +2179,7 @@ class QuickView(QWidget):
 
         avail = self.screen_avail()
         page_w = max(int(avail.width() * 0.55) - 44, 400)
+        self._page_scale = scale = self.page_scale()
         try:
             st = os.stat(path)
         except OSError as exc:
@@ -2164,7 +2187,7 @@ class QuickView(QWidget):
             return
 
         def page_key(i: int) -> str:
-            return cache_key(path, st, page_w, 0, f"md-{BOOK_THEME}{i}")
+            return cache_key(path, st, page_w, 0, f"md-{BOOK_THEME}{i}@{scale:g}")
 
         toc_key = cache_key(path, st, page_w, 0, "toc2")
         cached_toc = cache_read(toc_key)
@@ -2209,6 +2232,7 @@ class QuickView(QWidget):
     def show_epub(self, path: str):
         avail = self.screen_avail()
         page_w = max(int(avail.width() * 0.55) - 44, 400)
+        self._page_scale = scale = self.page_scale()
         try:
             st = os.stat(path)
         except OSError as exc:
@@ -2216,7 +2240,7 @@ class QuickView(QWidget):
             return
 
         def page_key(i: int) -> str:
-            return cache_key(path, st, page_w, 0, f"epub-{BOOK_THEME}{i}")
+            return cache_key(path, st, page_w, 0, f"epub-{BOOK_THEME}{i}@{scale:g}")
 
         toc_key = cache_key(path, st, page_w, 0, "toc2")
         cached_toc = cache_read(toc_key)
@@ -2670,8 +2694,19 @@ class QuickView(QWidget):
         if not 0 <= i < len(self._pdf_labels):
             return
         label = self._pdf_labels[i]
-        if label.size() != img.size():  # an estimate that missed
-            label.setFixedSize(img.size())
+        # Shown at logical size with all its pixels: the ratio is the one
+        # the worker actually rendered at, read off the page itself.
+        try:
+            ratio = float(img.text("QuickView:Scale") or 1.0)
+        except ValueError:
+            ratio = 1.0
+        img.setDevicePixelRatio(max(ratio, 1.0))
+        size = img.deviceIndependentSize().toSize()
+        if label.size() != size:  # an estimate that missed
+            label.setFixedSize(size)
+            overlay = self._pdf_overlays[i] if i < len(self._pdf_overlays) else None
+            if overlay is not None:
+                overlay.setGeometry(0, 0, size.width(), size.height())
         label.setPixmap(QPixmap.fromImage(img))
         label.setStyleSheet("")
 
@@ -2806,7 +2841,7 @@ class QuickView(QWidget):
                 log.warning("pdf render truncated: %s (%s)", path, error[:500])
 
         job = {"op": op, "page_w": page_w, "max_pages": PDF_MAX_PAGES,
-               "start": start}
+               "start": start, "scale": self._page_scale}
         if extra:
             job.update(extra)
         state["job"] = self._render_job = SandboxJob(
@@ -3327,6 +3362,7 @@ class QuickView(QWidget):
             return
         avail = self.screen_avail()
         page_w = max(int(avail.width() * 0.55) - 44, 400)
+        self._page_scale = scale = self.page_scale()
         try:
             st = os.stat(path)
         except OSError as exc:
@@ -3340,7 +3376,7 @@ class QuickView(QWidget):
         engine = "lo" if use_lo else "qt2"
 
         def page_key(i: int) -> str:
-            return cache_key(path, st, page_w, 0, f"off{engine}{i}")
+            return cache_key(path, st, page_w, 0, f"off{engine}{i}@{scale:g}")
 
         def on_doc(payload: bytes):
             try:

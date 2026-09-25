@@ -24,6 +24,16 @@ project has no version tags yet, so entries are dated.
 
 ### Fixed
 
+- **Pages are sharp on scaled screens.** PDF, office, EPUB and Markdown
+  pages were rendered at their logical width and then stretched by the
+  compositor, so at 125 % or 150 % scaling they were visibly blurry next
+  to Okular. They are now rendered with the window's device pixel ratio —
+  asked of the window, since under Wayland fractional scaling only it
+  knows the exact 1.25 — and shown at the same size with all the pixels.
+  Layout is unchanged: books and Markdown are painted at the higher
+  resolution, not re-flowed, and search highlights, outline and chapter
+  positions keep their logical geometry. The ratio is part of the page
+  cache key, and each page records the ratio it was actually rendered at.
 - **The built-in .docx layout is much closer to the document.** Images
   are drawn at the size the document gives them instead of a fixed 420 px;
   text in a table or text box is no longer printed twice; `<w:b w:val="0"/>`

@@ -146,7 +146,8 @@ def main() -> int:
         elif op == "pdf":
             first = True
             for count, png in renderers.render_pdf(
-                src, job["page_w"], job["max_pages"], job.get("start", 0)
+                src, job["page_w"], job["max_pages"], job.get("start", 0),
+                job.get("scale", 1.0),
             ):
                 if first:
                     header(count)
@@ -186,6 +187,7 @@ def main() -> int:
                 fd, job.get("name", ""), job["page_w"],
                 job["max_pages"], job.get("start", 0),
                 theme=job.get("theme", renderers.DEFAULT_BOOK_THEME),
+                scale=job.get("scale", 1.0),
             ):
                 if first:
                     state["header"] = True
@@ -205,6 +207,7 @@ def main() -> int:
                 fd, job.get("name", ""), job["page_w"], job["max_pages"],
                 job.get("start", 0),
                 job.get("theme", renderers.DEFAULT_BOOK_THEME),
+                job.get("scale", 1.0),
             ):
                 if first:
                     # The headings travel with the pages, as a book's
@@ -255,6 +258,7 @@ def main() -> int:
                     fd, job.get("name", ""), job["page_w"],
                     job["max_pages"], job.get("start", 0),
                     job.get("engine", "libreoffice"),
+                    job.get("scale", 1.0),
                 ):
                     if first:
                         state["header"] = True
