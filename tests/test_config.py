@@ -61,6 +61,30 @@ class Loading(unittest.TestCase):
         self.write("[preview]\nbook_theme = GRUVBOX-LIGHT\n")
         self.assertEqual(config.load(self.path)["book_theme"], "gruvbox-light")
 
+    def test_log_level_is_read(self):
+        self.write("[logging]\nlog_level = debug\n")
+        self.assertEqual(config.load(self.path)["log_level"], "debug")
+        self.write("[logging]\nlog_level = ERROR\n")
+        self.assertEqual(config.load(self.path)["log_level"], "error")
+
+    def test_a_bad_log_level_falls_back_to_info(self):
+        # Silencing the log through a typo would hide exactly the failures
+        # someone edits this file to go looking for.
+        self.write("[logging]\nlog_level = verbose\n")
+        self.assertEqual(config.load(self.path)["log_level"], "info")
+
+    def test_office_engine_is_read_and_a_typo_keeps_the_default(self):
+        self.write("[preview]\noffice_engine = Builtin\n")
+        self.assertEqual(config.load(self.path)["office_engine"], "builtin")
+        self.write("[preview]\noffice_engine = onlyoffice\n")
+        self.assertEqual(config.load(self.path)["office_engine"], "libreoffice")
+
+    def test_every_log_level_names_a_logging_constant(self):
+        # setup_logging() does getattr(logging, value.upper()).
+        import logging
+        for level in config._CHOICES["log_level"]:
+            self.assertTrue(hasattr(logging, level.upper()), level)
+
     def test_out_of_range_is_clamped(self):
         self.write("[preview]\npdf_max_pages = 9999999\n")
         self.assertEqual(config.load(self.path)["pdf_max_pages"], 2000)

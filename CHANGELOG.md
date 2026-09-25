@@ -5,6 +5,113 @@ project has no version tags yet, so entries are dated.
 
 [kac]: https://keepachangelog.com/en/1.1.0/
 
+## 2026-09-25
+
+### Added
+
+- **Word documents preview exactly when LibreOffice is installed.** A
+  `.docx` or `.odt` is converted to PDF by LibreOffice inside the bwrap
+  jail and shown by the PDF page view, so photos keep their size and
+  position, text wraps around them, and fonts, justification, headers and
+  EMF logos all appear as they do in the document. ~1.3 s on first open,
+  cached after that. Machines without LibreOffice — or a conversion that
+  fails or takes over 12 s — fall back to the built-in layout. The office
+  cache key now names the engine, so installing or removing LibreOffice
+  never leaves the other engine's pages on screen.
+
+  Speed over fidelity is a setting: `office_engine = builtin` in
+  `[preview]` skips LibreOffice even when it is installed.
+
+### Fixed
+
+- **The built-in .docx layout is much closer to the document.** Images
+  are drawn at the size the document gives them instead of a fixed 420 px;
+  text in a table or text box is no longer printed twice; `<w:b w:val="0"/>`
+  ("not bold") is no longer bold; headings are found by style *name*, so a
+  Greek or German Word's headings are recognised; alignment, indents,
+  paragraph spacing, page and line breaks, tabs, run sizes, colours, fonts,
+  strike-through and super/subscript are carried over; and EMF/WMF images,
+  which Qt cannot decode, are left out instead of leaving a gap.
+- **`install.sh` no longer exits silently on distros without a packaged
+  PySide6** (Ubuntu 22.04/24.04, Mint). The location probe added on
+  2026-09-23 failed under `set -e` when PySide6 was absent, ending the
+  script before it could install the private copy. Verified by clean
+  installs in Ubuntu 22.04 and 24.04 containers, alongside Fedora, Debian 13
+  and Arch.
+- **The Arch/CachyOS hint for missing Qt modules was wrong.** QtPdf lives in
+  `qt6-webengine` and QtMultimedia in `qt6-multimedia`, both optional for
+  `pyside6`; the hint now names them instead of `pyside6`, which the user
+  already has.
+
+## 2026-09-23
+
+### Added
+
+- **Shebangs decide the language when there is no extension.** A script
+  kept as `~/bin/deploy` rather than `deploy.sh` used to preview as grey
+  text; its `#!` line is now read instead. The content is already decoded
+  by the time the lexer is chosen, so this costs one string split and no
+  extra I/O.
+
+  Pygments' own `guess_lexer()` is deliberately not used. It runs every
+  lexer's `analyse_text()` over untrusted content — the slow, regex-heavy
+  surface the filename path exists to avoid — and it is wrong often enough
+  to matter: `#!/usr/bin/env node` and `#!/usr/bin/awk -f` both guess "Text
+  only", and `#!/usr/bin/php` guesses JavaScript. Reading the interpreter's
+  name off the line is exact. `env` is unwrapped, including `-S` and
+  leading `VAR=value` assignments, and a version suffix is trimmed
+  (`python3.12` → `python`). A small table covers the names Pygments has no
+  alias for (`node`, `deno`, `dash`, `Rscript`, …) or resolves wrongly
+  (`v` is the V language, not Verilog).
+
+  An extension Pygments recognises still wins; the shebang only fills the
+  gap where there is none.
+
+- **`[logging] log_level`**, one of `error`, `warning`, `info`, `debug`,
+  defaulting to `info`. The daemon used to be pinned to `DEBUG`, so every
+  install wrote cache hits and worker lifecycle to `quickview.log` and the
+  journal forever. Override for one run with `QUICKVIEW_LOG_LEVEL`. Crash
+  capture is unaffected: a native crash still lands in `crash.log` whatever
+  this is set to.
+
+### Changed
+
+- **A distribution's own PySide6 and Pygments are used when they are good
+  enough.** `install.sh` now builds `.venv` with `--system-site-packages`
+  and only pip-installs PySide6 when the system has none usable (6.4+, the
+  release that added the QtPdf bindings). An existing virtualenv is
+  upgraded in place by flipping the flag in `pyvenv.cfg`, which the
+  interpreter re-reads at every start.
+
+  Mostly a disk saving: measured on one machine, `.venv` drops from 672 MB
+  to 13 MB. Memory improves too, but modestly. Sharing the distribution's
+  Qt with Plasma's processes takes the daemon's private-clean pages from
+  14.7 MB to under 0.1 MB; against that, the distribution splits Qt into
+  more libraries than the bundled build loads (17 against 6), and the extra
+  relocations add ~8.6 MB of private-dirty. Net, over three runs of a
+  freshly started daemon: PSS 51.2 MB to 46.7 MB, exclusive (private) pages
+  44.9 MB to 38.9 MB. Plain RSS *rises*, 77 MB to 112 MB, because it counts
+  those extra shared libraries in full — which is why it is the wrong
+  number to quote here.
+
+  The saving depends on something else on the desktop already having the
+  libraries resident, which under Plasma it does; on a bare session it
+  would be smaller.
+
+  The jail reaches system site-packages without change: `/usr` is already
+  bound read-only. It does not reach `~/.local/lib`, which
+  `--system-site-packages` also exposes and which sits *ahead* of `/usr` on
+  `sys.path`, so the installer checks where a module resolves rather than
+  only that it imports — an earlier `pip install --user PySide6` would
+  otherwise satisfy every check and then be missing inside bubblewrap.
+
+  PySide6 is probed by module rather than by a bare `import PySide6`, since
+  distributions split it up differently. `QtCore`, `QtGui`, `QtWidgets` and
+  `QtNetwork` are required; `QtPdf`, `QtWebEngine` and `QtMultimedia` are
+  imported lazily and cost exactly one preview type each, so a missing one
+  is named on the way past rather than triggering a whole private Qt.
+  `./install.sh --pip-qt` forces the old behaviour.
+
 ## 2026-08-30
 
 ### Added

@@ -179,11 +179,19 @@ def decode_image(source, max_w: int, max_h: int) -> tuple:
 
     img = reader.read()
     if img.isNull():
-        # Qt has no handler for Photoshop or Krita files, and each of them
-        # stores a flattened copy of itself — try that before calling the
-        # file unreadable. Routing them through here rather than through
-        # branches of their own is what buys them the cache, the prefetch
-        # and the titlebar dimensions for free.
+        # Photoshop and Krita files each store a flattened copy of
+        # themselves — try that before calling the file unreadable. Routing
+        # them through here rather than through branches of their own is
+        # what buys them the cache, the prefetch and the titlebar
+        # dimensions for free.
+        #
+        # Whether this runs at all depends on the machine. Qt on its own has
+        # no psd/kra handler, but kimageformats adds one (along with xcf,
+        # avif, jxl and the raw formats), and a distro PySide6 will load it
+        # from /usr/lib/qt6/plugins — a bundled one never can. So on a KDE
+        # desktop these files are usually decoded above and the parsers
+        # below are the fallback for everyone else. The tests call them
+        # directly for that reason; see PsdDecoding.decoded.
         img, orig = _decode_native(source, max_w, max_h)
         if img is None:
             raise RuntimeError(f"unsupported or corrupt: {reader.errorString()}")
@@ -1031,6 +1039,78 @@ def render_anim(source, max_w: int, max_h: int, max_frames: int, max_bytes: int)
             break
 
 
+# Interpreters whose name is not the lexer's name, or that Pygments has no
+# alias for at all. Everything resolvable on its own is deliberately absent:
+# bash, sh, zsh, ksh, fish, python, perl, ruby, php, lua, awk, tcl, julia,
+# groovy, scala, pwsh, racket, elixir, crystal, raku, ocaml, make, csh, zig.
+_SHEBANG_ALIASES = {
+    "node": "javascript", "nodejs": "javascript", "bun": "javascript",
+    "deno": "typescript", "ts-node": "typescript",
+    "dash": "bash", "rscript": "r", "tclsh": "tcl", "wish": "tcl",
+    "guile": "scheme", "sbcl": "common-lisp",
+    "runhaskell": "haskell", "escript": "erlang",
+    "osascript": "applescript",
+}
+
+# Names Pygments resolves to something unrelated. "v" is the V language, but
+# get_lexer_by_name("v") hands back Verilog — colouring a V script as Verilog
+# is worse than leaving it plain.
+_SHEBANG_DENY = frozenset({"v"})
+
+
+def _shebang_lexer(text: str):
+    """The lexer a `#!` line names, or None.
+
+    Deliberately *not* guess_lexer(): that runs every lexer's analyse_text()
+    over the content, which is the slow, regex-heavy surface the filename
+    path above exists to avoid — and it is wrong often enough to matter
+    (`#!/usr/bin/env node` and `#!/usr/bin/awk -f` both guess "Text only").
+    Reading the interpreter's name is exact and costs one split.
+    """
+    from pygments.lexers import get_lexer_by_name
+    from pygments.util import ClassNotFound
+
+    if not text.startswith("#!"):
+        return None
+    # Capped: the "line" of a minified one-liner can be the whole file, and
+    # nothing past a handful of arguments is ever the interpreter.
+    line = text.split("\n", 1)[0][2:2 + 200].strip()
+    parts = line.split()
+    if not parts:
+        return None
+
+    prog = parts[0].rsplit("/", 1)[-1]
+    if prog == "env":
+        # `env -S deno run --allow-net`, `env FOO=bar python3` — the
+        # interpreter is the first token that is neither a flag nor an
+        # assignment. Without this, every `#!/usr/bin/env x` reads as "env".
+        for token in parts[1:]:
+            if token.startswith("-") or "=" in token:
+                continue
+            prog = token.rsplit("/", 1)[-1]
+            break
+        else:
+            return None
+
+    prog = prog.lower()
+    if prog in _SHEBANG_DENY:
+        return None
+
+    # python3.12 -> python, ruby2.7 -> ruby, node20 -> node -> javascript.
+    # The stripped name goes through the alias table too, or a versioned
+    # interpreter that needs an alias would miss it.
+    stripped = prog.rstrip("0123456789.")
+    for candidate in (_SHEBANG_ALIASES.get(prog, prog),
+                      _SHEBANG_ALIASES.get(stripped, stripped)):
+        if not candidate:
+            continue
+        try:
+            return get_lexer_by_name(candidate, ensurenl=False, stripnl=False)
+        except ClassNotFound:
+            continue
+    return None
+
+
 def highlight_text(source, name: str, limit: int, style_name: str = "one-dark") -> dict:
     """Read a text file and return it with colour spans for its syntax.
 
@@ -1067,15 +1147,24 @@ def highlight_text(source, name: str, limit: int, style_name: str = "one-dark") 
     except ImportError:
         return out  # highlighting is optional; plain text is a fine preview
 
+    # By filename first. guess_lexer() is never used: it runs every lexer's
+    # analyse_text() over the content, which is both slow and a lot more
+    # regex surface. ensurenl=False keeps the text identical to what the
+    # daemon shows, so the offsets below stay valid.
     try:
-        # By filename only. guess_lexer() runs every lexer's analyse_text()
-        # over the content, which is both slow and a lot more regex surface.
-        # ensurenl=False keeps the text identical to what the daemon shows,
-        # so the offsets below stay valid.
         lexer = get_lexer_for_filename(name, ensurenl=False, stripnl=False)
+    except ClassNotFound:
+        # No usable extension — a personal script like ~/bin/deploy. The
+        # text is already read and decoded above, so its `#!` line costs
+        # nothing to consult. An extension Pygments *does* know always
+        # wins; this only fills the gap where there is none.
+        lexer = _shebang_lexer(text)
+        if lexer is None:
+            return out
+    try:
         style = get_style_by_name(style_name)
     except ClassNotFound:
-        return out  # unknown extension, or a style name that does not exist
+        return out  # a style name that does not exist
 
     default = style.style_for_token(Token.Text).get("color")
     palette, styles, spans = {}, [], []
@@ -1352,17 +1441,152 @@ def _office_text(zf, names, limit: int) -> str:
     return ""
 
 
-def office_pages(fd: int, name: str, page_w: int, max_pages: int, start: int = 0):
+def office_pages(fd: int, name: str, page_w: int, max_pages: int, start: int = 0,
+                 engine: str = "libreoffice"):
     """Yield (page_count, png_bytes) for an office document, as page images.
 
-    Word-processor and spreadsheet documents are converted to the HTML subset
-    QTextDocument understands and laid out here: no office suite, no
-    subprocess, ~8 ms to convert and ~7 ms a page. Slide decks have no path
-    through this — their content is absolutely positioned graphics, which
-    QTextDocument cannot lay out — so they raise, and the caller falls back
-    to the thumbnail the deck embeds plus its text.
+    A word-processor document goes to LibreOffice when the system has one:
+    converted to PDF in here, in the jail, and rendered by the PDF path, so
+    the preview has the document's real fonts, image sizes and positions,
+    text wrap, headers and EMF logos. ~1.3 s where the fallback is ~15 ms,
+    which is the price of looking like the document rather than like its
+    text.
+
+    Otherwise — no LibreOffice, a spreadsheet, or a conversion that failed —
+    the document is converted to the HTML subset QTextDocument understands
+    and laid out here: no office suite, no subprocess, ~8 ms to convert and
+    ~7 ms a page. Slide decks have no path through that — their content is
+    absolutely positioned graphics, which QTextDocument cannot lay out — so
+    they raise, and the caller falls back to the thumbnail the deck embeds
+    plus its text.
+
+    engine "builtin" skips LibreOffice even where it is installed: the
+    office_engine setting, for people who would rather have the preview now
+    than have it exact.
     """
+    import sys
+
+    if engine != "builtin" and office_suite():
+        sent = False
+        try:
+            for item in _pages_via_office_suite(fd, page_w, max_pages, start):
+                sent = True
+                yield item
+            if sent:
+                return
+        except Exception as exc:
+            if sent:
+                raise  # pages already out: a fallback would repeat them
+            print("office suite: %s — using the built-in layout" % exc,
+                  file=sys.stderr)
     yield from _pages_via_qtextdocument(fd, name, page_w, max_pages, start)
+
+
+# Only the distro's own LibreOffice: the jail binds /usr and nothing else,
+# so a Flatpak or AppImage copy could not run in here even if it were found.
+OFFICE_SUITES = (
+    "/usr/bin/soffice",
+    "/usr/lib/libreoffice/program/soffice",
+    "/usr/lib64/libreoffice/program/soffice",
+)
+# Inside the daemon's 20 s inactivity watchdog, with room left over for the
+# built-in layout to run when this gives up.
+OFFICE_SUITE_TIMEOUT = 12
+OFFICE_SUITE_MAX_BYTES = 64 * 1024 * 1024
+
+
+def office_suite() -> str:
+    """Path of a LibreOffice the jail can run, or "" when there is none.
+
+    Also asked by the daemon, whose office cache key changes with the answer:
+    installing or removing LibreOffice must not leave pages from the other
+    engine on screen.
+    """
+    import os
+
+    for path in OFFICE_SUITES:
+        if os.access(path, os.X_OK):
+            return path
+    return ""
+
+
+def _office_suite_kind(fh) -> str:
+    """The extension LibreOffice should see, or "" to leave it to Qt.
+
+    Word-processor documents only. Spreadsheets have the sheets view and
+    decks have their thumbnail; both are separate decisions. Decided from
+    the container, not the name, which the file's owner chose.
+    """
+    import zipfile
+
+    if not zipfile.is_zipfile(fh):
+        return ""
+    fh.seek(0)
+    with zipfile.ZipFile(fh) as zf:
+        names = set(zf.namelist())
+        if "word/document.xml" in names:
+            return ".docx"
+        if "mimetype" in names:
+            with zf.open("mimetype") as m:
+                if m.read(64).strip() == b"application/vnd.oasis.opendocument.text":
+                    return ".odt"
+    return ""
+
+
+def _pages_via_office_suite(fd: int, page_w: int, max_pages: int, start: int = 0):
+    """Convert with LibreOffice to PDF, then render that like any PDF.
+
+    Everything happens under a private temporary directory in the jail's
+    tmpfs: a copy of the document (LibreOffice wants a path; the jail has
+    only a descriptor), a throwaway user profile, and the PDF. Nothing
+    outlives the worker, and the jail has no network for a linked image to
+    be fetched over.
+    """
+    import os
+    import signal
+    import subprocess
+    import tempfile
+
+    soffice = office_suite()
+    with _rewound(fd) as fh:
+        kind = _office_suite_kind(fh)
+        if not kind:
+            raise RuntimeError("not a word-processor document")
+        with tempfile.TemporaryDirectory(prefix="qv-office-") as tmp:
+            src = os.path.join(tmp, "doc" + kind)
+            fh.seek(0)
+            with open(src, "wb") as out:
+                data = fh.read(OFFICE_SUITE_MAX_BYTES + 1)
+                if len(data) > OFFICE_SUITE_MAX_BYTES:
+                    raise RuntimeError("too large for the office suite")
+                out.write(data)
+            del data
+            # Its own session, so a timeout can take down the whole tree:
+            # soffice is a launcher that forks soffice.bin, and killing only
+            # the launcher leaves the converter running.
+            proc = subprocess.Popen(
+                [soffice, "--headless", "--norestore", "--nologo",
+                 "--nolockcheck", "--nodefault",
+                 "-env:UserInstallation=file://" + tmp + "/profile",
+                 "--convert-to", "pdf", "--outdir", tmp, src],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                env={"HOME": tmp, "PATH": "/usr/bin:/bin",
+                     "SAL_USE_VCLPLUGIN": "svp"},
+                start_new_session=True,
+            )
+            try:
+                _out, err = proc.communicate(timeout=OFFICE_SUITE_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate()  # reaps it and closes the stderr pipe
+                raise RuntimeError("timed out after %d s" % OFFICE_SUITE_TIMEOUT)
+            pdf = os.path.join(tmp, "doc.pdf")
+            if not os.path.isfile(pdf):
+                tail = err.decode("utf-8", "replace").strip()[-200:]
+                raise RuntimeError("no PDF produced (exit %s) %s"
+                                   % (proc.returncode, tail))
+            yield from render_pdf(pdf, page_w, max_pages, start)
 
 
 def _pages_via_qtextdocument(fd: int, name: str, page_w: int, max_pages: int,
@@ -1379,7 +1603,7 @@ def _pages_via_qtextdocument(fd: int, name: str, page_w: int, max_pages: int,
         fh.seek(0)
         with zipfile.ZipFile(fh) as zf:
             names = set(zf.namelist())
-            body, images = _office_html(zf, names)
+            body, images = _office_html(zf, names, page_w)
             if not body:
                 raise RuntimeError("no layout for this document type")
 
@@ -1424,10 +1648,10 @@ def _document_pages(doc, page_w: int, page_h: int, count: int, start: int,
         yield count, _encode(page)
 
 
-def _office_html(zf, names) -> tuple:
+def _office_html(zf, names, page_w: int = 900) -> tuple:
     """(html, images) for the document types QTextDocument can lay out."""
     if "word/document.xml" in names:
-        return _docx_html(zf, names)
+        return _docx_html(zf, names, page_w)
     if "xl/workbook.xml" in names:
         return _xlsx_html(zf, names), {}
     if "content.xml" in names and "styles.xml" in names:
@@ -1446,76 +1670,380 @@ def _escape(text: str) -> str:
     return html.escape(text or "")
 
 
-def _docx_html(zf, names) -> tuple:
-    R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
-    rels, images = {}, {}
-    if "word/_rels/document.xml.rels" in names:
-        root = _member_xml(zf, "word/_rels/document.xml.rels")
-        for rel in root:
-            target = rel.get("Target", "")
-            member = "word/" + target.lstrip("./")
-            if member in names and member.startswith("word/media/"):
-                rels[rel.get("Id")] = member
+# The built-in .docx layout: what a machine without LibreOffice sees. It is
+# an approximation by design — QTextDocument has no floats, no text wrap, no
+# headers and no EMF — so the aim is the things it *can* show faithfully:
+# image sizes, alignment, indents, run formatting and page breaks.
+_DOCX_WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
+_DOCX_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_DOCX_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_DOCX_V = "{urn:schemas-microsoft-com:vml}"
+_DOCX_MC = "{http://schemas.openxmlformats.org/markup-compatibility/2006}"
+_DOCX_PAGE_IN = 210 / 25.4  # the page is laid out as A4, 8.27 in wide
+# Vector formats Qt has no reader for. Leaving them out is better than the
+# empty frame a failed <img> leaves in the layout.
+_DOCX_NO_RASTER = (".emf", ".wmf", ".emz", ".wmz", ".svm")
+_DOCX_PAGE_BREAK = "\0page\0"
 
+
+class _DocxContext:
+    """What every paragraph needs: the package, its images, and the scale."""
+
+    def __init__(self, zf, names, page_w: int):
+        self.zf = zf
+        self.images = {}
+        self.ppi = page_w / _DOCX_PAGE_IN
+        # Room between the margins that _pages_via_qtextdocument sets.
+        self.max_img_w = page_w * 0.88 - 8
+        self.rels = _docx_rels(zf, names)
+        self.styles, self.size_pt, self.font = _docx_styles(zf, names)
+
+    def px(self, inches: float) -> int:
+        return max(0, round(inches * self.ppi))
+
+
+def _docx_rels(zf, names) -> dict:
+    """Relationship id -> package member, for the images a run can embed."""
+    import posixpath
+
+    rels = {}
+    if "word/_rels/document.xml.rels" not in names:
+        return rels
+    for rel in _member_xml(zf, "word/_rels/document.xml.rels"):
+        if rel.get("TargetMode") == "External":
+            continue  # a URL: the jail has no network, and wants none
+        target = rel.get("Target", "")
+        if target.startswith("/"):
+            member = target.lstrip("/")
+        else:
+            member = posixpath.normpath(posixpath.join("word", target))
+        if member in names:
+            rels[rel.get("Id")] = member
+    return rels
+
+
+def _docx_styles(zf, names) -> tuple:
+    """(styleId -> lower-case style name, body size in pt, body font).
+
+    The id is not the name: a Greek or German Word writes ids like "1" or
+    "berschrift1" for what styles.xml calls "heading 1", and it is the name
+    that is stable across languages. The body size and font come from the
+    document defaults, overridden by the default paragraph style, which is
+    where Word keeps them.
+    """
+    out, size, font = {}, 11.0, ""
+    if "word/styles.xml" not in names:
+        return out, size, font
+    root = _member_xml(zf, "word/styles.xml")
+
+    def take(rpr):
+        nonlocal size, font
+        if rpr is None:
+            return
+        sz = _docx_val(rpr, W + "sz")
+        if sz and sz.isdigit() and 8 <= int(sz) <= 200:
+            size = int(sz) / 2
+        fonts = rpr.find(W + "rFonts")
+        if fonts is not None and (fonts.get(W + "ascii") or fonts.get(W + "hAnsi")):
+            font = fonts.get(W + "ascii") or fonts.get(W + "hAnsi")
+
+    take(root.find(W + "docDefaults/" + W + "rPrDefault/" + W + "rPr"))
+    for style in root.iter(W + "style"):
+        node = style.find(W + "name")
+        if node is not None:
+            out[style.get(W + "styleId", "")] = (node.get(W + "val") or "").lower()
+        if style.get(W + "type") == "paragraph" and style.get(W + "default") in ("1", "true"):
+            take(style.find(W + "rPr"))
+    return out, size, font
+
+
+def _docx_outer(node, tag: str):
+    """Descendants with this tag, not looking inside a text box.
+
+    A text box's paragraphs are laid out on their own (see _docx_inline);
+    reaching into one from the drawing around it would show its pictures,
+    and any text box nested in it, a second time.
+    """
+    for child in node:
+        if child.tag == tag:
+            yield child
+        elif child.tag != W + "txbxContent":
+            yield from _docx_outer(child, tag)
+
+
+def _docx_on(props, tag: str) -> bool:
+    """A toggle property: present and not switched off by its w:val."""
+    node = props.find(W + tag) if props is not None else None
+    if node is None:
+        return False
+    return node.get(W + "val", "true").lower() not in ("0", "false", "off", "none")
+
+
+def _docx_val(props, path: str):
+    node = props.find(path) if props is not None else None
+    return node.get(W + "val") if node is not None else None
+
+
+def _docx_twips(value, default: float = 0.0) -> float:
+    """A twentieth-of-a-point measure, in inches."""
+    try:
+        return int(value) / 1440
+    except (TypeError, ValueError):
+        return default
+
+
+def _docx_html(zf, names, page_w: int = 900) -> tuple:
+    ctx = _DocxContext(zf, names, page_w)
     root = _member_xml(zf, "word/document.xml")
+    body = root.find(W + "body")
+    parts = _docx_blocks(body if body is not None else root, ctx)
+    family = "'%s', serif" % ctx.font.replace("'", "") if ctx.font else "serif"
+    head = "<body style=\"font-family:%s; font-size:%dpx; color:#111;\">" % (
+        family, ctx.px(ctx.size_pt / 72))
+    return head + "".join(p for p in parts if p) + "</body>", ctx.images
+
+
+def _docx_blocks(container, ctx) -> list:
+    """Paragraphs and tables, in order, from a body, cell or content control.
+
+    Only direct children: a table's paragraphs belong to its cells, and
+    walking every descendant — as this once did — printed each of them twice.
+    """
     parts = []
-    for block in root.iter():
+    for block in container:
         if block.tag == W + "p":
-            parts.append(_docx_paragraph(block, rels, images, zf))
+            parts.append(_docx_paragraph(block, ctx))
         elif block.tag == W + "tbl":
-            parts.append(_docx_table(block, rels, images, zf))
-    return _HTML_HEAD + "".join(p for p in parts if p) + "</body>", images
+            parts.append(_docx_table(block, ctx))
+        elif block.tag in (W + "sdt", W + "customXml", W + "sdtContent"):
+            inner = block.find(W + "sdtContent")
+            parts += _docx_blocks(inner if inner is not None else block, ctx)
+    return parts
 
 
-def _docx_paragraph(para, rels, images, zf) -> str:
-    style_node = para.find(W + "pPr/" + W + "pStyle")
-    style = style_node.get(W + "val", "") if style_node is not None else ""
-    pieces = []
-    for run in para.iter(W + "r"):
-        text = "".join(node.text or "" for node in run.iter(W + "t"))
-        if text:
-            props = run.find(W + "rPr")
-            markup = _escape(text)
-            if props is not None:
-                if props.find(W + "b") is not None:
-                    markup = "<b>%s</b>" % markup
-                if props.find(W + "i") is not None:
-                    markup = "<i>%s</i>" % markup
-                if props.find(W + "u") is not None:
-                    markup = "<u>%s</u>" % markup
-            pieces.append(markup)
-        for blip in run.iter(
-            "{http://schemas.openxmlformats.org/drawingml/2006/main}blip"
+def _docx_inline(node, ctx, pieces: list, boxes: list):
+    """Collect a paragraph's runs in reading order.
+
+    Recursive because runs hide inside hyperlinks, tracked insertions and
+    content controls. A text box's paragraphs are *not* this paragraph's
+    text: they are collected into `boxes` and set after it. Of an
+    mc:AlternateContent, only the first choice is read — the fallback is
+    the same drawing again, for older readers.
+    """
+    for child in node:
+        tag = child.tag
+        if tag == W + "r":
+            _docx_run(child, ctx, pieces, boxes)
+        elif tag == W + "del" or tag == W + "pPr":
+            continue
+        elif tag == _DOCX_MC + "AlternateContent":
+            choice = child.find(_DOCX_MC + "Choice")
+            if choice is not None:
+                _docx_inline(choice, ctx, pieces, boxes)
+        elif tag == W + "txbxContent":
+            boxes += _docx_blocks(child, ctx)
+        else:
+            _docx_inline(child, ctx, pieces, boxes)
+
+
+def _docx_run(run, ctx, pieces: list, boxes: list):
+    props = run.find(W + "rPr")
+    for child in run:
+        tag = child.tag
+        if tag == W + "t":
+            pieces.append(_docx_styled(_escape(child.text), props, ctx))
+        elif tag == W + "tab":
+            pieces.append("&emsp;&emsp;")
+        elif tag in (W + "br", W + "cr"):
+            if child.get(W + "type") == "page":
+                pieces.append(_DOCX_PAGE_BREAK)
+            else:
+                pieces.append("<br>")
+        elif tag == W + "drawing":
+            pieces.append(_docx_drawing(child, ctx))
+            for box in _docx_outer(child, W + "txbxContent"):
+                boxes += _docx_blocks(box, ctx)
+        elif tag == W + "pict":
+            pieces.append(_docx_vml(child, ctx))
+            for box in _docx_outer(child, W + "txbxContent"):
+                boxes += _docx_blocks(box, ctx)
+        elif tag == _DOCX_MC + "AlternateContent":
+            choice = child.find(_DOCX_MC + "Choice")
+            if choice is not None:
+                _docx_run(choice, ctx, pieces, boxes)
+
+
+def _docx_styled(markup: str, props, ctx) -> str:
+    if not markup or props is None:
+        return markup
+    css = []
+    size = _docx_val(props, W + "sz")
+    if size and size.isdigit():
+        css.append("font-size:%dpx" % max(ctx.px(int(size) / 2 / 72), 4))
+    colour = _docx_val(props, W + "color")
+    if colour and len(colour) == 6 and colour.lower() != "auto":
+        css.append("color:#%s" % colour)
+    fonts = props.find(W + "rFonts")
+    if fonts is not None:
+        family = fonts.get(W + "ascii") or fonts.get(W + "hAnsi")
+        if family:
+            css.append("font-family:'%s'" % family.replace("'", ""))
+    if _docx_on(props, "strike") or _docx_on(props, "dstrike"):
+        css.append("text-decoration:line-through")
+    if css:
+        markup = "<span style=\"%s\">%s</span>" % (";".join(css), markup)
+    if _docx_on(props, "b"):
+        markup = "<b>%s</b>" % markup
+    if _docx_on(props, "i"):
+        markup = "<i>%s</i>" % markup
+    if _docx_on(props, "u"):
+        markup = "<u>%s</u>" % markup
+    shift = _docx_val(props, W + "vertAlign")
+    if shift == "superscript":
+        markup = "<sup>%s</sup>" % markup
+    elif shift == "subscript":
+        markup = "<sub>%s</sub>" % markup
+    return markup
+
+
+def _docx_image(ctx, rel_id, w_in: float, h_in: float) -> str:
+    member = ctx.rels.get(rel_id)
+    if not member or member.lower().endswith(_DOCX_NO_RASTER):
+        return ""
+    if not _stash_image(ctx.zf, member, ctx.images):
+        return ""
+    w, h = ctx.px(w_in), ctx.px(h_in)
+    if w <= 0 or h <= 0:
+        return "<img src='%s' width='%d'>" % (_escape(member), min(420, ctx.max_img_w))
+    if w > ctx.max_img_w:  # wider than the text column: shrink, keep aspect
+        h = round(h * ctx.max_img_w / w)
+        w = int(ctx.max_img_w)
+    return "<img src='%s' width='%d' height='%d'>" % (_escape(member), w, h)
+
+
+def _docx_drawing(drawing, ctx) -> str:
+    """A DrawingML picture, at the size the document gives it.
+
+    wp:extent is in EMUs, 914400 to the inch.
+    """
+    extent = drawing.find(".//" + _DOCX_WP + "extent")
+    w_in = h_in = 0.0
+    if extent is not None:
+        try:
+            w_in = int(extent.get("cx", 0)) / 914400
+            h_in = int(extent.get("cy", 0)) / 914400
+        except ValueError:
+            pass
+    out = []
+    for blip in _docx_outer(drawing, _DOCX_A + "blip"):
+        out.append(_docx_image(ctx, blip.get(_DOCX_R + "embed"), w_in, h_in))
+    return "".join(out)
+
+
+def _docx_vml(pict, ctx) -> str:
+    """A legacy VML picture (Word 2003 and older), sized from its style."""
+    import re
+
+    out = []
+    for shape in _docx_outer(pict, _DOCX_V + "shape"):
+        dims = {}
+        for key, num, unit in re.findall(
+            r"(width|height)\s*:\s*([\d.]+)\s*(pt|in|px)?", shape.get("style", "")
         ):
-            member = rels.get(blip.get(
-                "{http://schemas.openxmlformats.org/officeDocument/2006/"
-                "relationships}embed"
+            scale = {"in": 1.0, "px": 1 / 96}.get(unit, 1 / 72)
+            try:
+                dims[key] = float(num) * scale
+            except ValueError:
+                pass
+        for data in _docx_outer(shape, _DOCX_V + "imagedata"):
+            out.append(_docx_image(
+                ctx, data.get(_DOCX_R + "id"),
+                dims.get("width", 0.0), dims.get("height", 0.0),
             ))
-            if member and _stash_image(zf, member, images):
-                pieces.append("<img src='%s' width='420'>" % member)
-    body = "".join(pieces)
-    if not body:
-        return "<p>&nbsp;</p>"
-    if style.startswith("Title"):
-        return "<h1 style='text-align:center'>%s</h1>" % body
-    if style.startswith("Heading"):
-        level = style[-1] if style[-1].isdigit() else "2"
-        return "<h%s>%s</h%s>" % (min(int(level), 4), body, min(int(level), 4))
-    if style.startswith("ListParagraph"):
-        return "<p style='margin-left:24px'>• %s</p>" % body
-    return "<p>%s</p>" % body
+    return "".join(out)
 
 
-def _docx_table(table, rels, images, zf) -> str:
+def _docx_paragraph(para, ctx) -> str:
+    props = para.find(W + "pPr")
+    style = ctx.styles.get(_docx_val(props, W + "pStyle") or "", "")
+    pieces, boxes = [], []
+    _docx_inline(para, ctx, pieces, boxes)
+
+    css = []
+    align = _docx_val(props, W + "jc")
+    css_align = {"center": "center", "right": "right", "end": "right",
+                 "both": "justify", "distribute": "justify"}.get(align or "")
+    if css_align:
+        css.append("text-align:%s" % css_align)
+    ind = props.find(W + "ind") if props is not None else None
+    numbered = props is not None and props.find(W + "numPr") is not None
+    left = 0.0
+    if ind is not None:
+        left = _docx_twips(ind.get(W + "left") or ind.get(W + "start"))
+        first = _docx_twips(ind.get(W + "firstLine"))
+        first -= _docx_twips(ind.get(W + "hanging"))
+        if first and not numbered:
+            css.append("text-indent:%dpx" % ctx.px(first))
+    spacing = props.find(W + "spacing") if props is not None else None
+    if spacing is not None:
+        for side, attr in (("top", "before"), ("bottom", "after")):
+            if spacing.get(W + attr) is not None:
+                css.append("margin-%s:%dpx" % (side, ctx.px(_docx_twips(spacing.get(W + attr)))))
+    if props is not None and _docx_on(props, "pageBreakBefore"):
+        css.append("page-break-before:always")
+
+    bullet = numbered or style.startswith("list")
+    if bullet:
+        level = _docx_val(props, W + "numPr/" + W + "ilvl") or "0"
+        depth = int(level) if level.isdigit() else 0
+        left = max(left, 0.25 * (depth + 1))
+        pieces.insert(0, "•&nbsp;&nbsp;")
+    if left:
+        css.append("margin-left:%dpx" % ctx.px(left))
+
+    # A page break inside the paragraph splits it: what follows starts a page.
+    chunks = "".join(pieces).split(_DOCX_PAGE_BREAK)
+    out = []
+    for n, body in enumerate(chunks):
+        chunk_css = list(css)
+        if n:
+            chunk_css.append("page-break-before:always")
+        out.append(_docx_block(body, style, chunk_css))
+    return "".join(out) + "".join(boxes)
+
+
+def _docx_block(body: str, style: str, css: list) -> str:
+    attr = " style=\"%s\"" % ";".join(css) if css else ""
+    if not body.strip():
+        return "<p%s>&nbsp;</p>" % attr
+    if style == "title":
+        if not any(c.startswith("text-align") for c in css):
+            attr = " style=\"%s\"" % ";".join(css + ["text-align:center"])
+        return "<h1%s>%s</h1>" % (attr, body)
+    if style.startswith("heading "):
+        level = style.rsplit(" ", 1)[-1]
+        level = min(int(level), 4) if level.isdigit() else 2
+        return "<h%d%s>%s</h%d>" % (level, attr, body, level)
+    return "<p%s>%s</p>" % (attr, body)
+
+
+def _docx_table(table, ctx) -> str:
     rows = []
-    for row in table.iter(W + "tr"):
+    for row in table.findall(W + "tr"):
         cells = []
-        for cell in row.iter(W + "tc"):
-            inner = "".join(
-                _docx_paragraph(para, rels, images, zf)
-                for para in cell.iter(W + "p")
-            )
-            cells.append("<td style='padding:4px'>%s</td>" % inner)
+        for cell in row.findall(W + "tc"):
+            props = cell.find(W + "tcPr")
+            if _docx_val(props, W + "vMerge") == "continue":
+                continue  # the cell above spans down into this one
+            span = _docx_val(props, W + "gridSpan")
+            attr = " colspan='%s'" % span if span and span.isdigit() else ""
+            shade = props.find(W + "shd") if props is not None else None
+            fill = shade.get(W + "fill") if shade is not None else None
+            style = "padding:4px"
+            if fill and len(fill) == 6 and fill.lower() != "auto":
+                style += ";background-color:#%s" % fill
+            inner = "".join(_docx_blocks(cell, ctx))
+            cells.append("<td%s style='%s'>%s</td>" % (attr, style, inner))
         rows.append("<tr>%s</tr>" % "".join(cells))
     return (
         "<table border='1' cellspacing='0' width='100%%'>%s</table>"

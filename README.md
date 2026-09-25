@@ -45,7 +45,8 @@ just like Quick Look on a multi-file selection.
   contents sidebar. It uses the page palette too, so
   `book_theme = gruvbox-dark` themes both books and Markdown.
 - **Syntax highlighting** for source files, lexed by Pygments inside the
-  jail and themeable with any Pygments style.
+  jail and themeable with any Pygments style. Extensionless scripts are
+  recognised by their `#!` line.
 - **Archives are listed, never extracted**, so an archive that expands to
   terabytes costs nothing to look at.
 - **Office documents are laid out as pages**, like a PDF, rather than shown
@@ -86,7 +87,7 @@ just like Quick Look on a multi-file selection.
 | Text / code / CSV   | Monospace view with syntax highlighting (first 1 MiB) |
 | Archives (zip, rar, 7z, tar…) | Contents listing with sizes — nothing is extracted |
 | Spreadsheets (xlsx, xlsm, ods) | A table per sheet, with tabs along the bottom |
-| Office docs (docx, odt)  | Laid out as pages, like a PDF — headings, tables and images |
+| Office docs (docx, odt)  | Laid out as pages, like a PDF — exactly as LibreOffice lays them out when it is installed |
 | Folders             | Item count and contents listing            |
 | Everything else     | Icon, type, size and modified date         |
 
@@ -107,6 +108,22 @@ with everything else — its lexers are regexes, and a file written to make one
 backtrack should take down a throwaway worker, not the daemon that owns your
 window. What comes back is the text plus a list of colour spans; the daemon
 paints ranges and parses nothing.
+
+The language is taken from the file's extension, and — when there is no
+extension to go on — from its `#!` line, so a personal script kept as
+`~/bin/deploy` rather than `deploy.sh` is still coloured:
+
+```bash
+#!/bin/bash                      → Bash
+#!/usr/bin/env python3           → Python
+#!/usr/bin/env -S deno run       → TypeScript
+```
+
+An extension Pygments recognises always wins; the shebang only fills the
+gap where there is none. Pygments' own content guessing is deliberately not
+used — it reads every lexer's `analyse_text()` over untrusted content, which
+is both slow and wrong often enough to matter (it calls `#!/usr/bin/env node`
+plain text).
 
 Files over 256 KiB are shown unhighlighted (lexing 1 MiB takes ~1.5 s, which
 is slower than the preview it decorates). Any Pygments style works:
@@ -270,10 +287,24 @@ now; a cached preview is ~2 ms.
   the same page view PDFs use, so they scroll, cache and stream identically.
   They have no find: a document laid out through `QTextDocument` has no
   text layer, and unlike a book nothing here re-lays it out to search it.
-  Word-processor documents (docx, odt) are converted to the HTML subset
-  `QTextDocument` lays out — headings, bold and italic, tables, embedded
-  images — which needs nothing but Qt and Python's standard library. Not
-  pixel-identical to Word, but a page rather than a wall of text.
+  Word-processor documents (docx, odt) go to **LibreOffice when it is
+  installed**: converted to PDF inside the same jail — a copy of the file
+  in the jail's own tmpfs, a throwaway profile, no network — and rendered
+  by the PDF path. That is the only way to get the document's real fonts,
+  image sizes and positions, text wrap, headers and EMF logos. It costs
+  ~1.3 s on first open (cached after that) against ~15 ms for the fallback,
+  and gives up after 12 s. Only a distro LibreOffice under `/usr` is used;
+  a Flatpak copy cannot run in the jail. Set `office_engine = builtin` to
+  skip it and get the instant, approximate layout below instead.
+
+  Without LibreOffice, or when it fails, the document is converted to the
+  HTML subset `QTextDocument` lays out, which needs nothing but Qt and
+  Python's standard library: headings (found by style name, so a
+  non-English Word works too), bold/italic/underline/strike, run sizes,
+  colours and fonts, alignment and indents, page breaks, tables, and images
+  at the size the document gives them. Not pixel-identical — no text wrap
+  around pictures, no headers, and EMF/WMF images are left out — but a page
+  rather than a wall of text.
 
   Spreadsheets take a different route, because a workbook is a grid rather
   than a page: a `sheets` op reads the cells in the jail and the daemon
@@ -380,6 +411,19 @@ Honest list — these are the reads that never reach a jail:
 - `~/.local/share/quickview/crash.log` — faulthandler tracebacks if a
   native crash (e.g. inside a Qt decoder) takes the process down.
 
+The log records failures and one line per preview by default. Before
+reporting a bug, turn the detail up — cache hits, worker lifecycle, render
+timings — with `log_level = debug` under `[logging]` in the settings file,
+or for a single run:
+
+```bash
+systemctl --user stop quickview.service
+QUICKVIEW_LOG_LEVEL=debug ./bin/quickview --daemon
+```
+
+Crash reports are not affected by this setting: a native crash always lands
+in `crash.log`.
+
 ## Settings
 
 `~/.config/quickview/quickview.conf`, written with the defaults commented in
@@ -396,6 +440,8 @@ systemctl --user restart quickview.service
 | `[preview] book_theme` | `paper` | Page colours for EPUB books and rendered Markdown: `paper`, `sepia`, `dark`, `gruvbox-dark`, `gruvbox-light` |
 | `[preview] text_limit_kb` | `1024` | How much of a text file to read before truncating |
 | `[preview] pdf_max_pages` | `50` | Pages rendered from a PDF or office document |
+| `[preview] office_engine` | `libreoffice` | How docx/odt are laid out: `libreoffice` (exact, ~1-2 s on first open, when installed) or `builtin` (instant, approximate) |
+| `[logging] log_level` | `info` | How much the daemon writes to the log and the journal: `error`, `warning`, `info`, `debug` |
 | `[cache] disk_cache_mb` | `256` | Rendered previews kept on disk; `0` disables it |
 | `[cache] memory_cache_mb` | `96` | Decoded pixmaps kept in memory |
 
@@ -416,10 +462,27 @@ sizes, frame counts, worker timeouts — and is deliberately not configurable.
 - **bubblewrap** (`bwrap`) — mandatory, not optional: every parser runs
   inside the jail it provides. `pacman -S bubblewrap`,
   `apt install bubblewrap`, `dnf install bubblewrap`.
-- **Python 3.10+**. `install.sh` creates a virtualenv in `.venv/` and
-  installs PySide6 into it; no system packages are touched.
-- **Pygments**, optional — installed into the same virtualenv by
-  `install.sh`. Without it, code previews are plain text.
+- **Python 3.10+**. `install.sh` creates a virtualenv in `.venv/`. The
+  virtualenv is made with `--system-site-packages`, so a PySide6 your
+  distribution already ships (6.4+) is used as-is and nothing is downloaded;
+  only when there is no usable system copy does it pip-install a private
+  PySide6 (~650 MB). No system packages are ever installed or modified.
+  The big win is disk: measured here, `.venv` goes from 672 MB to 13 MB.
+  Memory improves more modestly — about 4.5 MB of PSS per process (51.2 MB
+  to 46.7 MB), because the Qt text pages become shared with Plasma's own
+  processes instead of being a private second copy. Note that plain RSS
+  *rises*, 77 MB to 112 MB: the distribution splits Qt into more libraries
+  than the bundled build loads, and RSS counts shared pages in full. PSS
+  and the private totals are the honest measures, and both fall. Pass
+  `--pip-qt` to force the private copy if your system PySide6 turns out to
+  be broken.
+- Distributions that split PySide6 into per-module packages (Debian,
+  Ubuntu) may leave out `QtPdf`, `QtWebEngine` or `QtMultimedia`. Each one
+  costs exactly one preview type — PDF/office, HTML, and audio/video
+  respectively — and `install.sh` names the missing ones on the way past.
+- **Pygments**, optional — a system Pygments is used when present,
+  otherwise `install.sh` installs it into the virtualenv. Without it, code
+  previews are plain text.
 - **Rust** (`rustc`), optional — `install.sh` uses it to build the small
   fast-path client that hands a path to the daemon in under a millisecond.
   No crates and no Cargo, just `rustc`. Without it the Python client does

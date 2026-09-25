@@ -197,14 +197,41 @@ def gradient_plane(w, h, base):
     return bytes(bytearray((base + x + y) & 0xFF for y in range(h) for x in range(w)))
 
 
+def _fit(img, max_w, max_h):
+    """decode_image's last step: the parser decimates while reading, and the
+    exact fit to the box happens afterwards. Reproduced here so the direct
+    calls below still assert on what a caller actually receives."""
+    from PySide6.QtCore import Qt
+
+    if img.width() > max_w or img.height() > max_h:
+        return img.scaled(max_w, max_h, Qt.KeepAspectRatio,
+                          Qt.SmoothTransformation)
+    return img
+
+
 class PsdDecoding(unittest.TestCase):
     """Photoshop files, which Qt cannot read and renderers.py parses itself."""
 
     def decoded(self, data, max_w=400, max_h=400):
+        """QuickView's own PSD parser, called directly.
+
+        Not through decode_image(): that tries QImageReader first, and where
+        kimageformats is installed Qt now *has* a PSD handler, so these would
+        silently exercise kimg_psd instead of the parser below — which
+        differs on alpha and on 16-bit rounding, and carries none of the
+        bounds checks these tests exist to pin down. The parser is still the
+        only path on a machine without that plugin, so it still needs
+        testing; it just cannot be reached through a route that prefers Qt.
+        """
         path = os.path.join(self.tmp, "f.psd")
         with open(path, "wb") as fh:
             fh.write(data)
-        return renderers.decode_image(path, max_w, max_h)
+        img, orig = renderers._decode_native(path, max_w, max_h)
+        if img is None:
+            # decode_image's contract, reproduced so the "is refused" tests
+            # read the same whether the parser raises or simply declines.
+            raise RuntimeError("unsupported or corrupt")
+        return _fit(img, max_w, max_h), orig
 
     def setUp(self):
         import tempfile
@@ -314,9 +341,44 @@ class PsdDecoding(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.decoded(bytes(data))
 
+    def test_decode_image_falls_back_to_the_parser_when_qt_declines(self):
+        """The wiring the direct calls above no longer cover.
+
+        Every other test in this class drives _decode_native() itself, so
+        nothing would notice if decode_image() stopped calling it — and on a
+        machine without kimageformats that branch is the only way a PSD is
+        ever decoded. Forcing QImageReader to decline proves the public path
+        still reaches the parser.
+        """
+        w, h = 8, 8
+        planes = [bytes([9] * w * h), bytes([8] * w * h), bytes([7] * w * h)]
+        path = os.path.join(self.tmp, "f.psd")
+        with open(path, "wb") as fh:
+            fh.write(build_psd(w, h, planes))
+
+        from PySide6.QtGui import QImageReader
+        real_read = QImageReader.read
+
+        def declines(self_):          # as if Qt had no handler for this
+            from PySide6.QtGui import QImage
+            return QImage()
+
+        QImageReader.read = declines
+        try:
+            img, orig = renderers.decode_image(path, 400, 400)
+        finally:
+            QImageReader.read = real_read
+        self.assertEqual(orig, "8×8")
+        self.assertEqual(img.pixelColor(2, 2).getRgb()[:3], (9, 8, 7))
+
     def test_a_non_psd_still_reports_qt_s_error(self):
+        # Deliberately the public path: this is about decode_image turning
+        # Qt's refusal into an exception, not about the PSD parser.
+        path = os.path.join(self.tmp, "f.psd")
+        with open(path, "wb") as fh:
+            fh.write(b"not an image at all")
         with self.assertRaises(RuntimeError):
-            self.decoded(b"not an image at all")
+            renderers.decode_image(path, 400, 400)
 
 
 def build_kra(members):
@@ -342,10 +404,16 @@ class KraDecoding(unittest.TestCase):
         self.tmp = self._dir.name
 
     def decoded(self, data, name="f.kra", max_w=400, max_h=400):
+        # Direct, for the same reason as PsdDecoding.decoded: kimageformats
+        # adds kra and ora handlers, so the public path would stop reaching
+        # the parser below on a KDE desktop.
         path = os.path.join(self.tmp, name)
         with open(path, "wb") as fh:
             fh.write(data)
-        return renderers.decode_image(path, max_w, max_h)
+        img, orig = renderers._decode_native(path, max_w, max_h)
+        if img is None:
+            raise RuntimeError("unsupported or corrupt")
+        return _fit(img, max_w, max_h), orig
 
     def png(self, w, h, colour):
         return renderers._encode(solid(w, h, colour))
@@ -407,10 +475,25 @@ class PsdBounds(unittest.TestCase):
         self.tmp = self._dir.name
 
     def decoded(self, data, max_w=400, max_h=400):
+        """QuickView's own PSD parser, called directly.
+
+        Not through decode_image(): that tries QImageReader first, and where
+        kimageformats is installed Qt now *has* a PSD handler, so these would
+        silently exercise kimg_psd instead of the parser below — which
+        differs on alpha and on 16-bit rounding, and carries none of the
+        bounds checks these tests exist to pin down. The parser is still the
+        only path on a machine without that plugin, so it still needs
+        testing; it just cannot be reached through a route that prefers Qt.
+        """
         path = os.path.join(self.tmp, "f.psd")
         with open(path, "wb") as fh:
             fh.write(data)
-        return renderers.decode_image(path, max_w, max_h)
+        img, orig = renderers._decode_native(path, max_w, max_h)
+        if img is None:
+            # decode_image's contract, reproduced so the "is refused" tests
+            # read the same whether the parser raises or simply declines.
+            raise RuntimeError("unsupported or corrupt")
+        return _fit(img, max_w, max_h), orig
 
     def test_a_degenerate_canvas_is_refused_before_the_buffer(self):
         # One pixel wide and millions tall: under the pixel cap, and no

@@ -254,6 +254,7 @@ def main() -> int:
                 for count, png in renderers.office_pages(
                     fd, job.get("name", ""), job["page_w"],
                     job["max_pages"], job.get("start", 0),
+                    job.get("engine", "libreoffice"),
                 ):
                     if first:
                         state["header"] = True

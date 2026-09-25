@@ -48,6 +48,9 @@ _SETTINGS = {
     "text_limit_kb": ("preview", int, 1024, "QUICKVIEW_TEXT_LIMIT_KB",
                       1, 1024 * 64),
     "pdf_max_pages": ("preview", int, 50, "QUICKVIEW_PDF_MAX_PAGES", 1, 2000),
+    "office_engine": ("preview", str, "libreoffice", "QUICKVIEW_OFFICE_ENGINE",
+                      None, None),
+    "log_level": ("logging", str, "info", "QUICKVIEW_LOG_LEVEL", None, None),
     "disk_cache_mb": ("cache", int, 256, "QUICKVIEW_DISK_CACHE_MB", 0, 65536),
     "memory_cache_mb": ("cache", int, 96, "QUICKVIEW_MEMORY_CACHE_MB",
                         8, 8192),
@@ -78,6 +81,16 @@ text_limit_kb = 1024
 # How many pages of a PDF or office document to render at most.
 pdf_max_pages = 50
 
+# How Word documents (docx, odt) are laid out.
+#
+#   libreoffice  exact: the document as LibreOffice shows it — fonts, photos
+#                in place, text wrap, headers. ~1-2 s on first open, cached
+#                after that. Used only when LibreOffice is installed;
+#                otherwise this behaves like builtin.
+#   builtin      fast: QuickView's own layout, ~50 ms. Text, headings,
+#                tables and images, but no text wrap, headers or EMF logos.
+office_engine = libreoffice
+
 [appearance]
 # How the panel itself is painted.
 #
@@ -92,6 +105,19 @@ pdf_max_pages = 50
 # two settings are independent, and the default one-dark is written for a
 # dark background, so its greys are close to unreadable on a pale one.
 panel_theme = quicklook
+
+[logging]
+# How much the daemon writes to ~/.local/share/quickview/quickview.log and
+# to the journal (journalctl --user -u quickview).
+#
+#   error    only failures
+#   warning  failures and recoverable problems
+#   info     the above, plus one line per preview
+#   debug    everything, including cache hits and worker lifecycle
+#
+# Crash reports are not affected: a native segfault always lands in
+# crash.log, whatever this is set to.
+log_level = info
 
 [cache]
 # Rendered previews kept on disk, in MiB. 0 disables the disk cache.
@@ -113,6 +139,12 @@ _CHOICES = {
     # The panel's own colours. Same reasoning as book_theme: a typo here
     # would otherwise leave the window with no palette at all.
     "panel_theme": ("quicklook", "breeze"),
+    # Named levels only, so a typo cannot silence the log entirely — and so
+    # setup_logging() can map straight onto the logging module's constants.
+    "log_level": ("error", "warning", "info", "debug"),
+    # A typo falls back to the default rather than to either engine by
+    # accident.
+    "office_engine": ("libreoffice", "builtin"),
 }
 
 

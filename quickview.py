@@ -45,6 +45,10 @@ from string import Template
 import config
 import ipc
 import theme
+# The one thing the daemon asks the renderers: which engine the workers will
+# use for office documents, for the cache key. renderers imports nothing at
+# module level, so this loads no parser here.
+from renderers import office_suite
 
 from PySide6.QtCore import (
     Qt, QUrl, QEvent, QPoint, QRect, QSize, QObject, QSocketNotifier,
@@ -152,6 +156,7 @@ WORKER_HELPER = os.path.join(APP_DIR, "worker.py")
 # Cap on rendered pages so a 2000-page (or hostile) PDF can't grind the
 # helper for minutes; the title says when the preview is truncated.
 PDF_MAX_PAGES = SETTINGS["pdf_max_pages"]
+OFFICE_ENGINE = SETTINGS["office_engine"]
 
 CACHE_DIR = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
@@ -217,7 +222,9 @@ def setup_logging():
     err_h.setFormatter(fmt)
     log.addHandler(file_h)
     log.addHandler(err_h)
-    log.setLevel(logging.DEBUG)
+    # config.py's _CHOICES guarantees one of error/warning/info/debug, so the
+    # attribute is always there; the default is belt and braces.
+    log.setLevel(getattr(logging, SETTINGS["log_level"].upper(), logging.INFO))
 
     # Native crashes (a segfault inside a Qt decoder, etc.) can't be caught
     # by Python's exception machinery — faulthandler dumps a traceback to
@@ -3303,10 +3310,12 @@ class QuickView(QWidget):
 
     # -------------------------------------------------------------- office
     # OOXML and ODF are zip containers full of XML, so no office suite is
-    # needed — or wanted, since one would have to run where the jail's
-    # guarantees hold. The worker prefers the thumbnail the authoring
-    # application embedded (its own rendering of page one, for the cost of
-    # unzipping a member) and extracts text when there is none.
+    # needed. When the system has LibreOffice anyway, the worker uses it for
+    # word-processor documents — inside the jail, like every other parser —
+    # because only a real layout engine gets them to look like themselves
+    # (see renderers.office_pages). Without one, the worker lays them out
+    # itself, and for a deck it prefers the thumbnail the authoring
+    # application embedded and extracts text when there is none.
 
     def show_office(self, path: str, mime: str):
         # Laid out as pages, cached page by page, and shown by the same code
@@ -3324,8 +3333,14 @@ class QuickView(QWidget):
             self.show_message(str(exc))
             return
 
+        # The engine is part of the key: pages laid out by the built-in
+        # converter must not outlive a LibreOffice install, or a change of
+        # office_engine, or vice versa.
+        use_lo = OFFICE_ENGINE != "builtin" and office_suite()
+        engine = "lo" if use_lo else "qt2"
+
         def page_key(i: int) -> str:
-            return cache_key(path, st, page_w, 0, f"off{i}")
+            return cache_key(path, st, page_w, 0, f"off{engine}{i}")
 
         def on_doc(payload: bytes):
             try:
@@ -3344,7 +3359,8 @@ class QuickView(QWidget):
                 total = int(img0.text("QuickView:PageCount"))
             except ValueError:
                 pass
-        extra = {"name": os.path.basename(path), "limit": TEXT_PREVIEW_LIMIT}
+        extra = {"name": os.path.basename(path), "limit": TEXT_PREVIEW_LIMIT,
+                 "engine": OFFICE_ENGINE}
         if total > 0:
             log.debug("disk cache hit (office): %s", path)
             self._pdf_show_cached(
@@ -3716,6 +3732,22 @@ def main():
     # only allows if contexts are shareable from the start.
     QGuiApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
+    # Draw with Qt's own style, not the desktop's. The panel is painted
+    # entirely by the stylesheets below, so a third-party QStyle has nothing
+    # to contribute here — but it can still act on the window, and some do:
+    # Kvantum reads blurring/blur_translucent from its theme and asks KWin
+    # to blur behind any translucent window, which turns the overlay's
+    # WA_TranslucentBackground (there for the rounded corners and the drop
+    # shadow) into a blur over the whole desktop, and reduce_window_opacity
+    # makes the deliberately opaque panel see-through.
+    #
+    # This only became visible when the installer started preferring a
+    # system PySide6: a bundled Qt cannot see /usr/lib/qt6/plugins, so it
+    # always fell back to Fusion. Pinning it keeps the two installs
+    # identical. Colours are unaffected — panel_theme = breeze follows the
+    # Plasma scheme through QApplication.palette(), which the platform
+    # theme still provides.
+    app.setStyle("Fusion")
     app.setApplicationName("QuickView")
     # Stay resident after the window is dismissed so the next preview is
     # instant — Qt/Python startup only ever happens once.
