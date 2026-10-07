@@ -50,11 +50,14 @@ just like Quick Look on a multi-file selection.
 - **Archives are listed, never extracted**, so an archive that expands to
   terabytes costs nothing to look at.
 - **Office documents are laid out as pages**, like a PDF, rather than shown
-  as a wall of text.
+  as a wall of text. With LibreOffice installed, slide decks get a page per
+  slide, and old `.doc`, `.xls`, `.ppt` and `.rtf` files open too.
 - **Spreadsheets open as a real grid**, one tab per sheet, with the column
-  letters and row numbers the file actually uses, dates and percentages
-  formatted the way the workbook formats them, and numeric columns aligned
-  right.
+  letters and row numbers the file actually uses, figures formatted the way
+  the workbook formats them — decimals, thousands separators, currency,
+  percentages, dates, negatives in brackets — and numeric columns aligned
+  right. Old `.xls` workbooks get the same grid and tabs when LibreOffice
+  is installed.
 - **Media plays inline** with a seek bar, decoded and mixed in the jail.
 - **HTML renders** with JavaScript off and the network blocked, and the
   titlebar flips to source view.
@@ -87,7 +90,10 @@ just like Quick Look on a multi-file selection.
 | Text / code / CSV   | Monospace view with syntax highlighting (first 1 MiB) |
 | Archives (zip, rar, 7z, tar…) | Contents listing with sizes — nothing is extracted |
 | Spreadsheets (xlsx, xlsm, ods) | A table per sheet, with tabs along the bottom |
+| Old Excel workbooks (xls) | The same table and tabs, converted by LibreOffice when it is installed; the metadata card otherwise |
 | Office docs (docx, odt)  | Laid out as pages, like a PDF — exactly as LibreOffice lays them out when it is installed |
+| Slide decks (pptx, ppsx, odp) | A page per slide with LibreOffice; without it, the thumbnail the deck embeds, with its text a button away |
+| Legacy office (doc, ppt, rtf) | Laid out as pages by LibreOffice when it is installed; the metadata card otherwise |
 | Folders             | Item count and contents listing            |
 | Everything else     | Icon, type, size and modified date         |
 
@@ -183,7 +189,8 @@ Image decodes are cached in two tiers (the `quicklookd` model):
 
 - **Memory** — recently shown pixmaps stay in the daemon; re-showing or
   paging back with ← → skips decoding entirely.
-- **Disk** — `~/.cache/quickview/previews/` (PNG entries, capped at 256 MiB,
+- **Disk** — `~/.cache/quickview/previews/` (PNG entries, and the grid of
+  an old `.xls` LibreOffice converted; capped at 256 MiB,
   pruned oldest-first). Keys embed the file's mtime + size, so a changed
   file re-renders automatically — no stale previews.
 
@@ -289,15 +296,19 @@ now; a cached preview is ~2 ms.
   the same page view PDFs use, so they scroll, cache and stream identically.
   They have no find: a document laid out through `QTextDocument` has no
   text layer, and unlike a book nothing here re-lays it out to search it.
-  Word-processor documents (docx, odt) go to **LibreOffice when it is
-  installed**: converted to PDF inside the same jail — a copy of the file
-  in the jail's own tmpfs, a throwaway profile, no network — and rendered
-  by the PDF path. That is the only way to get the document's real fonts,
+  Documents and slide decks — docx, odt, pptx, ppsx, odp, and the legacy
+  doc, ppt and rtf — go to **LibreOffice when it is installed**: converted
+  to PDF inside the same jail — a copy of the file in the jail's own tmpfs,
+  a throwaway profile, no network — and rendered by the PDF path. That is the only way to get the document's real fonts,
   image sizes and positions, text wrap, headers and EMF logos. It costs
   ~1.3 s on first open (cached after that) against ~15 ms for the fallback,
   and gives up after 12 s. Only a distro LibreOffice under `/usr` is used;
   a Flatpak copy cannot run in the jail. Set `office_engine = builtin` to
-  skip it and get the instant, approximate layout below instead.
+  skip it and get the instant, approximate layout below instead. Which
+  format a file is gets decided from its content, not its name: the zip
+  members or ODF `mimetype` of the current formats, the main stream's
+  directory entry in the OLE2 container the legacy binary formats share,
+  and RTF's opening `{\rtf`.
 
   Without LibreOffice, or when it fails, the document is converted to the
   HTML subset `QTextDocument` lays out, which needs nothing but Qt and
@@ -310,11 +321,19 @@ now; a cached preview is ~2 ms.
 
   Spreadsheets take a different route, because a workbook is a grid rather
   than a page: a `sheets` op reads the cells in the jail and the daemon
-  shows them in a table with a tab per sheet, hidden sheets left out. Dates
-  and percentages are numbers wearing a number format in xlsx, so the
-  format codes are read too — otherwise every date shows up as a five-digit
-  serial. Cells are placed by their own reference, so a sparse row keeps its
-  columns. Each sheet is bounded (2000 rows, 64 columns, 512 characters a
+  shows them in a table with a tab per sheet, hidden sheets left out. In
+  xlsx every figure is a bare number wearing a format code, so the codes
+  are read too — otherwise every date shows up as a five-digit serial and
+  €1,234.50 as 1234.5. Decimals, thousands separators, currency (quoted,
+  escaped or as a `[$€-408]` locale tag), percentages, scientific notation
+  and the positive;negative;zero sections are applied; conditional
+  sections, fractions and digit layouts such as phone numbers show the
+  plain number. An ods stores the text it displays, so that is shown as it
+  is. A legacy `.xls` is converted to xlsx by LibreOffice in the jail and
+  read the same way; the grid is cached on disk, since the conversion costs
+  ~0.6 s, and the daemon checks a cached grid's shape and bounds before
+  building a table from it. Cells are placed by their own reference, so a
+  sparse row keeps its columns. Each sheet is bounded (2000 rows, 64 columns, 512 characters a
   cell), so a million-row workbook costs what a small one does. Anything
   that will not parse as a grid — encrypted, corrupt, an unusual shape —
   falls back to the page view above.
@@ -366,11 +385,12 @@ now; a cached preview is ~2 ms.
   pointing past the last rendered page are dropped in the jail: a sidebar
   row that scrolls nowhere is worse than no row.
 
-  Slide decks (`.pptx`, `.odp`) are not previewed: their content is
-  absolutely positioned graphics that `QTextDocument` cannot lay out, and
-  the only thing that can is a full office suite. Legacy binary `.doc`,
-  `.xls` and `.ppt` are out for the same reason. Both show the metadata
-  card.
+  A slide deck has no fallback layout: its content is absolutely
+  positioned graphics that `QTextDocument` cannot lay out, and the only
+  thing that can is a full office suite. Without LibreOffice it shows the
+  thumbnail the deck embeds — the titlebar flips to its text — or the text
+  alone when there is no thumbnail. The legacy binary formats and RTF
+  have no fallback reader at all, and show the metadata card.
 - **Audio and video** — `media_worker.py` runs the whole pipeline in the
   jail and plays the audio itself through PipeWire (the one extra socket
   bound in). Because it owns the audio clock, Qt does A/V sync in there;
@@ -442,7 +462,7 @@ systemctl --user restart quickview.service
 | `[preview] book_theme` | `paper` | Page colours for EPUB books and rendered Markdown: `paper`, `sepia`, `dark`, `gruvbox-dark`, `gruvbox-light` |
 | `[preview] text_limit_kb` | `1024` | How much of a text file to read before truncating |
 | `[preview] pdf_max_pages` | `50` | Pages rendered from a PDF or office document |
-| `[preview] office_engine` | `libreoffice` | How docx/odt are laid out: `libreoffice` (exact, ~1-2 s on first open, when installed) or `builtin` (instant, approximate) |
+| `[preview] office_engine` | `libreoffice` | How office documents are laid out: `libreoffice` (exact, ~1-2 s on first open, when installed) or `builtin` (instant, approximate — decks show their thumbnail, and doc/xls/ppt/rtf the metadata card) |
 | `[logging] log_level` | `info` | How much the daemon writes to the log and the journal: `error`, `warning`, `info`, `debug` |
 | `[cache] disk_cache_mb` | `256` | Rendered previews kept on disk; `0` disables it |
 | `[cache] memory_cache_mb` | `96` | Decoded pixmaps kept in memory |
@@ -568,13 +588,13 @@ keeping Qt loaded is what makes previews open in ~20 ms instead of ~1 s.
 .venv/bin/python -m unittest discover -s tests -t .
 ```
 
-220 checks, a few seconds, no display needed — the Qt ones run offscreen.
+252 checks, about ten seconds, no display needed — the Qt ones run offscreen.
 Any way of starting them works: `discover` with or without `-s`/`-t`, from
 the repo root or from inside `tests/`, or a single file run directly.
 
 They cover the client↔daemon wire format, the settings parser, the raw-frame
 guard that stops a malformed worker header reading past a buffer, cache
-encoding and keys, the spreadsheet grid reader (cell placement, date and
+encoding and keys, the spreadsheet grid reader (cell placement, number, currency, date and
 percentage formats, and the bounds that keep a hostile workbook cheap), the
 EPUB reader (package document, both kinds of table of contents, entity
 handling, chapter-to-page mapping and the search's match geometry), the
@@ -592,7 +612,8 @@ nested bookmarks, two of them on one page, will do:
 QUICKVIEW_TEST_PDF=~/any/bookmarked.pdf .venv/bin/python -m unittest discover -s tests -t .
 ```
 
-Only the LibreOffice case skips, and only where LibreOffice is not
+Only the LibreOffice cases skip, and only where LibreOffice — or, for
+the decks and the legacy workbook, its Impress or Calc — is not
 installed. What the suite cannot check is whether the panel looks right —
 that stays a matter of opening a file and looking at it.
 

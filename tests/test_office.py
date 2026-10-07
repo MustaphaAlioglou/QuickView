@@ -276,6 +276,206 @@ class SuiteStandIn(unittest.TestCase):
         self.assertEqual(renderers._office_suite_kind(buf), ".odt")
 
 
+def ole(entries=(), body=b"") -> io.BytesIO:
+    """An OLE2 compound file reduced to what the kind check reads: the
+    signature, then directory entries at 128-byte boundaries — name in
+    UTF-16, zero-padded, its byte length at offset 64 — then body."""
+    import struct
+
+    data = bytearray(renderers._OLE_MAGIC + bytes(504))
+    for name in entries:
+        raw = name.encode("utf-16-le") + b"\0\0"
+        data += raw.ljust(64, b"\0") + struct.pack("<H", len(raw)) + bytes(62)
+    return io.BytesIO(bytes(data) + body)
+
+
+class SuiteKind(unittest.TestCase):
+    """Which files go to LibreOffice, and under which extension."""
+
+    def zipped(self, members) -> io.BytesIO:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for name, data in members.items():
+                zf.writestr(name, data)
+        buf.seek(0)
+        return buf
+
+    def kind(self, fh) -> str:
+        return renderers._office_suite_kind(fh)
+
+    def test_a_pptx_is_recognised_from_its_presentation_part(self):
+        fh = self.zipped({"ppt/presentation.xml": "<p:presentation/>"})
+        self.assertEqual(self.kind(fh), ".pptx")
+
+    def test_an_odp_is_recognised_from_its_mimetype_member(self):
+        fh = self.zipped({"mimetype": "application/vnd.oasis.opendocument.presentation",
+                          "content.xml": "<x/>"})
+        self.assertEqual(self.kind(fh), ".odp")
+
+    def test_an_ods_is_still_left_to_the_sheets_view(self):
+        fh = self.zipped({"mimetype": "application/vnd.oasis.opendocument.spreadsheet",
+                          "content.xml": "<x/>"})
+        self.assertEqual(self.kind(fh), "")
+
+    def test_rtf_is_recognised_from_its_first_bytes(self):
+        self.assertEqual(self.kind(io.BytesIO(b"{\\rtf1\\ansi hello}")), ".rtf")
+
+    def test_the_legacy_formats_are_told_apart_by_their_main_stream(self):
+        for stream, ext in (("WordDocument", ".doc"),
+                            ("PowerPoint Document", ".ppt"),
+                            ("Workbook", ".xls"), ("Book", ".xls")):
+            with self.subTest(stream=stream):
+                self.assertEqual(self.kind(ole(["Root Entry", stream])), ext)
+
+    def test_a_stream_name_in_the_text_does_not_decide_the_format(self):
+        # A spreadsheet whose cells mention "WordDocument": the name occurs,
+        # UTF-16 and terminated, but not as a directory entry.
+        decoy = b"x" + "WordDocument".encode("utf-16-le") + b"\0\0" + bytes(64)
+        self.assertEqual(self.kind(ole(["Root Entry", "Workbook"], decoy)), ".xls")
+
+    def test_an_ole_file_of_another_kind_is_not_sent(self):
+        # Outlook messages and MSI installers are OLE2 compound files too.
+        self.assertEqual(self.kind(ole(["Root Entry", "__properties_version1.0"])), "")
+
+    def test_the_read_position_does_not_matter(self):
+        # The workbook reader asks after zipfile.is_zipfile, which leaves
+        # the position at the end of the file on Pythons before 3.13.
+        fh = ole(["Root Entry", "Workbook"])
+        fh.seek(0, io.SEEK_END)
+        self.assertEqual(self.kind(fh), ".xls")
+
+    def test_the_name_is_not_consulted(self):
+        # Not an office file at all, whatever it is called.
+        self.assertEqual(self.kind(io.BytesIO(b"plain text, called deck.pptx")), "")
+
+
+class DecksWithoutTheSuite(unittest.TestCase):
+    """No LibreOffice: a deck has no page layout, so the worker shows its
+    thumbnail instead — which happens only if the page path refuses it."""
+
+    def setUp(self):
+        self._saved = renderers.OFFICE_SUITES
+        renderers.OFFICE_SUITES = ()
+
+    def tearDown(self):
+        renderers.OFFICE_SUITES = self._saved
+
+    def refused(self, members):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for name, data in members.items():
+                zf.writestr(name, data)
+        with self.assertRaises(RuntimeError):
+            pages(buf.getvalue())
+
+    def test_a_pptx_is_refused(self):
+        self.refused({"ppt/presentation.xml": "<p:presentation/>"})
+
+    def test_an_odp_is_refused_rather_than_read_as_text(self):
+        self.refused({
+            "mimetype": "application/vnd.oasis.opendocument.presentation",
+            "content.xml": '<office:document-content xmlns:office='
+                           '"urn:oasis:names:tc:opendocument:xmlns:office:1.0">'
+                           '<office:body/></office:document-content>',
+            "styles.xml": "<x/>",
+        })
+
+
+class Routing(unittest.TestCase):
+    """The daemon's choice of view for each office format, with and without
+    LibreOffice. Only the choice: the views are recorded, not built."""
+
+    def setUp(self):
+        import quickview
+
+        self.qv = quickview
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.window = quickview.QuickView()
+        self.addCleanup(self.window.deleteLater)
+        self.chosen = []
+        for view in ("show_office", "show_fallback", "show_text", "show_sheets"):
+            setattr(self.window, view,
+                    lambda *_a, view=view: self.chosen.append(view))
+        for call in ("fit_overlay", "show", "raise_", "activateWindow"):
+            setattr(self.window, call, lambda: None)
+
+    def route(self, name, data, suite=True, engine="libreoffice"):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        saved = (self.qv.office_suite, self.qv.OFFICE_ENGINE)
+        self.qv.office_suite = lambda: "/usr/bin/soffice" if suite else ""
+        self.qv.OFFICE_ENGINE = engine
+        try:
+            self.chosen.clear()
+            self.window.show_file(path)
+        finally:
+            self.qv.office_suite, self.qv.OFFICE_ENGINE = saved
+        return self.chosen[-1]
+
+    def deck(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("ppt/presentation.xml", "<p:presentation/>")
+        return buf.getvalue()
+
+    def test_a_deck_always_goes_to_the_office_view(self):
+        # Without LibreOffice that view shows the deck's own thumbnail.
+        for suite in (True, False):
+            with self.subTest(suite=suite):
+                self.assertEqual(self.route("deck.pptx", self.deck(), suite),
+                                 "show_office")
+
+    def test_legacy_formats_and_rtf_need_the_suite(self):
+        legacy = ole(["Root Entry", "WordDocument"]).getvalue()
+        for name, data, view in (("memo.doc", legacy, "show_office"),
+                                 ("deck.ppt", legacy, "show_office"),
+                                 # a workbook gets the grid, with its tabs
+                                 ("sheet.xls", legacy, "show_sheets"),
+                                 ("note.rtf", b"{\\rtf1\\ansi hello}",
+                                  "show_office")):
+            with self.subTest(name=name):
+                self.assertEqual(self.route(name, data, suite=True), view)
+                self.assertEqual(self.route(name, data, suite=False), "show_fallback")
+                self.assertEqual(self.route(name, data, engine="builtin"),
+                                 "show_fallback")
+
+
+class WorkbookPayload(unittest.TestCase):
+    """valid_workbook: what the daemon will build a table from. A cached
+    workbook comes from a directory anything running as the user can write."""
+
+    def setUp(self):
+        import quickview
+
+        self.valid = quickview.valid_workbook
+
+    def book(self, **sheet):
+        base = {"name": "S", "rows": [["a", "1"]], "cols": 2, "align": ["l", "r"],
+                "clipped": False, "first_col": 0, "first_row": 1}
+        base.update(sheet)
+        return {"sheets": [base], "clipped": False}
+
+    def test_a_reader_payload_passes(self):
+        self.assertTrue(self.valid(self.book()))
+
+    def test_out_of_bounds_or_misshapen_payloads_are_refused(self):
+        for label, book in (
+            ("not a dict", []),
+            ("a billion columns", self.book(cols=10 ** 9)),
+            ("too many rows", self.book(rows=[["x"]] * 100_000)),
+            ("a row too wide", self.book(rows=[["x"] * 1000])),
+            ("a cell that is not text", self.book(rows=[[{"x": 1}]])),
+            ("a huge cell", self.book(rows=[["x" * 10 ** 6]])),
+            ("a negative origin", self.book(first_row=-5)),
+            ("a boolean count", self.book(cols=True)),
+            ("too many sheets", {"sheets": [self.book()["sheets"][0]] * 100}),
+        ):
+            with self.subTest(label):
+                self.assertFalse(self.valid(book))
+
+
 @unittest.skipUnless(renderers.office_suite(), "LibreOffice not installed")
 class RealSuite(unittest.TestCase):
     def test_a_docx_converts_to_real_pages(self):
@@ -294,6 +494,122 @@ class RealSuite(unittest.TestCase):
         img = QImage.fromData(out[0][1])
         self.assertFalse(img.isNull())
         self.assertEqual(img.text("QuickView:PageCount"), "2")
+
+
+# Three slides, as flat ODF XML: one file LibreOffice can open and save as
+# any of the deck formats, so the tests carry no binary samples.
+FLAT_DECK = """<?xml version="1.0" encoding="UTF-8"?>
+<office:document
+ xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+ xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+ xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+ xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+ office:version="1.3"
+ office:mimetype="application/vnd.oasis.opendocument.presentation">
+ <office:body><office:presentation>%s</office:presentation></office:body>
+</office:document>
+""" % "".join(
+    '<draw:page draw:name="s%d"><draw:frame svg:x="2cm" svg:y="2cm" '
+    'svg:width="20cm" svg:height="3cm"><draw:text-box><text:p>Slide %d'
+    '</text:p></draw:text-box></draw:frame></draw:page>' % (n, n)
+    for n in (1, 2, 3)
+)
+
+
+@unittest.skipUnless(renderers.office_suite(), "LibreOffice not installed")
+class RealSuiteFormats(unittest.TestCase):
+    """Decks, the legacy binary formats and RTF, through the real suite.
+
+    The samples are written by LibreOffice itself from plain sources, once
+    for the class. A format this LibreOffice cannot write — a Writer-only
+    install has no Impress — skips its test rather than failing it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import subprocess
+
+        cls.tmp = tempfile.TemporaryDirectory()
+        d = cls.tmp.name
+        sources = {
+            "deck.fodp": FLAT_DECK,
+            "memo.txt": "A memo, written as plain text.\n",
+            "sheet.csv": "a,b\n1,2\n",
+        }
+        for name, text in sources.items():
+            with open(os.path.join(d, name), "w") as fh:
+                fh.write(text)
+        with open(os.path.join(d, "note.rtf"), "w") as fh:
+            fh.write("{\\rtf1\\ansi{\\fonttbl\\f0 Helvetica;}\\f0 A note.\\par}\n")
+        for target, source in (("pptx", "deck.fodp"), ("odp", "deck.fodp"),
+                               ("ppt", "deck.fodp"), ("doc", "memo.txt"),
+                               ("xls", "sheet.csv")):
+            subprocess.run(
+                [renderers.office_suite(), "--headless", "--norestore",
+                 "-env:UserInstallation=file://%s/profile" % d,
+                 "--convert-to", target, "--outdir", d, os.path.join(d, source)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env={"HOME": d, "PATH": "/usr/bin:/bin",
+                     "SAL_USE_VCLPLUGIN": "svp"},
+                timeout=60,
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def pages_of(self, name):
+        path = os.path.join(self.tmp.name, name)
+        if not os.path.exists(path):
+            self.skipTest("this LibreOffice cannot write %s" % name)
+        # The built-in layout has no path for any of these, so pages can
+        # only have come from LibreOffice.
+        with open(path, "rb") as fh:
+            out = list(renderers.office_pages(fh.fileno(), name, 600, 20))
+        images = [QImage.fromData(png) for _count, png in out]
+        self.assertTrue(images and not any(i.isNull() for i in images), name)
+        return images
+
+    def assert_a_deck(self, name):
+        slides = self.pages_of(name)
+        self.assertEqual(len(slides), 3, "one page per slide")
+        for slide in slides:
+            self.assertGreater(slide.width(), slide.height(), "slides are landscape")
+
+    def test_a_pptx_is_one_page_per_slide(self):
+        self.assert_a_deck("deck.pptx")
+
+    def test_an_odp_is_one_page_per_slide(self):
+        self.assert_a_deck("deck.odp")
+
+    def test_a_legacy_ppt_is_one_page_per_slide(self):
+        self.assert_a_deck("deck.ppt")
+
+    def test_a_legacy_doc_is_laid_out(self):
+        page = self.pages_of("memo.doc")[0]
+        self.assertGreater(page.height(), page.width())
+
+    def test_a_legacy_xls_is_laid_out(self):
+        self.pages_of("sheet.xls")
+
+    def test_a_legacy_xls_reads_as_a_grid(self):
+        path = os.path.join(self.tmp.name, "sheet.xls")
+        if not os.path.exists(path):
+            self.skipTest("this LibreOffice cannot write sheet.xls")
+        with open(path, "rb") as fh:
+            book = renderers.read_workbook(fh.fileno(), "sheet.xls")
+        self.assertEqual(book["sheets"][0]["rows"], [["a", "b"], ["1", "2"]])
+
+    def test_the_builtin_setting_keeps_a_legacy_xls_from_the_suite(self):
+        path = os.path.join(self.tmp.name, "sheet.xls")
+        if not os.path.exists(path):
+            self.skipTest("this LibreOffice cannot write sheet.xls")
+        with open(path, "rb") as fh, self.assertRaises(RuntimeError):
+            renderers.read_workbook(fh.fileno(), "sheet.xls", engine="builtin")
+
+    def test_rtf_is_laid_out(self):
+        page = self.pages_of("note.rtf")[0]
+        self.assertGreater(page.height(), page.width())
 
 
 if __name__ == "__main__":

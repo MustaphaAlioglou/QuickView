@@ -9,6 +9,36 @@ project has no version tags yet, so entries are dated.
 
 ### Added
 
+- **Old `.xls` workbooks open as a grid with tabs.** With LibreOffice
+  installed, a legacy workbook is converted to xlsx in the jail and read
+  by the same grid reader as a current one, so it gets a table per sheet
+  with the tabs along the bottom instead of flat pages. ~0.6 s on first
+  open; the grid is cached on disk after that, and the daemon checks a
+  cached grid's shape and bounds before building a table from it, since
+  the cache directory is writable by anything running as the user. If the
+  grid cannot be read, the page view is the fallback.
+- **Spreadsheet figures keep their number formats.** xlsx cells were shown
+  as bare numbers apart from dates and percentages: €1,234.50 read
+  1234.5. The format codes are now applied — decimals, thousands
+  separators, currency written quoted, escaped or as a `[$€-408]` locale
+  tag, scientific notation, and the positive;negative;zero sections that
+  put negatives in brackets or show zero as a dash — rounding half away
+  from zero as Excel does. Conditional sections, fractions and digit
+  layouts such as phone numbers still show the plain number.
+- **Slide decks and the legacy office formats preview with LibreOffice.**
+  `.pptx`, `.ppsx` and `.odp` decks get a page per slide, and the old
+  binary `.doc`, `.xls` and `.ppt`, and `.rtf`, are laid out as pages —
+  all through the same in-jail conversion Word documents already use,
+  cached the same way. Each used to show only the metadata card. Without
+  LibreOffice (or with `office_engine = builtin`) a deck shows the
+  thumbnail it embeds, with its text a button away, and the legacy formats
+  and RTF keep the card. The format is decided from the content: the zip
+  members or ODF `mimetype`, the main stream's directory entry in the OLE2
+  container the binary formats share — checked as a directory entry, so a
+  stream name typed into a document cannot decide it — and RTF's opening
+  `{\rtf`. An `.odp` with no LibreOffice is no longer read by the
+  built-in layout as a column of loose text boxes. CI installs Impress and
+  Calc alongside Writer so the real conversions are tested.
 - **Continuous integration.** A GitHub Actions workflow runs the test
   suite on every push and pull request, on Python 3.10 (the oldest
   `install.sh` accepts) and 3.14, against the PySide6 wheels on Ubuntu,
@@ -29,6 +59,9 @@ project has no version tags yet, so entries are dated.
 
 ### Fixed
 
+- **Percentages show the decimals their format asks for.** Every
+  percentage was printed with all its digits, so `0.0%` showed 52.65%
+  where Excel shows 52.7%, and `0.00%` showed 22.3% for 22.30%.
 - **The test suite no longer aborts depending on how it is started.**
   `python -m unittest discover tests` died with SIGABRT partway through:
   without `-t .` the files load as top-level modules, so the shared

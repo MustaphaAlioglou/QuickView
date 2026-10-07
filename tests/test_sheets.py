@@ -167,8 +167,9 @@ class CellValues(unittest.TestCase):
                    '<c r="C1" s="0"><v>46039</v></c></row>', False)],
             styles_xml=styles("0", "14", "10"),
         ))
+        # Built-in 10 is "0.00%": two decimals, as Excel shows it.
         self.assertEqual(
-            book["sheets"][0]["rows"], [["2026-01-17", "22.3%", "46039"]]
+            book["sheets"][0]["rows"], [["2026-01-17", "22.30%", "46039"]]
         )
 
     def test_custom_date_format_code_is_recognised(self):
@@ -183,6 +184,63 @@ class CellValues(unittest.TestCase):
         # "Days" in quotes is a label, not a d/y format — the number stays.
         self.assertEqual(renderers._classify_format('0" Days"'), "")
         self.assertEqual(renderers._classify_format("yyyy-mm-dd"), "date")
+
+
+class NumberFormats(unittest.TestCase):
+    """Figures printed the way the workbook's format codes print them."""
+
+    def fmt(self, raw, code):
+        return renderers._format_number(raw, code)
+
+    def test_decimals_are_padded_and_rounded(self):
+        self.assertEqual(self.fmt("64.3", "0.00"), "64.30")
+        self.assertEqual(self.fmt("2.5", "0"), "3")  # half away from zero,
+        self.assertEqual(self.fmt("-2.5", "0"), "-3")  # as Excel rounds
+
+    def test_thousands_separators(self):
+        self.assertEqual(self.fmt("1234567.891", "#,##0.00"), "1,234,567.89")
+        self.assertEqual(self.fmt("1500000", "#,##0,"), "1,500")  # in thousands
+
+    def test_percentages_keep_their_decimals(self):
+        self.assertEqual(self.fmt("0.5265", "0.0%"), "52.7%")
+        self.assertEqual(self.fmt("0.5", "0%"), "50%")
+
+    def test_currency_in_its_three_spellings(self):
+        self.assertEqual(self.fmt("64.3", "#,##0.00\\ [$€]"), "64.30 €")
+        self.assertEqual(self.fmt("1234.5", "[$€-408]#,##0.00"), "€1,234.50")
+        self.assertEqual(self.fmt("-1234.5", '"$"#,##0.00'), "-$1,234.50")
+
+    def test_a_negative_section_replaces_the_minus_sign(self):
+        self.assertEqual(self.fmt("-1234.5", "#,##0.00;(#,##0.00)"), "(1,234.50)")
+        self.assertEqual(self.fmt("-5", "0;[Red]0"), "5")  # red, not signed
+
+    def test_accounting_format_with_a_dash_for_zero(self):
+        code = ('_-* #,##0.00\\ "€"_-;\\-* #,##0.00\\ "€"_-;'
+                '_-* "-"??\\ "€"_-;_-@_-')
+        self.assertEqual(self.fmt("12.5", code), "12.50 €")
+        self.assertEqual(self.fmt("-12.5", code), "-12.50 €")
+        self.assertEqual(self.fmt("0", code), "- €")
+
+    def test_scientific_and_literal_text(self):
+        self.assertEqual(self.fmt("123456", "0.00E+00"), "1.23E+05")
+        self.assertEqual(self.fmt("15", '0" Days"'), "15 Days")
+
+    def test_unsupported_layouts_fall_back_to_the_plain_number(self):
+        for code in ("[>100]0;0.0", "000-0000", "# ?/?"):
+            with self.subTest(code=code):
+                self.assertIsNone(self.fmt("150", code))
+
+    def test_through_the_workbook(self):
+        book = read(build_xlsx(
+            [("S", '<row r="1"><c r="A1" s="0"><v>64.3</v></c>'
+                   '<c r="B1" s="1"><v>0.5265</v></c>'
+                   '<c r="C1" s="2"><v>1234.5</v></c>'
+                   '<c r="D1" s="3"><v>-7</v></c></row>', False)],
+            styles_xml=styles("164", "165", "4", "37", codes=(
+                ("164", "#,##0.00\\ [$€]"), ("165", "0.0%"))),
+        ))
+        self.assertEqual(book["sheets"][0]["rows"],
+                         [["64.30 €", "52.7%", "1,234.50", "(7)"]])
 
 
 class Bounds(unittest.TestCase):

@@ -30,10 +30,14 @@ jobs:
             libglib2.0-0 libegl1 libgl1 libxkbcommon0 libfontconfig1 \
             libdbus-1-3 libgssapi-krb5-2 fonts-dejavu-core
 
-      # Writer alone, without a GUI: the one office test that converts a real
-      # .docx skips without it, and every other office test fakes the suite.
+      # Without a GUI: Writer, Impress and Calc for the tests that convert a
+      # real document, deck and legacy workbook, which skip without them.
+      # Every other office test fakes the suite.
       - name: Install LibreOffice
-        run: sudo apt-get install -y --no-install-recommends libreoffice-writer-nogui
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            libreoffice-writer-nogui libreoffice-impress-nogui \
+            libreoffice-calc-nogui
 
       # The full PySide6 rather than PySide6-Essentials: QtPdf is an add-on.
       - name: Install Python dependencies

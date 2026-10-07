@@ -1471,20 +1471,21 @@ def office_pages(fd: int, name: str, page_w: int, max_pages: int, start: int = 0
                  engine: str = "libreoffice", scale: float = 1.0):
     """Yield (page_count, png_bytes) for an office document, as page images.
 
-    A word-processor document goes to LibreOffice when the system has one:
-    converted to PDF in here, in the jail, and rendered by the PDF path, so
-    the preview has the document's real fonts, image sizes and positions,
-    text wrap, headers and EMF logos. ~1.3 s where the fallback is ~15 ms,
-    which is the price of looking like the document rather than like its
-    text.
+    A document or slide deck goes to LibreOffice when the system has one —
+    see _office_suite_kind for which, legacy binary formats and RTF
+    included: converted to PDF in here, in the jail, and rendered by the PDF
+    path, so the preview has the document's real fonts, image sizes and
+    positions, text wrap, headers and EMF logos, and a deck has one page per
+    slide. ~1.3 s where the fallback is ~15 ms, which is the price of
+    looking like the document rather than like its text.
 
     Otherwise — no LibreOffice, a spreadsheet, or a conversion that failed —
     the document is converted to the HTML subset QTextDocument understands
     and laid out here: no office suite, no subprocess, ~8 ms to convert and
-    ~7 ms a page. Slide decks have no path through that — their content is
-    absolutely positioned graphics, which QTextDocument cannot lay out — so
-    they raise, and the caller falls back to the thumbnail the deck embeds
-    plus its text.
+    ~7 ms a page. Slide decks and the binary formats have no path through
+    that — a deck's content is absolutely positioned graphics, which
+    QTextDocument cannot lay out — so they raise, and the caller falls back
+    to the thumbnail a deck embeds plus its text, or to the metadata card.
 
     engine "builtin" skips LibreOffice even where it is installed: the
     office_engine setting, for people who would rather have the preview now
@@ -1538,15 +1539,40 @@ def office_suite() -> str:
     return ""
 
 
+# ODF packages name their type in a "mimetype" member.
+_ODF_SUITE_KINDS = {
+    b"application/vnd.oasis.opendocument.text": ".odt",
+    b"application/vnd.oasis.opendocument.presentation": ".odp",
+}
+# The legacy binary formats share one container, the OLE2 compound file,
+# and differ in the name of the main stream inside it. "Book" is Excel 5/95.
+_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_OLE_SUITE_KINDS = (
+    ("WordDocument", ".doc"),
+    ("PowerPoint Document", ".ppt"),
+    ("Workbook", ".xls"),
+    ("Book", ".xls"),
+)
+
+
 def _office_suite_kind(fh) -> str:
     """The extension LibreOffice should see, or "" to leave it to Qt.
 
-    Word-processor documents only. Spreadsheets have the sheets view and
-    decks have their thumbnail; both are separate decisions. Decided from
-    the container, not the name, which the file's owner chose.
+    Word-processor documents and slide decks, in their current and legacy
+    formats, legacy Excel workbooks and RTF. Current spreadsheets are not
+    sent: they have the sheets view, and come here only when that view has
+    already failed. Decided from the content, not the name, which the
+    file's owner chose.
     """
     import zipfile
 
+    fh.seek(0)  # is_zipfile leaves the position at the end before 3.13
+    head = fh.read(8)
+    fh.seek(0)
+    if head[:5] == b"{\\rtf":
+        return ".rtf"
+    if head == _OLE_MAGIC:
+        return _ole_kind(fh.read(OFFICE_SUITE_MAX_BYTES))
     if not zipfile.is_zipfile(fh):
         return ""
     fh.seek(0)
@@ -1554,68 +1580,100 @@ def _office_suite_kind(fh) -> str:
         names = set(zf.namelist())
         if "word/document.xml" in names:
             return ".docx"
+        if "ppt/presentation.xml" in names:
+            return ".pptx"
         if "mimetype" in names:
             with zf.open("mimetype") as m:
-                if m.read(64).strip() == b"application/vnd.oasis.opendocument.text":
-                    return ".odt"
+                return _ODF_SUITE_KINDS.get(m.read(64).strip(), "")
+    return ""
+
+
+def _ole_kind(data: bytes) -> str:
+    """Which legacy format an OLE2 compound file holds, from its directory.
+
+    A directory entry is 128 bytes, aligned to 128 in the file: the name in
+    UTF-16, zero-padded, with its byte length (terminator included) at
+    offset 64. Requiring all three keeps a stream name that merely occurs in
+    the document's text — "PowerPoint Document" typed into a Word file —
+    from deciding the format.
+    """
+    import struct
+
+    for name, kind in _OLE_SUITE_KINDS:
+        needle = name.encode("utf-16-le") + b"\0\0"
+        size = struct.pack("<H", len(needle))
+        at = data.find(needle)
+        while at != -1:
+            if at % 128 == 0 and data[at + 64:at + 66] == size:
+                return kind
+            at = data.find(needle, at + 1)
     return ""
 
 
 def _pages_via_office_suite(fd: int, page_w: int, max_pages: int, start: int = 0,
                             scale: float = 1.0):
-    """Convert with LibreOffice to PDF, then render that like any PDF.
+    """Convert with LibreOffice to PDF, then render that like any PDF."""
+    import tempfile
 
-    Everything happens under a private temporary directory in the jail's
-    tmpfs: a copy of the document (LibreOffice wants a path; the jail has
-    only a descriptor), a throwaway user profile, and the PDF. Nothing
-    outlives the worker, and the jail has no network for a linked image to
-    be fetched over.
+    with _rewound(fd) as fh:
+        kind = _office_suite_kind(fh)
+        if not kind:
+            raise RuntimeError("not a document LibreOffice is used for")
+        with tempfile.TemporaryDirectory(prefix="qv-office-") as tmp:
+            pdf = _suite_convert(fh, kind, "pdf", tmp)
+            yield from render_pdf(pdf, page_w, max_pages, start, scale)
+
+
+def _suite_convert(fh, kind: str, target: str, tmp: str) -> str:
+    """Convert fh with LibreOffice to target, in tmp; the output's path.
+
+    tmp is a private temporary directory in the jail's tmpfs, which the
+    caller removes: it holds a copy of the document (LibreOffice wants a
+    path; the jail has only a descriptor), a throwaway user profile, and
+    the output. Nothing outlives the worker, and the jail has no network
+    for a linked image to be fetched over.
     """
     import os
     import signal
     import subprocess
-    import tempfile
 
     soffice = office_suite()
-    with _rewound(fd) as fh:
-        kind = _office_suite_kind(fh)
-        if not kind:
-            raise RuntimeError("not a word-processor document")
-        with tempfile.TemporaryDirectory(prefix="qv-office-") as tmp:
-            src = os.path.join(tmp, "doc" + kind)
-            fh.seek(0)
-            with open(src, "wb") as out:
-                data = fh.read(OFFICE_SUITE_MAX_BYTES + 1)
-                if len(data) > OFFICE_SUITE_MAX_BYTES:
-                    raise RuntimeError("too large for the office suite")
-                out.write(data)
-            del data
-            # Its own session, so a timeout can take down the whole tree:
-            # soffice is a launcher that forks soffice.bin, and killing only
-            # the launcher leaves the converter running.
-            proc = subprocess.Popen(
-                [soffice, "--headless", "--norestore", "--nologo",
-                 "--nolockcheck", "--nodefault",
-                 "-env:UserInstallation=file://" + tmp + "/profile",
-                 "--convert-to", "pdf", "--outdir", tmp, src],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                env={"HOME": tmp, "PATH": "/usr/bin:/bin",
-                     "SAL_USE_VCLPLUGIN": "svp"},
-                start_new_session=True,
-            )
-            try:
-                _out, err = proc.communicate(timeout=OFFICE_SUITE_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.communicate()  # reaps it and closes the stderr pipe
-                raise RuntimeError("timed out after %d s" % OFFICE_SUITE_TIMEOUT)
-            pdf = os.path.join(tmp, "doc.pdf")
-            if not os.path.isfile(pdf):
-                tail = err.decode("utf-8", "replace").strip()[-200:]
-                raise RuntimeError("no PDF produced (exit %s) %s"
-                                   % (proc.returncode, tail))
-            yield from render_pdf(pdf, page_w, max_pages, start, scale)
+    if not soffice:
+        raise RuntimeError("no office suite")
+    src = os.path.join(tmp, "doc" + kind)
+    fh.seek(0)
+    with open(src, "wb") as out:
+        data = fh.read(OFFICE_SUITE_MAX_BYTES + 1)
+        if len(data) > OFFICE_SUITE_MAX_BYTES:
+            raise RuntimeError("too large for the office suite")
+        out.write(data)
+    del data
+    # Its own session, so a timeout can take down the whole tree:
+    # soffice is a launcher that forks soffice.bin, and killing only
+    # the launcher leaves the converter running.
+    proc = subprocess.Popen(
+        [soffice, "--headless", "--norestore", "--nologo",
+         "--nolockcheck", "--nodefault",
+         "-env:UserInstallation=file://" + tmp + "/profile",
+         "--convert-to", target, "--outdir", tmp, src],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env={"HOME": tmp, "PATH": "/usr/bin:/bin",
+             "SAL_USE_VCLPLUGIN": "svp"},
+        start_new_session=True,
+    )
+    try:
+        _out, err = proc.communicate(timeout=OFFICE_SUITE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()  # reaps it and closes the stderr pipe
+        raise RuntimeError("timed out after %d s" % OFFICE_SUITE_TIMEOUT)
+    result = os.path.join(tmp, "doc." + target)
+    if not os.path.isfile(result):
+        tail = err.decode("utf-8", "replace").strip()[-200:]
+        raise RuntimeError("no %s produced (exit %s) %s"
+                           % (target.upper(), proc.returncode, tail))
+    return result
 
 
 def _pages_via_qtextdocument(fd: int, name: str, page_w: int, max_pages: int,
@@ -1692,9 +1750,23 @@ def _office_html(zf, names, page_w: int = 900) -> tuple:
         return _docx_html(zf, names, page_w)
     if "xl/workbook.xml" in names:
         return _xlsx_html(zf, names), {}
-    if "content.xml" in names and "styles.xml" in names:
+    if "content.xml" in names and "styles.xml" in names and not _odf_deck(zf, names):
         return _odf_html(zf, names)
     return "", {}  # slide decks land here: nothing to lay out, only a thumbnail
+
+
+def _odf_deck(zf, names) -> bool:
+    """An ODF presentation or drawing: frames on a canvas, not running text.
+
+    Read as text it comes out as every text box in a column, which looks
+    like a broken document; its embedded thumbnail looks like the deck.
+    """
+    if "mimetype" not in names:
+        return False
+    with zf.open("mimetype") as m:
+        kind = m.read(64).strip()
+    return kind.startswith((b"application/vnd.oasis.opendocument.presentation",
+                            b"application/vnd.oasis.opendocument.graphics"))
 
 
 _HTML_HEAD = (
@@ -2176,9 +2248,9 @@ def _odf_html(zf, names) -> tuple:
 
 # ------------------------------------------------------------- spreadsheets
 # A workbook is a grid, not a page, so it gets a grid: the cells come back as
-# text and the daemon puts them in a table with one tab per sheet. Only the
-# XML containers are handled (xlsx/ods) — the same standard-library-only path
-# the rest of the office code takes, with no office suite anywhere near it.
+# text and the daemon puts them in a table with one tab per sheet. The XML
+# containers (xlsx/ods) are read here with the standard library alone; a
+# legacy .xls is first converted to xlsx by LibreOffice, when there is one.
 SHEET_MAX_SHEETS = 24
 SHEET_MAX_ROWS = 2000
 SHEET_MAX_COLS = 64
@@ -2196,34 +2268,52 @@ DOC_REL = (
 )
 
 
-def read_workbook(fd: int, name: str = "") -> dict:
+def read_workbook(fd: int, name: str = "", engine: str = "libreoffice") -> dict:
     """Read a spreadsheet's cells as text, sheet by sheet.
 
     Returns {"sheets": [{"name", "rows", "cols", "align", "clipped"}, ...],
     "clipped": bool}. Every sheet is bounded (rows, columns and the length of
     one cell), so a workbook with a million-row sheet costs the same as a
     small one: the daemon is showing a preview, not opening the file.
+
+    A legacy binary .xls has no reader here. When LibreOffice is there and
+    engine allows it, it converts the workbook to xlsx in the jail, and the
+    xlsx reader below reads that — so an old workbook gets the same grid
+    and tabs as a new one, number formats included.
     """
+    import tempfile
     import zipfile
 
     with _rewound(fd) as fh:
-        if not zipfile.is_zipfile(fh):
+        if zipfile.is_zipfile(fh):
+            sheets = _workbook_sheets(fh)
+        elif (engine != "builtin" and office_suite()
+                and _office_suite_kind(fh) == ".xls"):
+            with tempfile.TemporaryDirectory(prefix="qv-office-") as tmp:
+                with open(_suite_convert(fh, ".xls", "xlsx", tmp), "rb") as xlsx:
+                    sheets = _workbook_sheets(xlsx)
+        else:
             raise RuntimeError("not a spreadsheet")
-        fh.seek(0)
-        with zipfile.ZipFile(fh) as zf:
-            names = set(zf.namelist())
-            if "xl/workbook.xml" in names:
-                sheets = _xlsx_sheets(zf, names)
-            elif "content.xml" in names:
-                sheets = _ods_sheets(zf)
-            else:
-                raise RuntimeError("no spreadsheet part in this container")
 
     clipped = len(sheets) > SHEET_MAX_SHEETS
     sheets = sheets[:SHEET_MAX_SHEETS]
     if not any(sheet["rows"] for sheet in sheets):
         raise RuntimeError("no cells to show")
     return {"sheets": sheets, "clipped": clipped}
+
+
+def _workbook_sheets(fh) -> list:
+    """The sheets of an xlsx or ods container."""
+    import zipfile
+
+    fh.seek(0)
+    with zipfile.ZipFile(fh) as zf:
+        names = set(zf.namelist())
+        if "xl/workbook.xml" in names:
+            return _xlsx_sheets(zf, names)
+        if "content.xml" in names:
+            return _ods_sheets(zf)
+    raise RuntimeError("no spreadsheet part in this container")
 
 
 def _column_alignment(rows: list, cols: int) -> list:
@@ -2308,7 +2398,7 @@ def _xlsx_sheets(zf, names) -> list:
             "".join(node.text or "" for node in item.iter(SS + "t"))
             for item in root.iter(SS + "si")
         ]
-    date_styles = _xlsx_date_styles(zf, names)
+    formats = _xlsx_formats(zf, names)
 
     rels = {}
     if "xl/_rels/workbook.xml.rels" in names:
@@ -2336,12 +2426,12 @@ def _xlsx_sheets(zf, names) -> list:
 
     sheets = []
     for sheet_name, member in entries[:SHEET_MAX_SHEETS]:
-        grid, clipped = _xlsx_grid(zf, member, shared, date_styles)
+        grid, clipped = _xlsx_grid(zf, member, shared, formats)
         sheets.append(_sheet_payload(sheet_name, grid, clipped))
     return sheets
 
 
-def _xlsx_grid(zf, member: str, shared: list, date_styles: dict) -> tuple:
+def _xlsx_grid(zf, member: str, shared: list, formats: dict) -> tuple:
     """{(row, col): text} for one worksheet, plus whether it was cut short.
 
     Cells are placed by their own reference rather than by the order they
@@ -2360,7 +2450,7 @@ def _xlsx_grid(zf, member: str, shared: list, date_styles: dict) -> tuple:
             col = _col_index(ref) if ref else position
             if col < 0:
                 continue
-            text = _xlsx_cell_text(cell, shared, date_styles)
+            text = _xlsx_cell_text(cell, shared, formats)
             if text:
                 grid[(number, col)] = text[:SHEET_MAX_CELL_CHARS]
         if len(grid) > SHEET_MAX_ROWS * SHEET_MAX_COLS:
@@ -2369,7 +2459,7 @@ def _xlsx_grid(zf, member: str, shared: list, date_styles: dict) -> tuple:
     return grid, clipped
 
 
-def _xlsx_cell_text(cell, shared: list, date_styles: dict) -> str:
+def _xlsx_cell_text(cell, shared: list, formats: dict) -> str:
     kind = cell.get("t")
     if kind == "inlineStr":
         node = cell.find(SS + "is")
@@ -2390,14 +2480,13 @@ def _xlsx_cell_text(cell, shared: list, date_styles: dict) -> str:
         return "TRUE" if raw.strip() not in ("0", "") else "FALSE"
     if kind in ("str", "e"):
         return raw
-    style = date_styles.get(cell.get("s") or "0")
-    if style == "percent":
-        try:
-            return _trim_number(repr(float(raw) * 100)) + "%"
-        except ValueError:
-            return raw
-    if style:
-        formatted = _serial_to_date(raw, style)
+    kind, code = formats.get(cell.get("s") or "0", ("", ""))
+    if kind == "number":
+        formatted = _format_number(raw, code)
+        if formatted is not None:
+            return formatted
+    elif kind:
+        formatted = _serial_to_date(raw, kind)
         if formatted:
             return formatted
     return _trim_number(raw)
@@ -2413,6 +2502,199 @@ def _trim_number(raw: str) -> str:
     if number == int(number) and abs(number) < 1e15:
         return str(int(number))
     return ("%.10g" % number)
+
+
+def _format_number(raw: str, code: str):
+    """A number as its Excel format code prints it, or None to fall back.
+
+    Covers what workbooks actually use for figures: decimals ("0.00"),
+    thousands separators ("#,##0"), percentages ("0.0%"), currency written
+    as a literal ("$", "\\ €") or a locale tag ("[$€-408]"), scientific
+    notation, and the positive;negative;zero sections that put negatives in
+    brackets or a zero as a dash. Conditional sections ("[>100]"),
+    fractions and digit layouts such as phone numbers are rarer, and get
+    the plain number rather than a guess.
+    """
+    import re
+
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    sections = _format_sections(code)
+    if not sections or len(sections) > 4:
+        return None
+    if any(re.search(r"\[[<>=]", sec) for sec in sections):
+        return None
+    if value < 0 and len(sections) > 1:
+        section, value, sign = sections[1], -value, ""
+    elif value == 0 and len(sections) > 2:
+        section, sign = sections[2], ""
+    else:
+        section = sections[0]
+        sign = "-" if value < 0 else ""
+        value = abs(value)
+    tokens = _format_tokens(section)
+    if tokens is None:
+        return None
+    # The pattern: one unbroken run of digit placeholders, with literals on
+    # either side. Two runs ("000-0000", "# ?/?") is a layout, not a number.
+    runs = [i for i, (kind, _t) in enumerate(tokens) if kind == "digits"]
+    if not runs:
+        if any(kind == "general" for kind, _t in tokens):
+            body = _trim_number(repr(value))
+        elif any(kind == "text" for kind, _t in tokens):
+            return None
+        else:
+            body = ""  # a section of pure literal, such as a zero as "-"
+        runs = None
+    elif len(runs) > 1:
+        return None
+    else:
+        pattern = tokens[runs[0]][1]
+        percent = sum(t.count("%") for kind, t in tokens if kind == "lit")
+        body = _format_digits(value * 100 ** percent, pattern)
+        if body is None:
+            return None
+    out = []
+    for i, (kind, text) in enumerate(tokens):
+        if runs is not None and i == runs[0]:
+            out.append(body)
+        elif kind == "lit":
+            out.append(text)
+        elif kind == "general" and runs is None:
+            out.append(body)
+    text = "".join(out).strip()
+    if runs is None and not any(k == "general" for k, _t in tokens):
+        return text
+    return sign + text if text else None
+
+
+def _format_sections(code: str) -> list:
+    """Split a format code on the semicolons that are not quoted or escaped."""
+    sections, cur, quoted, i = [], [], False, 0
+    while i < len(code):
+        ch = code[i]
+        if ch == "\\" and not quoted and i + 1 < len(code):
+            cur.append(code[i:i + 2])
+            i += 2
+            continue
+        if ch == '"':
+            quoted = not quoted
+        if ch == ";" and not quoted:
+            sections.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    sections.append("".join(cur))
+    return sections
+
+
+_FORMAT_DIGITS = set("0#?.,Ee+-")
+
+
+def _format_tokens(section: str):
+    """[(kind, text)] for one section: "lit", "digits", "general", "text".
+
+    Quoted strings, backslash escapes and bracketed currency are literal;
+    _x pads with a space the width of x and *x fills with x, both of which
+    a preview shows as a single space and nothing. Colours print nothing.
+    """
+    tokens, i, n = [], 0, len(section)
+
+    def lit(text):
+        if tokens and tokens[-1][0] == "lit":
+            tokens[-1] = ("lit", tokens[-1][1] + text)
+        else:
+            tokens.append(("lit", text))
+
+    while i < n:
+        ch = section[i]
+        if ch == '"':
+            end = section.find('"', i + 1)
+            end = n if end == -1 else end
+            lit(section[i + 1:end])
+            i = end + 1
+        elif ch == "\\":
+            lit(section[i + 1:i + 2])
+            i += 2
+        elif ch == "_":
+            lit(" ")
+            i += 2
+        elif ch == "*":
+            i += 2
+        elif ch == "[":
+            end = section.find("]", i)
+            if end == -1:
+                return None
+            inner = section[i + 1:end]
+            if inner.startswith("$"):
+                lit(inner[1:].split("-", 1)[0])  # [$€-408] -> €
+            i = end + 1
+        elif section[i:i + 7].lower() == "general":
+            tokens.append(("general", ""))
+            i += 7
+        elif ch == "@":
+            tokens.append(("text", ""))
+            i += 1
+        elif ch in "0#?" or (ch in ".," and _digit_near(section, i)):
+            start = i
+            while i < n and (section[i] in "0#?.," or (
+                section[i] in "Ee" and i + 1 < n and section[i + 1] in "+-"
+            ) or (section[i] in "+-" and i > start
+                  and section[i - 1] in "Ee")):
+                i += 1
+            tokens.append(("digits", section[start:i]))
+        else:
+            lit(ch)
+            i += 1
+    return tokens
+
+
+def _digit_near(section: str, i: int) -> bool:
+    """Is the "." or "," at i part of a number pattern rather than text?"""
+    after = section[i + 1:i + 2]
+    before = section[i - 1:i] if i else ""
+    return after in ("0", "#", "?") or before in ("0", "#", "?")
+
+
+def _format_digits(value: float, pattern: str):
+    """value (already non-negative, and scaled for %) through a digit run."""
+    import re
+    from decimal import ROUND_HALF_UP, Decimal
+
+    if "E" in pattern.upper():
+        mantissa, _e, exponent = re.split(r"([Ee][+-])", pattern, maxsplit=1)
+        places = len(mantissa.split(".", 1)[1]) if "." in mantissa else 0
+        digits = len(exponent.replace("#", "0"))
+        text = "%.*e" % (places, value)
+        num, exp = text.split("e")
+        exp_val = int(exp)
+        plus = "+" in pattern
+        exp_sign = "-" if exp_val < 0 else ("+" if plus else "")
+        return "%sE%s%0*d" % (num, exp_sign, digits, abs(exp_val))
+
+    int_part, _dot, frac_part = pattern.partition(".")
+    # Commas after the last digit scale by a thousand each ("#,##0," = k).
+    stripped = int_part.rstrip(",")
+    value /= 1000 ** (len(int_part) - len(stripped))
+    grouping = "," in stripped
+    int_min = stripped.count("0")
+    frac_min = frac_part.count("0")
+    frac_max = sum(frac_part.count(c) for c in "0#?")
+    # Excel rounds half away from zero; Python's % rounds half to even.
+    quant = Decimal(1).scaleb(-frac_max)
+    number = Decimal(repr(value)).quantize(quant, rounding=ROUND_HALF_UP)
+    text = "{:f}".format(number)
+    whole, _d, frac = text.partition(".")
+    frac = frac.rstrip("0").ljust(frac_min, "0") if frac_max else ""
+    if whole == "0" and int_min == 0:
+        whole = ""
+    whole = whole.rjust(int_min, "0")
+    if grouping and whole:
+        whole = "{:,}".format(int(whole))
+    return whole + ("." + frac if frac else "")
 
 
 def _serial_to_date(raw: str, style: str) -> str:
@@ -2441,11 +2723,25 @@ def _serial_to_date(raw: str, style: str) -> str:
     return text
 
 
-def _xlsx_date_styles(zf, names) -> dict:
-    """Cell-format index -> "date" / "datetime" / "time".
+# Built-in number formats: the ids a workbook may use without writing the
+# code out. 5-8 and 41-44 are locale-dependent currency and accounting
+# formats, which the file does not spell out, so they stay General.
+_XLSX_BUILTIN_FORMATS = {
+    "1": "0", "2": "0.00", "3": "#,##0", "4": "#,##0.00",
+    "9": "0%", "10": "0.00%", "11": "0.00E+00",
+    "37": "#,##0 ;(#,##0)", "38": "#,##0 ;(#,##0)",
+    "39": "#,##0.00;(#,##0.00)", "40": "#,##0.00;(#,##0.00)",
+    "48": "##0.0E+0",
+}
 
-    A date in xlsx is an ordinary number wearing a number format, so without
-    this every date in the file shows up as a five-digit serial.
+
+def _xlsx_formats(zf, names) -> dict:
+    """Cell-format index -> (kind, code): how that style's numbers print.
+
+    kind is "date", "datetime" or "time" — a date in xlsx is an ordinary
+    number wearing a format, so without this every date in the file shows
+    up as a five-digit serial — or "number", with the format code that
+    gives a figure its decimals, thousands separators, currency and sign.
     """
     if "xl/styles.xml" not in names:
         return {}
@@ -2457,22 +2753,22 @@ def _xlsx_date_styles(zf, names) -> dict:
         **{str(i): "date" for i in (14, 15, 16, 17, 30, 34, 35)},
         **{str(i): "datetime" for i in (22,)},
         **{str(i): "time" for i in (18, 19, 20, 21, 45, 46, 47)},
-        **{str(i): "percent" for i in (9, 10)},
     }
-    codes = {}
+    codes = dict(_XLSX_BUILTIN_FORMATS)
     for node in root.iter(SS + "numFmt"):
         codes[node.get("numFmtId")] = node.get("formatCode", "")
-    styles, index = {}, 0
+    formats, index = {}, 0
     for xfs in root.iter(SS + "cellXfs"):
         for xf in xfs.iter(SS + "xf"):
             fmt_id = xf.get("numFmtId", "0")
             kind = builtin.get(fmt_id)
-            if kind is None and fmt_id in codes:
-                kind = _classify_format(codes[fmt_id])
+            code = codes.get(fmt_id, "")
+            if kind is None and code:
+                kind = _classify_format(code) or "number"
             if kind:
-                styles[str(index)] = kind
+                formats[str(index)] = (kind, code)
             index += 1
-    return styles
+    return formats
 
 
 def _classify_format(code: str) -> str:
@@ -2482,6 +2778,8 @@ def _classify_format(code: str) -> str:
     minutes or months depending on its neighbours, which is why a code with
     hours *and* a day is a datetime rather than either alone.
     """
+    import re
+
     body, quoted = [], False
     for ch in code:
         if ch in ('"', "'"):
@@ -2490,7 +2788,9 @@ def _classify_format(code: str) -> str:
             body.append(ch)
     text = "".join(body).lower()
     if "%" in text:
-        return "percent"
+        return ""  # a percentage is a number with a format, not a date
+    # Bracketed parts are colours, conditions and currency, not date letters.
+    text = re.sub(r"\[[^\]]*\]", "", text)
     has_day = "y" in text or "d" in text
     has_time = "h" in text or "s" in text
     if has_day and has_time:

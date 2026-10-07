@@ -244,9 +244,9 @@ def main() -> int:
             # A workbook as a grid of text, one entry per sheet: the daemon
             # shows it in a table with tabs rather than as page images.
             header(1)
-            send(sock, json.dumps(
-                renderers.read_workbook(fd, job.get("name", ""))
-            ).encode())
+            send(sock, json.dumps(renderers.read_workbook(
+                fd, job.get("name", ""), job.get("engine", "libreoffice")
+            )).encode())
         elif op == "office":
             # Two shapes of answer, and the header says which: laid-out
             # page images when the document can be rendered, or a JSON

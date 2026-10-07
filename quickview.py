@@ -45,10 +45,13 @@ from string import Template
 import config
 import ipc
 import theme
-# The one thing the daemon asks the renderers: which engine the workers will
-# use for office documents, for the cache key. renderers imports nothing at
-# module level, so this loads no parser here.
-from renderers import office_suite
+# What the daemon asks the renderers: which engine the workers will use for
+# office documents, for the cache key, and the bounds a workbook is held to.
+# renderers imports nothing at module level, so this loads no parser here.
+from renderers import (
+    SHEET_MAX_CELL_CHARS, SHEET_MAX_COLS, SHEET_MAX_ROWS, SHEET_MAX_SHEETS,
+    office_suite,
+)
 
 from PySide6.QtCore import (
     Qt, QUrl, QEvent, QPoint, QRect, QSize, QObject, QSocketNotifier,
@@ -94,16 +97,29 @@ ARCHIVE_MIMES = (
     "application/vnd.debian.binary-package", "application/x-cd-image",
 )
 ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z", ".tar", ".tgz", ".txz", ".tbz2"}
-# OOXML and ODF documents that paginate: zip containers full of XML, laid
-# out with the standard library alone. Slide decks are deliberately absent —
-# their content is absolutely positioned graphics that nothing here can lay
-# out, and half a preview is worse than the honest metadata card. The legacy
-# binary formats (.doc/.xls/.ppt) are absent for the same reason.
+# OOXML and ODF documents: zip containers full of XML. Shown as pages —
+# laid out by LibreOffice in the jail when the system has it, and otherwise
+# with the standard library alone. A slide deck is absolutely positioned
+# graphics that only an office suite can lay out, so without one it shows
+# the thumbnail the deck embeds, with its text a button away.
 OFFICE_MIMES = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.oasis.opendocument.text",
     "application/vnd.oasis.opendocument.spreadsheet",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.presentationml.slideshow",
+    "application/vnd.oasis.opendocument.presentation",
+)
+# The legacy binary formats and RTF, which nothing but an office suite can
+# read: shown as pages when LibreOffice is there, and as the metadata card
+# when it is not — or when office_engine = builtin turns it off.
+SUITE_ONLY_MIMES = (
+    "application/msword",
+    "application/vnd.ms-excel",
+    "application/vnd.ms-powerpoint",
+    "application/rtf",
+    "text/rtf",
 )
 
 # Markdown gets both views: rendered pages (Qt's own Markdown parser, run
@@ -122,6 +138,9 @@ SPREADSHEET_MIMES = (
     "application/vnd.oasis.opendocument.spreadsheet",
 )
 SPREADSHEET_EXTENSIONS = {".xlsx", ".xlsm", ".ods"}
+# A legacy .xls gets the grid too, but only through LibreOffice, which
+# converts it to xlsx in the jail first; without it, it keeps the card.
+LEGACY_SPREADSHEET_MIMES = ("application/vnd.ms-excel",)
 
 # A book is a zip of XHTML with a reading order, which the office page
 # pipeline can lay out — see renderers.epub_pages. What it gets on top of a
@@ -1678,9 +1697,13 @@ class QuickView(QWidget):
                 self.show_epub(path)
             elif mime in ARCHIVE_MIMES or ext in ARCHIVE_EXTENSIONS:
                 self.show_archive(path, mime)
-            elif mime in SPREADSHEET_MIMES or ext in SPREADSHEET_EXTENSIONS:
+            elif mime in SPREADSHEET_MIMES or ext in SPREADSHEET_EXTENSIONS or (
+                mime in LEGACY_SPREADSHEET_MIMES and self.office_suite_in_use()
+            ):
                 self.show_sheets(path, mime)
-            elif mime in OFFICE_MIMES:
+            elif mime in OFFICE_MIMES or (
+                mime in SUITE_ONLY_MIMES and self.office_suite_in_use()
+            ):
                 self.show_office(path, mime)
             elif mime in MARKDOWN_MIMES or ext in MARKDOWN_EXTENSIONS:
                 self.show_markdown(path)
@@ -3346,17 +3369,23 @@ class QuickView(QWidget):
     # -------------------------------------------------------------- office
     # OOXML and ODF are zip containers full of XML, so no office suite is
     # needed. When the system has LibreOffice anyway, the worker uses it for
-    # word-processor documents — inside the jail, like every other parser —
+    # documents and slide decks — inside the jail, like every other parser —
     # because only a real layout engine gets them to look like themselves
-    # (see renderers.office_pages). Without one, the worker lays them out
-    # itself, and for a deck it prefers the thumbnail the authoring
-    # application embedded and extracts text when there is none.
+    # (see renderers.office_pages); the legacy binary formats and RTF come
+    # here only then. Without one, the worker lays documents out itself,
+    # and for a deck it prefers the thumbnail the authoring application
+    # embedded and extracts text when there is none.
+
+    @staticmethod
+    def office_suite_in_use() -> bool:
+        """Whether office documents go to LibreOffice: installed, not refused."""
+        return OFFICE_ENGINE != "builtin" and bool(office_suite())
 
     def show_office(self, path: str, mime: str):
         # Laid out as pages, cached page by page, and shown by the same code
-        # that shows a PDF — a document with pages gets the page view. Slide
-        # decks have no layout path here, so for those the worker answers
-        # with the thumbnail the deck embeds plus its text instead.
+        # that shows a PDF — a document with pages gets the page view. A
+        # slide deck with no LibreOffice to lay it out gets the thumbnail it
+        # embeds plus its text instead.
         if self._office_text and self._office_doc and self._office_doc[0] == path:
             self._render_office(path, self._office_doc[1])
             return
@@ -3372,8 +3401,7 @@ class QuickView(QWidget):
         # The engine is part of the key: pages laid out by the built-in
         # converter must not outlive a LibreOffice install, or a change of
         # office_engine, or vice versa.
-        use_lo = OFFICE_ENGINE != "builtin" and office_suite()
-        engine = "lo" if use_lo else "qt2"
+        engine = "lo" if self.office_suite_in_use() else "qt2"
 
         def page_key(i: int) -> str:
             return cache_key(path, st, page_w, 0, f"off{engine}{i}@{scale:g}")
@@ -3503,23 +3531,32 @@ class QuickView(QWidget):
     """)
 
     def show_sheets(self, path: str, mime: str):
+        # A legacy workbook costs a LibreOffice conversion, ~0.6 s, so its
+        # grid is kept on disk like a rendered page; a current one parses
+        # in milliseconds and is not worth the space.
+        key = None
+        if mime in LEGACY_SPREADSHEET_MIMES:
+            try:
+                key = cache_key(path, os.stat(path), 0, 0, "sheets-lo")
+            except OSError:
+                pass
+        cached = cache_read(key) if key else None
+        if cached is not None:
+            if self._show_workbook(path, cached):
+                log.debug("disk cache hit (sheets): %s", path)
+                return
+            cache_remove(key)
+
         self.show_message("Loading preview…")
         state = {"job": None, "shown": False}
 
         def on_frame(payload: bytes):
             if self._render_job is not state["job"] or path != self.current_path:
                 return
-            try:
-                book = json.loads(payload)
-                sheets = [s for s in book["sheets"] if s.get("rows")]
-            except (ValueError, TypeError, KeyError):
-                log.warning("sheet worker sent a malformed workbook: %s", path)
-                return
-            if not sheets:
-                return  # on_done falls back to the page view
-            self._clear_widgets()
-            self._show_sheets_widget(sheets, book.get("clipped", False))
-            state["shown"] = True
+            if self._show_workbook(path, payload):
+                state["shown"] = True
+                if key:
+                    cache_write(key, payload)
 
         def on_done(ok: bool, error: str):
             if self._render_job is not state["job"] or path != self.current_path:
@@ -3530,16 +3567,40 @@ class QuickView(QWidget):
                 # The office path can still lay it out, or show its thumbnail.
                 log.debug("no grid for %s (%s)", path, error[:200])
                 self._clear_widgets()
-                if mime in OFFICE_MIMES:
+                if mime in OFFICE_MIMES or (
+                    mime in SUITE_ONLY_MIMES and self.office_suite_in_use()
+                ):
                     self.show_office(path, mime)
                 else:
                     self.show_fallback(path, mime)
 
         state["job"] = self._render_job = SandboxJob(
             self.pool, path,
-            {"op": "sheets", "name": os.path.basename(path)},
+            {"op": "sheets", "name": os.path.basename(path),
+             "engine": OFFICE_ENGINE},
             on_frame, on_done, self,
         )
+
+    def _show_workbook(self, path: str, payload: bytes) -> bool:
+        """Show a workbook payload as tabs; False when it is not one.
+
+        The payload is either a worker's answer or a disk cache entry, and
+        the cache directory is writable by anything running as this user,
+        so both are checked for shape before a widget is built from them.
+        """
+        try:
+            book = json.loads(payload)
+        except ValueError:
+            book = None
+        if not valid_workbook(book):
+            log.warning("malformed workbook for %s", path)
+            return False
+        sheets = [s for s in book["sheets"] if s["rows"]]
+        if not sheets:
+            return False  # on_done falls back to the page view
+        self._clear_widgets()
+        self._show_sheets_widget(sheets, book.get("clipped", False))
+        return True
 
     def _show_sheets_widget(self, sheets: list, clipped: bool):
         wrap = QWidget()
@@ -3703,6 +3764,43 @@ class QuickView(QWidget):
         lay.addWidget(details)
         self.content.addWidget(wrap)
         self.set_panel_size(520, 360)
+
+
+def valid_workbook(book) -> bool:
+    """Is this the shape renderers.read_workbook returns, within its bounds?
+
+    The table is sized from these numbers, so a payload claiming a billion
+    columns must be refused here rather than handed to QTableWidget.
+    """
+    def count(value, low, high):
+        return isinstance(value, int) and not isinstance(value, bool) and (
+            low <= value <= high)
+
+    if not isinstance(book, dict) or not isinstance(book.get("sheets"), list):
+        return False
+    if len(book["sheets"]) > SHEET_MAX_SHEETS:
+        return False
+    for sheet in book["sheets"]:
+        if not isinstance(sheet, dict):
+            return False
+        rows = sheet.get("rows")
+        if not isinstance(rows, list) or len(rows) > SHEET_MAX_ROWS:
+            return False
+        for row in rows:
+            if not isinstance(row, list) or len(row) > SHEET_MAX_COLS:
+                return False
+            if not all(isinstance(cell, str) and len(cell) <= SHEET_MAX_CELL_CHARS
+                       for cell in row):
+                return False
+        align = sheet.get("align", [])
+        if not isinstance(align, list) or not all(isinstance(a, str) for a in align):
+            return False
+        if not (count(sheet.get("cols", 0), 0, SHEET_MAX_COLS)
+                and count(sheet.get("first_col", 0), 0, 16383)
+                and count(sheet.get("first_row", 1), 0, 1048576)
+                and isinstance(sheet.get("name", ""), str)):
+            return False
+    return True
 
 
 def connect_to_daemon() -> QLocalSocket | None:

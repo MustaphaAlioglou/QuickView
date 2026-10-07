@@ -81,14 +81,17 @@ text_limit_kb = 1024
 # How many pages of a PDF or office document to render at most.
 pdf_max_pages = 50
 
-# How Word documents (docx, odt) are laid out.
+# How office documents are laid out: Word (docx, odt), slide decks (pptx,
+# ppsx, odp), and the legacy doc, xls, ppt and rtf.
 #
 #   libreoffice  exact: the document as LibreOffice shows it — fonts, photos
-#                in place, text wrap, headers. ~1-2 s on first open, cached
-#                after that. Used only when LibreOffice is installed;
-#                otherwise this behaves like builtin.
+#                in place, text wrap, headers, a page per slide. ~1-2 s on
+#                first open, cached after that. Used only when LibreOffice
+#                is installed; otherwise this behaves like builtin.
 #   builtin      fast: QuickView's own layout, ~50 ms. Text, headings,
 #                tables and images, but no text wrap, headers or EMF logos.
+#                A deck shows the thumbnail it embeds; doc, xls, ppt and rtf
+#                show the file's details only.
 office_engine = libreoffice
 
 [appearance]
