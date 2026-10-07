@@ -568,10 +568,9 @@ keeping Qt loaded is what makes previews open in ~20 ms instead of ~1 s.
 .venv/bin/python -m unittest discover -s tests -t .
 ```
 
-177 checks, about a second, no display needed — the Qt ones run offscreen.
-Run it from the repo root, and keep the `-t .`: without it the files are
-imported as top-level modules, `tests/__init__.py` never runs, and the Qt
-cases crash on the `QApplication` it is there to create.
+216 checks, a few seconds, no display needed — the Qt ones run offscreen.
+Any way of starting them works: `discover` with or without `-s`/`-t`, from
+the repo root or from inside `tests/`, or a single file run directly.
 
 They cover the client↔daemon wire format, the settings parser, the raw-frame
 guard that stops a malformed worker header reading past a buffer, cache

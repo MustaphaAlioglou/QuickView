@@ -26,11 +26,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QMarginsF, QSizeF  # noqa: E402
 from PySide6.QtGui import (  # noqa: E402
-    QFont, QGuiApplication, QImage, QPageSize, QPainter, QPdfWriter,
+    QFont, QImage, QPageSize, QPainter, QPdfWriter,
     QTextDocument,
 )
+from PySide6.QtWidgets import QApplication  # noqa: E402
 
-_app = QGuiApplication.instance() or QGuiApplication([sys.argv[0]])
+_app = QApplication.instance() or QApplication([sys.argv[0]])
 
 import renderers  # noqa: E402
 

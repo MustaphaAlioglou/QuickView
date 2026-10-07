@@ -5,6 +5,19 @@ project has no version tags yet, so entries are dated.
 
 [kac]: https://keepachangelog.com/en/1.1.0/
 
+## 2026-10-07
+
+### Fixed
+
+- **The test suite no longer aborts depending on how it is started.**
+  `python -m unittest discover tests` died with SIGABRT partway through:
+  without `-t .` the files load as top-level modules, so the shared
+  `QApplication` in `tests/__init__.py` was never made, `test_epub` made a
+  `QGuiApplication` instead, and the first widget test in `test_media`
+  aborted Qt. Every test module now creates a `QApplication` itself — it
+  serves the non-widget tests just as well — so discovery from anywhere,
+  and running a single file directly, all work.
+
 ## 2026-09-25
 
 ### Added

@@ -7,24 +7,13 @@
 # option) any later version. This program is distributed WITHOUT ANY
 # WARRANTY; see the LICENSE file, or <https://www.gnu.org/licenses/>.
 
-"""Shared Qt bootstrap for the suite.
+"""Every Qt test module creates a QApplication, never a QGuiApplication.
 
-Every module here needs an application object, and the widget tests need it
-to be a QApplication in particular. A process gets exactly one, and a
-QGuiApplication made first cannot be upgraded to a QApplication later — so
-whichever test module happened to be imported first would decide whether
-widgets could be tested at all. This package is imported before any of
-them, which makes the choice once and in one place.
-
-The modules that only need a QGuiApplication ask for one and are handed
-this, since QApplication is one.
+The widget tests need a QApplication in particular. A process gets exactly
+one application object, and a QGuiApplication made first cannot be upgraded
+later — so a module that made one would, by being imported first, abort every
+widget test after it. Since QApplication is a QGuiApplication, the modules
+that need only the latter lose nothing by asking for the former, and the
+suite then works however it is started: discovered from the repo root or
+from inside tests/, or a single file run directly.
 """
-
-import os
-import sys
-
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
-from PySide6.QtWidgets import QApplication  # noqa: E402
-
-app = QApplication.instance() or QApplication([sys.argv[0]])

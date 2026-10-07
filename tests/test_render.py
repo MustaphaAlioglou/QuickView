@@ -16,9 +16,10 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtGui import QGuiApplication, QColor, QImage  # noqa: E402
+from PySide6.QtGui import QColor, QImage  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
 
-_app = QGuiApplication.instance() or QGuiApplication([sys.argv[0]])
+_app = QApplication.instance() or QApplication([sys.argv[0]])
 
 import quickview  # noqa: E402
 import renderers  # noqa: E402
