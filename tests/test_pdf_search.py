@@ -11,9 +11,11 @@
 
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -21,6 +23,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 _app = QApplication.instance() or QApplication([sys.argv[0]])
 
 import renderers  # noqa: E402
+import samplepdf  # noqa: E402
 
 
 class Flatten(unittest.TestCase):
@@ -56,38 +59,43 @@ class Flatten(unittest.TestCase):
         self.assertEqual(renderers._flatten("   ")[0], "")
 
 
-# The checks below are written against one particular document — the match
-# counts and the phrases are its — so the path is named by the environment
-# rather than hard-coded, and they skip themselves for everyone else:
-#
-#     QUICKVIEW_SEARCH_PDF=~/that/document.pdf \
-#         python -m unittest discover -s tests
-#
-# Any PDF with bookmarks works for the outline checks in test_epub.py, which
-# read QUICKVIEW_TEST_PDF instead.
-PDF = os.path.expanduser(os.environ.get("QUICKVIEW_SEARCH_PDF", ""))
-
-
-@unittest.skipUnless(PDF and os.path.exists(PDF), "no QUICKVIEW_SEARCH_PDF")
+# Searched in a PDF built by tests/samplepdf.py, whose text is known, so the
+# expected counts come from what was written rather than from one person's
+# document — and the checks run everywhere, CI included.
 class Search(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.pdf = samplepdf.write(os.path.join(cls.tmp.name, "sample.pdf"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
     def hits(self, query, **kw):
-        return renderers.search_pdf(PDF, query, 1645, 50, **kw)
+        return renderers.search_pdf(self.pdf, query, 1645, 50, **kw)
 
     def test_a_single_word(self):
-        self.assertEqual(len(self.hits("volatility")["matches"]), 36)
+        self.assertEqual(len(self.hits(samplepdf.WORD)["matches"]),
+                         samplepdf.count(samplepdf.WORD))
+
+    def test_case_is_ignored(self):
+        self.assertEqual(len(self.hits(samplepdf.WORD.upper())["matches"]),
+                         samplepdf.count(samplepdf.WORD))
 
     def test_a_phrase_across_a_line_break(self):
         # Reads as continuous on the page; the text layer has \r\n in it.
-        out = self.hits("degree of Master")
-        self.assertTrue(out["matches"])
+        out = self.hits(samplepdf.PHRASE)
+        self.assertEqual(len(out["matches"]), 1)
         self.assertFalse(out["loose"])
         # One rectangle per line the match spans, not one slab over both.
         self.assertEqual(len(out["matches"][0]["rects"]), 2)
 
     def test_query_whitespace_is_tolerated(self):
+        padded = "  " + "   ".join(samplepdf.PHRASE.split()) + " "
         self.assertEqual(
-            len(self.hits("  degree   of    Master ")["matches"]),
-            len(self.hits("degree of Master")["matches"]),
+            len(self.hits(padded)["matches"]),
+            len(self.hits(samplepdf.PHRASE)["matches"]),
         )
 
     def test_no_match(self):
@@ -99,13 +107,20 @@ class Search(unittest.TestCase):
         self.assertEqual(self.hits("")["matches"], [])
 
     def test_the_hit_cap(self):
+        self.assertGreater(samplepdf.count("the"), 10)
         out = self.hits("the", max_hits=10)
         self.assertTrue(out["capped"])
         self.assertEqual(len(out["matches"]), 10)
 
+    def test_only_the_shown_pages_are_searched(self):
+        # A hit on a page the viewer never renders is worse than silence.
+        out = renderers.search_pdf(self.pdf, samplepdf.WORD, 1645, 2)
+        self.assertTrue(out["matches"])
+        self.assertTrue(all(m["page"] < 2 for m in out["matches"]))
+
     def test_rectangles_land_inside_the_page(self):
-        doc = renderers._open_pdf(PDF)
-        for hit in self.hits("volatility")["matches"]:
+        doc = renderers._open_pdf(self.pdf)
+        for hit in self.hits(samplepdf.WORD)["matches"]:
             w, h = renderers._page_px(doc, hit["page"], 1645)
             for x, y, rw, rh in hit["rects"]:
                 self.assertGreaterEqual(x, 0)
@@ -113,19 +128,41 @@ class Search(unittest.TestCase):
                 self.assertLessEqual(x + rw, w)
                 self.assertLessEqual(y + rh, h)
 
+    def test_each_highlight_covers_the_text_it_reports(self):
+        # Read back what lies under every rectangle. A match whose offsets
+        # are not mapped back through _flatten's index still produces
+        # rectangles of about the right size — one character to the side
+        # per line break above it — so only the text under them shows it.
+        from PySide6.QtCore import QPointF
+
+        doc = renderers._open_pdf(self.pdf)
+        for query in (samplepdf.WORD, samplepdf.PHRASE):
+            for hit in self.hits(query)["matches"]:
+                w, h = renderers._page_px(doc, hit["page"], 1645)
+                pt = doc.pagePointSize(hit["page"])
+                sx, sy = w / pt.width(), h / pt.height()
+                under = []
+                for x, y, rw, rh in hit["rects"]:
+                    mid = (y + rh / 2) / sy
+                    sel = doc.getSelection(hit["page"], QPointF((x + 1) / sx, mid),
+                                           QPointF((x + rw - 1) / sx, mid))
+                    under.append(sel.text())
+                self.assertEqual(renderers._flatten(" ".join(under))[0],
+                                 renderers._flatten(query)[0],
+                                 f"page {hit['page']}: {under}")
+
     def test_search_geometry_matches_what_the_renderer_emits(self):
         # The drift that would put every highlight in the wrong place.
         from PySide6.QtGui import QImage
 
-        doc = renderers._open_pdf(PDF)
+        doc = renderers._open_pdf(self.pdf)
         for page in (0, 7):
-            _count, png = next(renderers.render_pdf(PDF, 1645, page + 1, page))
+            _count, png = next(renderers.render_pdf(self.pdf, 1645, page + 1, page))
             img = QImage()
             img.loadFromData(png)
             self.assertEqual(
                 (img.width(), img.height()), renderers._page_px(doc, page, 1645)
             )
-
 
 if __name__ == "__main__":
     unittest.main()

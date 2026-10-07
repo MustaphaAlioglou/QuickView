@@ -13,7 +13,19 @@ project has no version tags yet, so entries are dated.
   suite on every push and pull request, on Python 3.10 (the oldest
   `install.sh` accepts) and 3.14, against the PySide6 wheels on Ubuntu,
   with LibreOffice Writer installed so the real `.docx` conversion is
-  tested too.
+  tested too — nothing in the suite skips there.
+- **The PDF outline and search tests run everywhere.** They used to skip
+  unless pointed at a real document, and the search ones asserted match
+  counts in one particular file only its author had. They now run against
+  a nine-page PDF that `tests/samplepdf.py` writes from raw PDF syntax, with
+  a nested outline and known text, so the expected counts come from what
+  was written. Two checks are new: the outline comes back exactly as
+  written, each entry landing on its own line, and every search highlight
+  covers the words it reports, read back from the page. The second catches
+  a match offset not mapped back through the text flattening, which shifts
+  each highlight sideways and that nothing else noticed.
+  `QUICKVIEW_SEARCH_PDF` is gone; `QUICKVIEW_TEST_PDF` still overrides the
+  outline sample.
 
 ### Fixed
 

@@ -568,7 +568,7 @@ keeping Qt loaded is what makes previews open in ~20 ms instead of ~1 s.
 .venv/bin/python -m unittest discover -s tests -t .
 ```
 
-216 checks, a few seconds, no display needed — the Qt ones run offscreen.
+220 checks, a few seconds, no display needed — the Qt ones run offscreen.
 Any way of starting them works: `discover` with or without `-s`/`-t`, from
 the repo root or from inside `tests/`, or a single file run directly.
 
@@ -579,21 +579,22 @@ percentage formats, and the bounds that keep a hostile workbook cheap), the
 EPUB reader (package document, both kinds of table of contents, entity
 handling, chapter-to-page mapping and the search's match geometry), the
 Markdown import (raw HTML, images, theming, headings and code wrapping), and
-the PDF search's text flattening and geometry.
+the PDF search's text flattening and geometry — including that each
+highlight box lies on the very words it reports, read back from the page.
 
-Eleven of them want a real PDF and skip without one — point them at your own:
+The PDF cases run against a small document that `tests/samplepdf.py` writes
+from raw PDF syntax — Qt can write a PDF but not its bookmarks — with a
+nested outline, three sections on one page and a phrase broken over a line.
+The outline cases can be pointed at a real document instead; any PDF with
+nested bookmarks, two of them on one page, will do:
 
 ```bash
 QUICKVIEW_TEST_PDF=~/any/bookmarked.pdf .venv/bin/python -m unittest discover -s tests -t .
 ```
 
-`QUICKVIEW_TEST_PDF` can be any PDF that has bookmarks (the outline cases).
-`QUICKVIEW_SEARCH_PDF` is separate because those checks assert match counts
-for one particular document, so only its author can run them.
-
-What they cannot check is whether a highlight box lands on the right word,
-or whether the panel looks right — that stays a matter of opening a file and
-looking at it.
+Only the LibreOffice case skips, and only where LibreOffice is not
+installed. What the suite cannot check is whether the panel looks right —
+that stays a matter of opening a file and looking at it.
 
 ## Contributing
 

@@ -24,6 +24,7 @@ import unittest
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 _app = QApplication.instance() or QApplication([sys.argv[0]])
 
 import renderers  # noqa: E402
+import samplepdf  # noqa: E402
 
 CONTAINER = (
     '<container version="1.0" '
@@ -437,21 +439,36 @@ class Themes(unittest.TestCase):
                       config._CHOICES["book_theme"])
 
 
-# Any PDF that carries bookmarks, named by the environment — see
-# tests/test_pdf_search.py for the same arrangement and why.
+# The outline checks run against a PDF built by tests/samplepdf.py, so they
+# run everywhere, CI included. QUICKVIEW_TEST_PDF points them at a real
+# document instead — any PDF with nested bookmarks, two of them on one page.
 SAMPLE_PDF = os.path.expanduser(os.environ.get("QUICKVIEW_TEST_PDF", ""))
 
 
-@unittest.skipUnless(
-    SAMPLE_PDF and os.path.exists(SAMPLE_PDF), "no QUICKVIEW_TEST_PDF"
-)
 class PdfOutline(unittest.TestCase):
-    def test_bookmarks_come_back_flattened_with_pages(self):
+    @classmethod
+    def setUpClass(cls):
+        cls.generated = not SAMPLE_PDF
+        if cls.generated:
+            cls.tmp = tempfile.TemporaryDirectory()
+            cls.path = samplepdf.write(os.path.join(cls.tmp.name, "sample.pdf"))
+        else:
+            cls.path = SAMPLE_PDF
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.generated:
+            cls.tmp.cleanup()
+
+    def outline(self, max_pages=50):
         from PySide6.QtCore import QFile, QIODevice
 
-        src = QFile(SAMPLE_PDF)
-        src.open(QIODevice.OpenModeFlag.ReadOnly)
-        entries = renderers.pdf_outline(src, 700, max_pages=50)
+        src = QFile(self.path)
+        self.assertTrue(src.open(QIODevice.OpenModeFlag.ReadOnly), self.path)
+        return renderers.pdf_outline(src, 700, max_pages=max_pages)
+
+    def test_bookmarks_come_back_flattened_with_pages(self):
+        entries = self.outline()
         self.assertTrue(entries)
         page_h = int(700 * renderers.PAGE_RATIO)
         for entry in entries:
@@ -463,13 +480,9 @@ class PdfOutline(unittest.TestCase):
             self.assertLess(entry["y"], page_h * 1.05)
 
     def test_sections_sharing_a_page_scroll_to_different_places(self):
-        # The sample's chapter 1 puts five subsections on one page. With a
-        # page number alone they all scroll to the top of it.
-        from PySide6.QtCore import QFile, QIODevice
-
-        src = QFile(SAMPLE_PDF)
-        src.open(QIODevice.OpenModeFlag.ReadOnly)
-        entries = renderers.pdf_outline(src, 700, max_pages=50)
+        # The sample puts three subsections on one page. With a page number
+        # alone they all scroll to the top of it.
+        entries = self.outline()
         by_page = {}
         for entry in entries:
             by_page.setdefault(entry["page"], []).append(entry["y"])
@@ -481,13 +494,26 @@ class PdfOutline(unittest.TestCase):
                         "sample has subsections; nesting should survive")
 
     def test_entries_past_the_rendered_pages_are_dropped(self):
-        from PySide6.QtCore import QFile, QIODevice
-
-        src = QFile(SAMPLE_PDF)
-        src.open(QIODevice.OpenModeFlag.ReadOnly)
-        entries = renderers.pdf_outline(src, 700, max_pages=2)
+        entries = self.outline(max_pages=2)
+        self.assertTrue(entries)
         self.assertTrue(all(e["page"] < 2 for e in entries))
 
+    def test_the_outline_is_the_one_in_the_file(self):
+        # Only the generated sample has an outline known in advance: every
+        # entry, in order, nested as written, each landing on its own line.
+        if not self.generated:
+            self.skipTest("QUICKVIEW_TEST_PDF is not the generated sample")
+        entries = self.outline()
+        self.assertEqual(
+            [(e["title"], e["level"], e["page"]) for e in entries],
+            [(t, lvl, p) for t, lvl, p, _ in samplepdf.OUTLINE],
+        )
+        page_h = 700 * samplepdf.PAGE_H / samplepdf.PAGE_W
+        for entry, (_t, _l, _p, line) in zip(entries, samplepdf.OUTLINE):
+            top_pt = samplepdf.PAGE_H - (samplepdf.TOP - line * samplepdf.LEADING
+                                         + samplepdf.FONT_SIZE)
+            self.assertAlmostEqual(entry["y"], top_pt * page_h / samplepdf.PAGE_H,
+                                   delta=2)
 
 if __name__ == "__main__":
     unittest.main()
