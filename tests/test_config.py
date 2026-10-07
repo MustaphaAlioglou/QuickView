@@ -111,6 +111,9 @@ class Loading(unittest.TestCase):
         finally:
             del os.environ["QUICKVIEW_CODE_STYLE"]
 
+    # Root reads a mode-000 file regardless, so there the file is not
+    # unreadable and the case cannot be set up — as in a container.
+    @unittest.skipIf(os.geteuid() == 0, "root can read any file")
     def test_an_unreadable_file_does_not_raise(self):
         self.write("[preview]\ncode_style = dracula\n")
         os.chmod(self.path, 0o000)

@@ -7,6 +7,14 @@ project has no version tags yet, so entries are dated.
 
 ## 2026-10-07
 
+### Added
+
+- **Continuous integration.** A GitHub Actions workflow runs the test
+  suite on every push and pull request, on Python 3.10 (the oldest
+  `install.sh` accepts) and 3.14, against the PySide6 wheels on Ubuntu,
+  with LibreOffice Writer installed so the real `.docx` conversion is
+  tested too.
+
 ### Fixed
 
 - **The test suite no longer aborts depending on how it is started.**
@@ -17,6 +25,9 @@ project has no version tags yet, so entries are dated.
   aborted Qt. Every test module now creates a `QApplication` itself — it
   serves the non-widget tests just as well — so discovery from anywhere,
   and running a single file directly, all work.
+- **The unreadable-config test skips itself as root.** Root reads a
+  mode-000 file anyway, so in a container the case could not be set up
+  and failed instead.
 
 ## 2026-09-25
 
