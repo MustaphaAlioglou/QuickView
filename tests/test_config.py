@@ -79,6 +79,21 @@ class Loading(unittest.TestCase):
         self.write("[preview]\noffice_engine = onlyoffice\n")
         self.assertEqual(config.load(self.path)["office_engine"], "libreoffice")
 
+    def test_navigation_keys(self):
+        self.assertEqual(config.load(self.path)["navigation_keys"], "left-right")
+        self.write("[keyboard]\nnavigation_keys = UP-DOWN\n")
+        self.assertEqual(config.load(self.path)["navigation_keys"], "up-down")
+        self.write("[keyboard]\nnavigation_keys = sideways\n")
+        self.assertEqual(config.load(self.path)["navigation_keys"], "left-right")
+
+    def test_navigation_environment_overrides_file(self):
+        self.write("[keyboard]\nnavigation_keys = left-right\n")
+        os.environ["QUICKVIEW_NAVIGATION_KEYS"] = "up-down"
+        try:
+            self.assertEqual(config.load(self.path)["navigation_keys"], "up-down")
+        finally:
+            del os.environ["QUICKVIEW_NAVIGATION_KEYS"]
+
     def test_every_log_level_names_a_logging_constant(self):
         # setup_logging() does getattr(logging, value.upper()).
         import logging
