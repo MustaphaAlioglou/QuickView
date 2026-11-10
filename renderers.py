@@ -1203,7 +1203,15 @@ def highlight_text(source, name: str, limit: int, style_name: str = "one-dark") 
         length = len(value)
         colour = colour_of.get(ttype)
         if colour is None:
-            colour = colour_of[ttype] = style.style_for_token(ttype).get("color") or ""
+            # Some lexers mint their own token types — YAML's
+            # Literal.Scalar.Plain — that no style lists, and
+            # style_for_token() raises KeyError on those rather than
+            # inheriting. Climb to the nearest ancestor the style knows,
+            # as Pygments' own formatters do.
+            known = ttype
+            while not style.styles_token(known) and known.parent is not None:
+                known = known.parent
+            colour = colour_of[ttype] = style.style_for_token(known).get("color") or ""
         if colour and colour != default and value.strip():
             index = palette.get(colour)
             if index is None:
