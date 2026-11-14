@@ -116,6 +116,16 @@ class Extensions(unittest.TestCase):
     def test_an_unknown_extension_and_no_shebang_is_plain(self):
         self.assertIsNone(lexer_for("a.zzz", "whatever\n"))
 
+    def test_tokens_no_style_lists_still_get_colour(self):
+        # The YAML lexer emits Token.Literal.Scalar.Plain, which no style
+        # names; looking it up directly raised KeyError and lost the colour.
+        doc = renderers.highlight_text(
+            io.BytesIO(b"model:\n  name: plain scalar\n  r: 16\n"),
+            "config.yaml", 1 << 20,
+        )
+        self.assertEqual(doc["lexer"], "YAML")
+        self.assertTrue(doc["spans"])
+
     def test_a_bad_style_name_degrades_to_plain_text(self):
         # Must not read as "unknown extension" and must not raise.
         got = renderers.highlight_text(
