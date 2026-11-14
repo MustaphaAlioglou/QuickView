@@ -17,6 +17,7 @@ Keys:
   Space / Esc / Q   close the preview
   Left / Right      previous / next file (the selection if several files
                     were passed, otherwise siblings in the same folder)
+  Up / Down         previous / next file when navigation_keys = up-down
   Enter             open the file in its default application
 
 A second invocation while a preview is open is forwarded to the running
@@ -1366,14 +1367,19 @@ class QuickView(QWidget):
         # the find field open, typing a space or a "q" would dismiss the
         # preview and the arrows would switch files. _set_nav_shortcuts()
         # turns them off for exactly as long as that field has focus.
+        previous_key, next_key = (
+            (Qt.Key_Up, Qt.Key_Down)
+            if SETTINGS["navigation_keys"] == "up-down"
+            else (Qt.Key_Left, Qt.Key_Right)
+        )
         self._nav_shortcuts = [
             QShortcut(QKeySequence(keys), self, activated=fn)
             for keys, fn in (
                 (Qt.Key_Space, lambda: self.dismiss("space")),
                 (Qt.Key_Escape, lambda: self.dismiss("escape")),
                 (Qt.Key_Q, lambda: self.dismiss("q")),
-                (Qt.Key_Left, lambda: self.step_sibling(-1)),
-                (Qt.Key_Right, lambda: self.step_sibling(+1)),
+                (previous_key, lambda: self.step_sibling(-1)),
+                (next_key, lambda: self.step_sibling(+1)),
                 (Qt.Key_Return, self.open_externally),
                 (Qt.Key_Enter, self.open_externally),
             )

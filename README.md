@@ -458,6 +458,7 @@ systemctl --user restart quickview.service
 
 | Setting | Default | What it does |
 |---------|---------|--------------|
+| `[keyboard] navigation_keys` | `left-right` | Previous/next file arrows: `left-right` or `up-down` |
 | `[preview] code_style` | `one-dark` | Pygments style for source files |
 | `[preview] book_theme` | `paper` | Page colours for EPUB books and rendered Markdown: `paper`, `sepia`, `dark`, `gruvbox-dark`, `gruvbox-light` |
 | `[preview] text_limit_kb` | `1024` | How much of a text file to read before truncating |
@@ -466,6 +467,19 @@ systemctl --user restart quickview.service
 | `[logging] log_level` | `info` | How much the daemon writes to the log and the journal: `error`, `warning`, `info`, `debug` |
 | `[cache] disk_cache_mb` | `256` | Rendered previews kept on disk; `0` disables it |
 | `[cache] memory_cache_mb` | `96` | Decoded pixmaps kept in memory |
+
+To use **↑ / ↓** for previous/next file, add this to the settings file (or
+change the existing `[keyboard]` section), then restart the service:
+
+```ini
+[keyboard]
+navigation_keys = up-down
+```
+
+Scroll with the mouse wheel, touchpad, or **Page Up / Page Down** in this
+mode. Set `navigation_keys = left-right` to restore the original arrows
+and use Up/Down for scrolling. You can also try the setting with
+`QUICKVIEW_NAVIGATION_KEYS=up-down` when launching the daemon.
 
 Each has a matching `QUICKVIEW_*` environment variable (`QUICKVIEW_CODE_STYLE`,
 `QUICKVIEW_BOOK_THEME`, `QUICKVIEW_PDF_MAX_PAGES`, …) that wins over the file,
