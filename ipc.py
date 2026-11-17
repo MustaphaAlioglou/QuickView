@@ -25,6 +25,27 @@ safe side of the wire. The C client never looks at the bytes it forwards.
 
 import os
 
+_SCHEME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-"
+)
+
+
+def is_remote_url(raw: str) -> bool:
+    """True for a URL the daemon must map through KIO (smb://, sftp://…).
+
+    Such a URL has to reach the daemon intact: abspath() would otherwise
+    glue it onto the cwd and produce a path that cannot exist ("File not
+    found"). Checked by hand rather than with re, which would add its
+    import time to client.py's fast path.
+    """
+    scheme, sep, _ = raw.partition("://")
+    return (
+        bool(sep)
+        and scheme[:1].isascii() and scheme[:1].isalpha()
+        and all(c in _SCHEME_CHARS for c in scheme)
+        and scheme.lower() != "file"
+    )
+
 
 def socket_path() -> str:
     # XDG_RUNTIME_DIR is stable for the whole session; TMPDIR is not (it
@@ -62,6 +83,8 @@ def normalize_arg(raw: str, cwd: str = "") -> str:
     # The daemon's toggle compares paths by string, so every entry point
     # must decode a file:// URL and absolutize a path identically — which
     # is why this is the only copy of the rule.
+    if is_remote_url(raw):
+        return raw  # resolved to a local path by the daemon, via kio-fuse
     if raw.startswith("file://"):
         # Imported here, not at module scope: client.py's fast path only
         # needs socket_path() and encode_request(), and urllib.parse costs
