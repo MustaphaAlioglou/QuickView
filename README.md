@@ -163,7 +163,11 @@ panel_theme = breeze   # or the default, quicklook
 Breeze takes every colour from the running `QPalette`, which under Plasma is
 your own colour scheme — so it follows a light theme, a dark one and your
 accent colour without being configured further, and it re-reads that palette
-when you change schemes rather than waiting for a restart. It also squares
+when you change schemes rather than waiting for a restart. QuickView also
+reads and watches `kdeglobals` directly, so this works outside Plasma (such
+as Hyprland) and when the KDE Qt platform plugin is unavailable. Open
+preview controls repaint without resetting the document or scroll position.
+It also squares
 the corners off and moves the close button to the right, where a Plasma
 window decoration puts it.
 
@@ -535,6 +539,15 @@ your `PATH`, and enables the background daemon as a systemd user service.
 
 Then bind Space in Dolphin (one-time):
 **Menu → Configure → Configure Keyboard Shortcuts… → search "Quick Look" → Custom → Space**
+
+If Space stops working in an existing Dolphin window after a colour-scheme
+change, try **right-click → Quick Look**. Dolphin can lose service-menu
+shortcut bindings when it reloads configuration; opening a new Dolphin
+window restores them. This is tracked upstream as
+[KDE bug 525749](https://bugs.kde.org/show_bug.cgi?id=525749).
+The QuickView daemon cannot restore a shortcut inside Dolphin; the upstream
+fix preserves bindings when Dolphin refreshes its service-menu actions.
+
 
 ## How it works
 

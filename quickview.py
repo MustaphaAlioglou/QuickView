@@ -55,7 +55,8 @@ from renderers import (
 
 from PySide6.QtCore import (
     Qt, QUrl, QEvent, QPoint, QRect, QSize, QObject, QSocketNotifier,
-    QThreadPool, QTimer, QFileInfo, QMimeDatabase, QStandardPaths, Signal,
+    QThreadPool, QTimer, QFileInfo, QFileSystemWatcher, QMimeDatabase,
+    QStandardPaths, Signal,
 )
 from PySide6.QtGui import (
     QAction, QFont, QGuiApplication, QIcon, QImage, QKeySequence, QRegion,
@@ -1289,7 +1290,10 @@ class QuickView(QWidget):
         # which is what "breeze" follows — so this has to happen after the
         # application exists, not at import time with the rest of SETTINGS.
         self.theme_name = SETTINGS["panel_theme"]
-        self.theme = theme.load(self.theme_name, QApplication.palette())
+        palette = QApplication.palette()
+        if self.theme_name == "breeze":
+            palette = theme.desktop_palette(palette)
+        self.theme = theme.load(self.theme_name, palette)
         self.mime_db = QMimeDatabase()
         self.icon_provider = QFileIconProvider()
         self.current_path = None
@@ -1386,6 +1390,64 @@ class QuickView(QWidget):
             QKeySequence(Qt.CTRL | Qt.Key_Q), self,
             activated=QApplication.instance().quit,
         )
+        if self.theme_name == "breeze":
+            self._watch_colour_scheme()
+
+    def _watch_colour_scheme(self):
+        # Watch the directory too: KDE commonly replaces kdeglobals with a
+        # rename, which removes a watch on the old file's inode.
+        self._scheme_path = theme.kdeglobals_path()
+        self._scheme_watcher = QFileSystemWatcher(self)
+        self._scheme_timer = QTimer(self)
+        self._scheme_timer.setSingleShot(True)
+        self._scheme_timer.setInterval(100)
+        self._scheme_timer.timeout.connect(self._refresh_theme)
+        self._scheme_watcher.fileChanged.connect(self._schedule_theme_refresh)
+        self._scheme_watcher.directoryChanged.connect(self._schedule_theme_refresh)
+        self._refresh_theme()
+
+    def _schedule_theme_refresh(self, _path):
+        self._scheme_timer.start()
+
+    def _set_theme_style(self, widget, template):
+        # Retain the template on the widget so open previews can be repainted
+        # without replacing content or losing the selection/scroll position.
+        widget.setProperty("quickviewThemeStyle", template.template)
+        widget.setStyleSheet(template.substitute(self.theme))
+
+    def _refresh_theme(self):
+        if self.theme_name != "breeze":
+            return
+        watcher = getattr(self, "_scheme_watcher", None)
+        if watcher is not None:
+            for path in (os.path.dirname(self._scheme_path), self._scheme_path):
+                watched = watcher.files() + watcher.directories()
+                if os.path.exists(path) and path not in watched:
+                    watcher.addPath(path)
+        values = theme.load("breeze", theme.desktop_palette(QApplication.palette()))
+        if values == self.theme:
+            return
+        self.theme = values
+        self.setStyleSheet(PANEL_STYLE.substitute(values))
+        for widget in self.findChildren(QWidget):
+            template = widget.property("quickviewThemeStyle")
+            if template:
+                widget.setStyleSheet(Template(template).substitute(values))
+        if self._toc_sidebar is not None:
+            tree = self._toc_sidebar.findChild(QTreeWidget)
+            if tree is not None:
+                def repaint_numbers(item):
+                    item.setForeground(1, QColor(values["text_muted"]))
+                    for i in range(item.childCount()):
+                        repaint_numbers(item.child(i))
+                repaint_numbers(tree.invisibleRootItem())
+        for table in self.findChildren(QTableWidget):
+            if table.property("quickviewHeaderRow"):
+                for col in range(table.columnCount()):
+                    item = table.item(0, col)
+                    if item is not None:
+                        item.setForeground(QColor(values["text_bright"]))
+                        item.setBackground(QColor(values["surface_head"]))
 
     def dismiss(self, reason: str = "request"):
         """Hide the preview but keep the process resident for instant reuse."""
@@ -1402,25 +1464,10 @@ class QuickView(QWidget):
         self.dismiss("window closed")
 
     def event(self, event):
-        # Handled here rather than in changeEvent() because changeEvent()
-        # never sees it: QWidget.event() consumes ApplicationPaletteChange
-        # itself and passes on only the widget-level PaletteChange, which
-        # also arrives mid-__init__ and on every stylesheet re-polish.
-        #
-        # The daemon outlives any number of colour-scheme changes: there is
-        # one QuickView for its whole lifetime, so a theme resolved once in
-        # __init__ would keep the scheme that happened to be set at login.
-        # Only breeze reads the palette, so only breeze has to be redone.
         if (event.type() == QEvent.ApplicationPaletteChange
-                and getattr(self, "theme_name", None) == "breeze"):
-            self.theme = theme.load("breeze", QApplication.palette())
-            # The panel only. Content widgets carry stylesheets built when
-            # the preview was made, and the sole way to recolour those is to
-            # re-render, which would lose the scroll position, the PDF page,
-            # the EPUB chapter. A preview lasts seconds and nobody reaches
-            # System Settings past it — the next one is built from the new
-            # palette anyway.
-            self.setStyleSheet(PANEL_STYLE.substitute(self.theme))
+                and getattr(self, "theme_name", None) == "breeze"
+                and hasattr(self, "content")):
+            self._refresh_theme()
         return super().event(event)
 
     # ---------------------------------------------------------------- helpers
@@ -1653,6 +1700,7 @@ class QuickView(QWidget):
         self.titlebar.title.setText(text)
 
     def show_files(self, paths, index: int = 0):
+        self._refresh_theme()
         self.selection = [
             p if ipc.is_remote_url(p) else os.path.abspath(p)
             for p in resolve_remote_urls(paths)
@@ -2144,7 +2192,7 @@ class QuickView(QWidget):
             label = QLabel()
             label.setFixedSize(w, h)
             # An unfilled page, before its render arrives.
-            label.setStyleSheet(f"background: {self.theme['surface_alt']};")
+            self._set_theme_style(label, Template("background: $surface_alt;"))
             lay.addWidget(label, 0, Qt.AlignHCenter)
             self._pdf_labels.append(label)
             overlay = MatchOverlay(label)
@@ -2154,7 +2202,7 @@ class QuickView(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet(f"background: {self.theme['bg']};")
+        self._set_theme_style(scroll, Template("background: $bg;"))
         scroll.setWidget(col)
         # Wrapper so the find row can sit above the pages and scroll with
         # neither of them, and the contents sidebar beside both.
@@ -2462,7 +2510,7 @@ class QuickView(QWidget):
         tree.itemActivated.connect(self._toc_clicked)
 
         panel = QWidget()
-        panel.setStyleSheet(self.TOC_STYLE.substitute(self.theme))
+        self._set_theme_style(panel, self.TOC_STYLE)
         panel.setFixedWidth(TOC_WIDTH)
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -2547,11 +2595,11 @@ class QuickView(QWidget):
         row.setSpacing(8)
         self._find_input = QLineEdit()
         self._find_input.setPlaceholderText("Find in document…")
-        self._find_input.setStyleSheet(
-            "QLineEdit {{ background:{surface_alt}; color:{text};"
-            " border:1px solid {input_border}; border-radius:{radius_btn};"
-            " padding:5px 8px; }}".format(**self.theme)
-        )
+        self._set_theme_style(self._find_input, Template(
+            "QLineEdit { background:$surface_alt; color:$text;"
+            " border:1px solid $input_border; border-radius:$radius_btn;"
+            " padding:5px 8px; }"
+        ))
         # The nav shortcuts are single keys and outrank this field's own key
         # events, so they are off precisely while it holds focus.
         self._find_input.focusInEvent = self._wrap_focus(
@@ -2565,7 +2613,7 @@ class QuickView(QWidget):
             self._find_input.keyPressEvent
         )
         self._find_label = QLabel("")
-        self._find_label.setStyleSheet(f"color:{self.theme['text_faint']};")
+        self._set_theme_style(self._find_label, Template("color:$text_faint;"))
         prev_btn = QPushButton("‹")
         next_btn = QPushButton("›")
         close_btn = QPushButton("✕")
@@ -2575,13 +2623,12 @@ class QuickView(QWidget):
             (close_btn, self.close_find),
         ):
             b.setFixedWidth(28)
-            b.setStyleSheet(
-                "QPushButton {{ background:{surface_alt}; color:{text};"
-                " border:1px solid {input_border};"
-                " border-radius:{radius_btn}; padding:4px; }}"
-                "QPushButton:hover {{ background:{input_hover}; }}"
-                .format(**self.theme)
-            )
+            self._set_theme_style(b, Template(
+                "QPushButton { background:$surface_alt; color:$text;"
+                " border:1px solid $input_border;"
+                " border-radius:$radius_btn; padding:4px; }"
+                "QPushButton:hover { background:$input_hover; }"
+            ))
             b.setFocusPolicy(Qt.NoFocus)  # never steal focus from the field
             b.clicked.connect(fn)
         row.addWidget(self._find_input, 1)
@@ -3623,13 +3670,13 @@ class QuickView(QWidget):
         lay = QVBoxLayout(wrap)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-        wrap.setStyleSheet(self.SHEET_STYLE.substitute(self.theme))
+        self._set_theme_style(wrap, self.SHEET_STYLE)
 
         status = QLabel()
-        status.setStyleSheet(
-            "color:{text_status}; font-size:11px; padding:5px 12px;"
-            "background-color:{bg};".format(**self.theme)
-        )
+        self._set_theme_style(status, Template(
+            "color:$text_status; font-size:11px; padding:5px 12px;"
+            "background-color:$bg;"
+        ))
 
         widths = []
         if len(sheets) == 1:
@@ -3706,6 +3753,7 @@ class QuickView(QWidget):
         table.verticalHeader().setDefaultSectionSize(24)
 
         header_row = self._looks_like_header(rows)
+        table.setProperty("quickviewHeaderRow", header_row)
         bold = QFont()
         bold.setBold(True)
         for r, row in enumerate(rows):

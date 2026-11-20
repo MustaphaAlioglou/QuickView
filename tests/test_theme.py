@@ -17,6 +17,8 @@ the failure a test should catch instead.
 
 import os
 import sys
+import tempfile
+from unittest.mock import patch
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -122,7 +124,14 @@ class BuildsWindows:
     TestCase: subclassing a TestCase to reach a helper re-runs every test
     it declares."""
 
-    def build(self, name):
+    def build(self, name, scheme_path=None):
+        if scheme_path is None:
+            directory = tempfile.TemporaryDirectory()
+            self.addCleanup(directory.cleanup)
+            scheme_path = os.path.join(directory.name, "kdeglobals")
+        mock_path = patch.object(theme, "kdeglobals_path", return_value=scheme_path)
+        mock_path.start()
+        self.addCleanup(mock_path.stop)
         original = quickview.SETTINGS["panel_theme"]
         quickview.SETTINGS["panel_theme"] = name
         try:
@@ -195,6 +204,85 @@ class ASchemeChange(BuildsWindows, unittest.TestCase):
         before = dict(window.theme)
         self.send_palette_change(window, self.dark_palette())
         self.assertEqual(window.theme, before)
+
+
+class SavedDesktopScheme(BuildsWindows, unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = os.path.join(self.directory.name, "kdeglobals")
+
+    def write_scheme(self, dark, atomic=False):
+        path = self.path + ".new" if atomic else self.path
+        bg, text = ("32,35,38", "252,252,252") if dark else ("239,240,241", "35,38,41")
+        with open(path, "w") as out:
+            out.write(f"[Colors:Window]\nBackgroundNormal={bg}\nForegroundNormal={text}\n"
+                      f"ForegroundInactive=127,128,129\n"
+                      f"[Colors:View]\nBackgroundNormal={bg}\nForegroundNormal={text}\n"
+                      f"[Colors:Button]\nBackgroundNormal={bg}\nForegroundNormal={text}\n")
+        if atomic:
+            os.replace(path, self.path)
+
+    def wait_for_background(self, window, expected):
+        from PySide6.QtTest import QTest
+        for _ in range(100):
+            QTest.qWait(20)
+            if window.theme["bg"] == expected:
+                return
+        self.assertEqual(window.theme["bg"], expected)
+
+    def test_starts_with_saved_dark_colours_even_with_a_light_qt_palette(self):
+        self.write_scheme(True)
+        window = self.build("breeze", self.path)
+        self.assertEqual(window.theme["bg"], "#202326")
+        self.assertEqual(window.theme["text"], "#fcfcfc")
+
+    def test_watches_repeated_atomic_replacements_while_hidden(self):
+        self.write_scheme(True)
+        window = self.build("breeze", self.path)
+        for dark, expected in ((False, "#eff0f1"), (True, "#202326"), (False, "#eff0f1")):
+            self.write_scheme(dark, atomic=True)
+            self.wait_for_background(window, expected)
+        self.assertFalse(window.isVisible())
+
+    def test_recolours_open_content_without_rebuilding_it(self):
+        self.write_scheme(True)
+        window = self.build("breeze", self.path)
+        bar = window._build_find_bar()
+        window.content.addWidget(bar)
+        window._find_input.setText("keep this query")
+        window._show_sheets_widget(
+            [{"rows": [["Name", "Count"], ["Example", "12"]], "cols": 2}], False
+        )
+        table = window.findChild(quickview.QTableWidget)
+        table.setCurrentCell(1, 1)
+        self.write_scheme(False, atomic=True)
+        self.wait_for_background(window, "#eff0f1")
+        self.assertEqual(window._find_input.text(), "keep this query")
+        self.assertIn("#232629", window._find_input.styleSheet())
+        self.assertEqual(table.currentRow(), 1)
+        self.assertEqual(table.currentColumn(), 1)
+        self.assertEqual(table.item(0, 0).foreground().color().name(), "#232629")
+
+    def test_missing_or_malformed_file_keeps_qt_colours(self):
+        palette = QApplication.palette()
+        self.assertEqual(theme.desktop_palette(palette, self.path), palette)
+        with open(self.path, "w") as out:
+            out.write("not an ini file")
+        self.assertEqual(theme.desktop_palette(palette, self.path), palette)
+
+    def test_bad_colour_keeps_the_corresponding_qt_role(self):
+        with open(self.path, "w") as out:
+            out.write("[Colors:Window]\nBackgroundNormal=999,0,0\nForegroundNormal=1,2,3\n")
+        palette = QApplication.palette()
+        result = theme.desktop_palette(palette, self.path)
+        self.assertEqual(result.color(QPalette.Window), palette.color(QPalette.Window))
+        self.assertEqual(result.color(QPalette.WindowText).name(), "#010203")
+
+    def test_fixed_quicklook_still_ignores_saved_colours(self):
+        self.write_scheme(False)
+        window = self.build("quicklook", self.path)
+        self.assertEqual(window.theme, theme.QUICKLOOK)
 
 
 if __name__ == "__main__":
