@@ -63,6 +63,18 @@ class RoundTrip(unittest.TestCase):
     def test_a_message_with_no_arguments(self):
         self.assertEqual(ipc.decode_request(b"/tmp"), [])
 
+    def test_remote_url_passes_through(self):
+        # Gluing smb://… onto the cwd made a path that cannot exist, which
+        # is the "File not found" network shares used to get. The daemon
+        # maps it through kio-fuse instead.
+        url = "smb://nas/share/a%20b.pdf"
+        self.assertEqual(self.rt("/tmp", [url]), [url])
+        self.assertTrue(ipc.is_remote_url(url))
+
+    def test_file_url_and_plain_paths_are_not_remote(self):
+        for raw in ("file:///tmp/a", "/tmp/a", "a:b", "notes"):
+            self.assertFalse(ipc.is_remote_url(raw), raw)
+
     def test_normalize_is_idempotent(self):
         # quickview.py forwards already-normalized paths through the same
         # request format, so re-normalizing must be a no-op.

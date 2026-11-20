@@ -1620,7 +1620,11 @@ class QuickView(QWidget):
 
     def open_externally(self):
         if self.current_path:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(self.current_path))
+            path = self.current_path
+            QDesktopServices.openUrl(
+                QUrl(path) if ipc.is_remote_url(path)
+                else QUrl.fromLocalFile(path)
+            )
             self.dismiss("opened externally")
 
     def step_sibling(self, delta: int):
@@ -1655,12 +1659,17 @@ class QuickView(QWidget):
         self.titlebar.title.setText(text)
 
     def show_files(self, paths, index: int = 0):
-        self.selection = [os.path.abspath(p) for p in paths]
+        self.selection = [
+            p if ipc.is_remote_url(p) else os.path.abspath(p)
+            for p in resolve_remote_urls(paths)
+        ]
         self.sel_index = max(0, min(index, len(self.selection) - 1))
         self.show_file(self.selection[self.sel_index])
 
     def show_file(self, path: str):
-        path = os.path.abspath(path)
+        remote = ipc.is_remote_url(path)
+        if not remote:
+            path = os.path.abspath(path)
         self.current_path = path
         self.clear_content()
         log.info("preview: %s", path)
@@ -1670,7 +1679,14 @@ class QuickView(QWidget):
         self.titlebar.mode_btn.setVisible(False)  # show_html() re-enables
         self.titlebar.toc_btn.setVisible(False)   # _set_toc() re-enables
 
-        if not os.path.exists(path):
+        if remote:
+            # Only reached when kio-fuse is missing or could not mount it;
+            # the log has kio-fuse's own reason.
+            self.show_message(
+                f"Cannot open a network location:\n{path}\n\n"
+                "The share may be unreachable, or kio-fuse is not installed."
+            )
+        elif not os.path.exists(path):
             self.show_message(f"File not found:\n{path}")
         elif os.path.isdir(path):
             self.show_folder(path)
@@ -3809,6 +3825,39 @@ def valid_workbook(book) -> bool:
     return True
 
 
+def resolve_remote_urls(paths: list) -> list:
+    """Map smb://, sftp://… URLs to local paths through kio-fuse.
+
+    The service menu asks KIO for local files (%F), so Dolphin normally
+    does this itself; this covers a stale service menu from an older
+    install and `quickview smb://…` from a terminal. A URL kio-fuse cannot
+    mount is left as is, and show_file() explains why it cannot open.
+    """
+    if not any(ipc.is_remote_url(p) for p in paths):
+        return paths
+    from PySide6.QtDBus import QDBusConnection, QDBusInterface
+
+    vfs = QDBusInterface(
+        "org.kde.KIOFuse", "/org/kde/KIOFuse", "org.kde.KIOFuse.VFS",
+        QDBusConnection.sessionBus(),
+    )
+    # The call blocks the UI, and a host that drops packets would otherwise
+    # hold it for D-Bus's 25 s default.
+    vfs.setTimeout(10000)
+    out = []
+    for p in paths:
+        if ipc.is_remote_url(p) and vfs.isValid():
+            reply = vfs.call("mountUrl", p)
+            args = reply.arguments()
+            if args and isinstance(args[0], str) and args[0].startswith("/"):
+                p = args[0]
+            else:
+                log.warning("kio-fuse could not mount %s: %s",
+                            p, reply.errorMessage())
+        out.append(p)
+    return out
+
+
 def connect_to_daemon() -> QLocalSocket | None:
     sock = QLocalSocket()
     sock.connectToServer(SOCKET_PATH)
@@ -3937,7 +3986,7 @@ def main():
         def on_done():
             buf.extend(bytes(conn.readAll()))
             conn.deleteLater()
-            new_paths = ipc.decode_request(bytes(buf))
+            new_paths = resolve_remote_urls(ipc.decode_request(bytes(buf)))
             if not new_paths:
                 return
             if (
