@@ -39,6 +39,8 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "quickview.conf")
 # The bounds are there so a typo degrades to something usable instead of a
 # daemon that will not start or a cache that eats the disk.
 _SETTINGS = {
+    "navigation_keys": ("keyboard", str, "left-right",
+                        "QUICKVIEW_NAVIGATION_KEYS", None, None),
     "code_style": ("preview", str, "one-dark", "QUICKVIEW_CODE_STYLE",
                    None, None),
     "book_theme": ("preview", str, "paper", "QUICKVIEW_BOOK_THEME",
@@ -94,6 +96,11 @@ pdf_max_pages = 50
 #                show the file's details only.
 office_engine = libreoffice
 
+[keyboard]
+# Arrow keys for previous / next file: left-right or up-down.
+# With up-down, scroll using the wheel, touchpad or Page Up / Page Down.
+navigation_keys = left-right
+
 [appearance]
 # How the panel itself is painted.
 #
@@ -138,6 +145,7 @@ memory_cache_mb = 96
 # The palettes themselves live in renderers.BOOK_THEMES, which runs in the
 # jail — this is the list a person may type, and a test keeps the two equal.
 _CHOICES = {
+    "navigation_keys": ("left-right", "up-down"),
     "book_theme": ("paper", "sepia", "dark", "gruvbox-dark", "gruvbox-light"),
     # The panel's own colours. Same reasoning as book_theme: a typo here
     # would otherwise leave the window with no palette at all.
