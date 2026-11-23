@@ -163,12 +163,14 @@ panel_theme = breeze   # or the default, quicklook
 Breeze takes every colour from the running `QPalette`, which under Plasma is
 your own colour scheme — so it follows a light theme, a dark one and your
 accent colour without being configured further, and it re-reads that palette
-when you change schemes rather than waiting for a restart. QuickView also
-reads and watches `kdeglobals` directly, so this works outside Plasma (such
-as Hyprland) and when the KDE Qt platform plugin is unavailable. Open
-preview controls repaint without resetting the document or scroll position.
-It also squares
-the corners off and moves the close button to the right, where a Plasma
+when you change schemes rather than waiting for a restart. An application
+style such as Kvantum, or a theme tool such as qt6ct, is followed the same
+way, so QuickView matches your other apps. When Qt has no desktop theme
+plugin to ask (outside Plasma, such as Hyprland, or with a PySide6 that lacks
+the KDE plugin), QuickView reads and watches `kdeglobals` itself instead.
+Open preview controls repaint without resetting the document or scroll
+position. It also squares the corners off and moves the close button to the
+right, where a Plasma
 window decoration puts it.
 
 ![The breeze panel theme on a dark Plasma colour scheme, with a PDF's contents sidebar open](docs/screenshots/breeze.png)

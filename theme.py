@@ -200,18 +200,50 @@ def load(name: str, palette=None) -> dict:
 def kdeglobals_path():
     import os
 
+    # `or`, not a get() default: an empty XDG_CONFIG_HOME means unset, and
+    # joining onto "" would look for kdeglobals in the current directory.
     return os.path.join(
-        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
         "kdeglobals",
+    )
+
+
+# Platform theme plugins that hand Qt a palette of their own. The portal one
+# is left out: Qt loads it inside Flatpak and it reports only light or dark.
+_PALETTE_THEMES = ("KDEPlasmaPlatformTheme", "qt6ct", "qt5ct", "qgtk3")
+
+
+def qt_follows_desktop(maps=None):
+    """Whether Qt already took the palette from a desktop theme plugin.
+
+    Under Plasma the KDE plugin reads kdeglobals itself, and an application
+    style such as Kvantum then adjusts that palette; qt6ct or GTK supply
+    their own. Overlaying kdeglobals on any of them would paint QuickView
+    differently from every other app. Asked of the loaded libraries rather
+    than the environment, because a private PySide6 may not ship the plugin
+    the desktop asks for. Call it after the QApplication exists.
+    """
+    if maps is None:
+        try:
+            with open("/proc/self/maps", encoding="utf-8",
+                      errors="replace") as source:
+                maps = source.read()
+        except OSError:
+            return False
+    return any(
+        "/platformthemes/" in line
+        and any(name in line.rsplit("/", 1)[-1] for name in _PALETTE_THEMES)
+        for line in maps.splitlines()
     )
 
 
 def desktop_palette(fallback, path=None):
     """Read KDE's saved colours when Qt's platform plugin is unavailable.
 
-    This also works outside Plasma and with a private PySide6 installation,
-    where the KDE platform plugin may not be loaded. Missing or invalid
-    entries retain Qt's palette instead of inventing a desktop scheme.
+    For when qt_follows_desktop() is false: outside Plasma, or a private
+    PySide6 installation without the KDE platform plugin. Missing or
+    invalid entries retain Qt's palette instead of inventing a desktop
+    scheme.
     """
     import configparser
     from PySide6.QtGui import QColor, QPalette
@@ -249,15 +281,32 @@ def desktop_palette(fallback, path=None):
             return None
         return QColor(*channels)
 
+    # Active and Inactive only. setColor(role, colour) would also overwrite
+    # the Disabled group, and breeze() reads its faint text from Disabled
+    # WindowText — a scheme without ForegroundInactive would lose the dimming.
+    group = QPalette.ColorGroup
+    normal = (group.Active, group.Inactive)
+
+    def put(target, value):
+        for g in normal:
+            palette.setColor(g, target, value)
+
     for section, key, target in entries:
         value = colour(section, key)
         if value is not None:
-            palette.setColor(target, value)
+            put(target, value)
+    window = palette.color(role.Window)
+    text = palette.color(role.WindowText)
     muted = colour("Window", "ForegroundInactive")
+    if muted is None and colour("Window", "ForegroundNormal") is not None:
+        # The fallback's own Disabled colour belongs to whatever scheme Qt
+        # had, likely the wrong brightness; dim the text that is shown.
+        muted = _mix(text, window, 0.45)
     if muted is not None:
-        palette.setColor(QPalette.ColorGroup.Disabled, role.WindowText, muted)
-    # Mid is a derived Qt role rather than a key in KDE's colour sets.
+        palette.setColor(group.Disabled, role.WindowText, muted)
+    # Mid is a derived Qt role rather than a key in KDE's colour sets. Only
+    # reached without a desktop plugin, so Qt's Mid was derived from the
+    # fallback palette and does not match these colours.
     if colour("Window", "BackgroundNormal") is not None:
-        palette.setColor(role.Mid, _mix(palette.color(role.Window),
-                                        palette.color(role.WindowText), 0.25))
+        put(role.Mid, _mix(window, text, 0.25))
     return palette

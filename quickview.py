@@ -16,8 +16,8 @@ Usage: quickview <file> [file ...]
 Keys:
   Space / Esc / Q   close the preview
   Left / Right      previous / next file (the selection if several files
-                    were passed, otherwise siblings in the same folder)
-  Up / Down         previous / next file when navigation_keys = up-down
+                    were passed, otherwise siblings in the same folder);
+                    Up / Down instead when navigation_keys = up-down
   Enter             open the file in its default application
 
 A second invocation while a preview is open is forwarded to the running
@@ -1291,10 +1291,11 @@ class QuickView(QWidget):
         # which is what "breeze" follows — so this has to happen after the
         # application exists, not at import time with the rest of SETTINGS.
         self.theme_name = SETTINGS["panel_theme"]
-        palette = QApplication.palette()
-        if self.theme_name == "breeze":
-            palette = theme.desktop_palette(palette)
-        self.theme = theme.load(self.theme_name, palette)
+        # kdeglobals stands in for the desktop only when no platform theme
+        # gave Qt a palette; otherwise it would override Kvantum or qt6ct.
+        self._read_kdeglobals = (self.theme_name == "breeze"
+                                 and not theme.qt_follows_desktop())
+        self.theme = theme.load(self.theme_name, self._desktop_palette())
         self.mime_db = QMimeDatabase()
         self.icon_provider = QFileIconProvider()
         self.current_path = None
@@ -1396,8 +1397,17 @@ class QuickView(QWidget):
             QKeySequence(Qt.CTRL | Qt.Key_Q), self,
             activated=QApplication.instance().quit,
         )
-        if self.theme_name == "breeze":
+        # With a desktop plugin, a scheme change reaches the window as an
+        # ApplicationPaletteChange (see event()); only kdeglobals needs a watch.
+        self._scheme_watcher = None
+        if self._read_kdeglobals:
             self._watch_colour_scheme()
+
+    def _desktop_palette(self):
+        palette = QApplication.palette()
+        if self._read_kdeglobals:
+            palette = theme.desktop_palette(palette)
+        return palette
 
     def _watch_colour_scheme(self):
         # Watch the directory too: KDE commonly replaces kdeglobals with a
@@ -1410,11 +1420,24 @@ class QuickView(QWidget):
         self._scheme_timer.timeout.connect(self._scheme_file_settled)
         self._scheme_watcher.fileChanged.connect(self._schedule_theme_refresh)
         self._scheme_watcher.directoryChanged.connect(self._schedule_theme_refresh)
+        self._watch_scheme_paths()
         self._scheme_sig = self._scheme_stat()
         self._refresh_theme()
 
+    def _watch_scheme_paths(self):
+        # Re-added after kdeglobals is replaced, since the watch went with
+        # the old file. Called only when the file moved, not per preview, so
+        # a watch the system refuses is not retried on every Space.
+        watched = self._scheme_watcher.files() + self._scheme_watcher.directories()
+        for path in (os.path.dirname(self._scheme_path), self._scheme_path):
+            if os.path.exists(path) and path not in watched:
+                self._scheme_watcher.addPath(path)
+
     def _schedule_theme_refresh(self, _path):
-        self._scheme_timer.start()
+        # Not restarted while pending: another app saving in ~/.config more
+        # often than every 100 ms would otherwise hold the refresh off.
+        if not self._scheme_timer.isActive():
+            self._scheme_timer.start()
 
     def _scheme_stat(self):
         try:
@@ -1432,6 +1455,7 @@ class QuickView(QWidget):
         if sig == self._scheme_sig:
             return
         self._scheme_sig = sig
+        self._watch_scheme_paths()
         self._refresh_theme()
 
     def _set_theme_style(self, widget, template):
@@ -1443,13 +1467,7 @@ class QuickView(QWidget):
     def _refresh_theme(self):
         if self.theme_name != "breeze":
             return
-        watcher = getattr(self, "_scheme_watcher", None)
-        if watcher is not None:
-            for path in (os.path.dirname(self._scheme_path), self._scheme_path):
-                watched = watcher.files() + watcher.directories()
-                if os.path.exists(path) and path not in watched:
-                    watcher.addPath(path)
-        values = theme.load("breeze", theme.desktop_palette(QApplication.palette()))
+        values = theme.load("breeze", self._desktop_palette())
         if values == self.theme:
             return
         self.theme = values
@@ -1725,7 +1743,11 @@ class QuickView(QWidget):
         self.titlebar.title.setText(text)
 
     def show_files(self, paths, index: int = 0):
-        self._refresh_theme()
+        # A stat, not a parse: catches a scheme change the watch missed
+        # without reading kdeglobals on every file switch. A desktop plugin
+        # delivers its changes as events and needs nothing here.
+        if self._scheme_watcher is not None:
+            self._scheme_file_settled()
         self.selection = [
             p if ipc.is_remote_url(p) else os.path.abspath(p)
             for p in resolve_remote_urls(paths)
@@ -2819,6 +2841,9 @@ class QuickView(QWidget):
             if overlay is not None:
                 overlay.setGeometry(0, 0, size.width(), size.height())
         label.setPixmap(QPixmap.fromImage(img))
+        # The placeholder's template goes too, or the next scheme change
+        # would paint the grey back behind a rendered page.
+        label.setProperty("quickviewThemeStyle", None)
         label.setStyleSheet("")
 
     def _pdf_show_cached(

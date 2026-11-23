@@ -124,14 +124,18 @@ class BuildsWindows:
     TestCase: subclassing a TestCase to reach a helper re-runs every test
     it declares."""
 
-    def build(self, name, scheme_path=None):
+    def build(self, name, scheme_path=None, follows_desktop=False):
         if scheme_path is None:
             directory = tempfile.TemporaryDirectory()
             self.addCleanup(directory.cleanup)
             scheme_path = os.path.join(directory.name, "kdeglobals")
-        mock_path = patch.object(theme, "kdeglobals_path", return_value=scheme_path)
-        mock_path.start()
-        self.addCleanup(mock_path.stop)
+        # Pinned, not detected: on a Plasma machine the answer would depend
+        # on which Qt plugins the test run happened to load.
+        for target, value in (("kdeglobals_path", scheme_path),
+                              ("qt_follows_desktop", follows_desktop)):
+            mock = patch.object(theme, target, return_value=value)
+            mock.start()
+            self.addCleanup(mock.stop)
         original = quickview.SETTINGS["panel_theme"]
         quickview.SETTINGS["panel_theme"] = name
         try:
@@ -301,6 +305,53 @@ class SavedDesktopScheme(BuildsWindows, unittest.TestCase):
         self.write_scheme(False)
         window = self.build("quicklook", self.path)
         self.assertEqual(window.theme, theme.QUICKLOOK)
+
+    def test_a_desktop_plugin_wins_over_saved_colours(self):
+        # Under Plasma with Kvantum, Qt's palette is the one every other app
+        # shows; kdeglobals must not be laid over it, nor watched.
+        self.write_scheme(True)
+        window = self.build("breeze", self.path, follows_desktop=True)
+        self.assertEqual(window.theme,
+                         theme.load("breeze", QApplication.palette()))
+        self.assertIsNone(window._scheme_watcher)
+
+    def test_faint_text_stays_dimmer_than_text(self):
+        for inactive in (True, False):
+            with self.subTest(foreground_inactive=inactive):
+                with open(self.path, "w") as out:
+                    out.write("[Colors:Window]\nBackgroundNormal=32,35,38\n"
+                              "ForegroundNormal=252,252,252\n")
+                    if inactive:
+                        out.write("ForegroundInactive=127,128,129\n")
+                values = theme.load("breeze", theme.desktop_palette(
+                    QApplication.palette(), self.path))
+                self.assertEqual(values["text"], "#fcfcfc")
+                self.assertNotEqual(values["text_faint"], values["text"])
+                if inactive:
+                    self.assertEqual(values["text_faint"], "#7f8081")
+
+
+class FindingTheDesktop(unittest.TestCase):
+    def maps(self, *names):
+        return "".join(
+            f"7f00-7f10 r-xp 0 00:00 1 /usr/lib/qt6/plugins/platformthemes/{n}\n"
+            for n in names
+        ) + "7f20-7f30 r-xp 0 00:00 2 /usr/lib/libQt6Core.so.6\n"
+
+    def test_a_palette_plugin_counts(self):
+        for plugin in ("KDEPlasmaPlatformTheme6.so", "libqt6ct.so", "libqgtk3.so"):
+            with self.subTest(plugin=plugin):
+                self.assertTrue(theme.qt_follows_desktop(self.maps(plugin)))
+
+    def test_no_plugin_or_only_the_portal_does_not(self):
+        self.assertFalse(theme.qt_follows_desktop(self.maps()))
+        self.assertFalse(theme.qt_follows_desktop(
+            self.maps("libqxdgdesktopportal.so")))
+
+    def test_an_empty_xdg_config_home_means_the_default(self):
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": ""}):
+            self.assertEqual(theme.kdeglobals_path(),
+                             os.path.expanduser("~/.config/kdeglobals"))
 
 
 if __name__ == "__main__":
