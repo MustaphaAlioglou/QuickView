@@ -195,3 +195,69 @@ def load(name: str, palette=None) -> dict:
     if name == "breeze" and palette is not None:
         return breeze(palette)
     return dict(QUICKLOOK)
+
+
+def kdeglobals_path():
+    import os
+
+    return os.path.join(
+        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+        "kdeglobals",
+    )
+
+
+def desktop_palette(fallback, path=None):
+    """Read KDE's saved colours when Qt's platform plugin is unavailable.
+
+    This also works outside Plasma and with a private PySide6 installation,
+    where the KDE platform plugin may not be loaded. Missing or invalid
+    entries retain Qt's palette instead of inventing a desktop scheme.
+    """
+    import configparser
+    from PySide6.QtGui import QColor, QPalette
+
+    settings = configparser.ConfigParser(interpolation=None, strict=False)
+    try:
+        with open(path or kdeglobals_path(), encoding="utf-8") as source:
+            settings.read_file(source)
+    except (OSError, UnicodeError, configparser.Error):
+        return QPalette(fallback)
+
+    palette = QPalette(fallback)
+    role = QPalette.ColorRole
+    entries = (
+        ("Window", "BackgroundNormal", role.Window),
+        ("Window", "ForegroundNormal", role.WindowText),
+        ("View", "BackgroundNormal", role.Base),
+        ("View", "BackgroundAlternate", role.AlternateBase),
+        ("View", "ForegroundNormal", role.Text),
+        ("Button", "BackgroundNormal", role.Button),
+        ("Button", "ForegroundNormal", role.ButtonText),
+        ("Selection", "BackgroundNormal", role.Highlight),
+        ("Selection", "ForegroundNormal", role.HighlightedText),
+        ("Tooltip", "BackgroundNormal", role.ToolTipBase),
+        ("Tooltip", "ForegroundNormal", role.ToolTipText),
+    )
+
+    def colour(section, key):
+        value = settings.get("Colors:" + section, key, fallback="")
+        try:
+            channels = [int(part) for part in value.split(",")]
+        except ValueError:
+            return None
+        if len(channels) not in (3, 4) or any(c < 0 or c > 255 for c in channels):
+            return None
+        return QColor(*channels)
+
+    for section, key, target in entries:
+        value = colour(section, key)
+        if value is not None:
+            palette.setColor(target, value)
+    muted = colour("Window", "ForegroundInactive")
+    if muted is not None:
+        palette.setColor(QPalette.ColorGroup.Disabled, role.WindowText, muted)
+    # Mid is a derived Qt role rather than a key in KDE's colour sets.
+    if colour("Window", "BackgroundNormal") is not None:
+        palette.setColor(role.Mid, _mix(palette.color(role.Window),
+                                        palette.color(role.WindowText), 0.25))
+    return palette
