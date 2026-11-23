@@ -245,6 +245,24 @@ class SavedDesktopScheme(BuildsWindows, unittest.TestCase):
             self.wait_for_background(window, expected)
         self.assertFalse(window.isVisible())
 
+    def test_other_files_in_the_folder_do_not_reread_the_scheme(self):
+        from PySide6.QtTest import QTest
+        self.write_scheme(True)
+        window = self.build("breeze", self.path)
+        # Counted on this window alone: windows left by earlier tests watch
+        # temp folders that are being deleted, and those refresh too.
+        with patch.object(window, "_refresh_theme",
+                          wraps=window._refresh_theme) as read:
+            # Another app saving its settings the way KDE does.
+            other = os.path.join(self.directory.name, "otherrc")
+            with open(other + ".new", "w") as out:
+                out.write("[General]\nx=1\n")
+            os.replace(other + ".new", other)
+            QTest.qWait(400)
+            self.assertEqual(read.call_count, 0)
+            self.write_scheme(False, atomic=True)
+            self.wait_for_background(window, "#eff0f1")
+
     def test_recolours_open_content_without_rebuilding_it(self):
         self.write_scheme(True)
         window = self.build("breeze", self.path)

@@ -1407,13 +1407,32 @@ class QuickView(QWidget):
         self._scheme_timer = QTimer(self)
         self._scheme_timer.setSingleShot(True)
         self._scheme_timer.setInterval(100)
-        self._scheme_timer.timeout.connect(self._refresh_theme)
+        self._scheme_timer.timeout.connect(self._scheme_file_settled)
         self._scheme_watcher.fileChanged.connect(self._schedule_theme_refresh)
         self._scheme_watcher.directoryChanged.connect(self._schedule_theme_refresh)
+        self._scheme_sig = self._scheme_stat()
         self._refresh_theme()
 
     def _schedule_theme_refresh(self, _path):
         self._scheme_timer.start()
+
+    def _scheme_stat(self):
+        try:
+            st = os.stat(self._scheme_path)
+        except OSError:
+            return None
+        return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+    def _scheme_file_settled(self):
+        # The directory watch fires whenever any app saves its settings in
+        # ~/.config. Re-read kdeglobals only when it is the file that moved:
+        # a replacement changes the inode, an edit the mtime or size. Only
+        # this path checks; a palette change or a new preview still refreshes.
+        sig = self._scheme_stat()
+        if sig == self._scheme_sig:
+            return
+        self._scheme_sig = sig
+        self._refresh_theme()
 
     def _set_theme_style(self, widget, template):
         # Retain the template on the widget so open previews can be repainted

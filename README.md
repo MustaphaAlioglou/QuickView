@@ -554,14 +554,11 @@ your `PATH`, and enables the background daemon as a systemd user service.
 Then bind Space in Dolphin (one-time):
 **Menu → Configure → Configure Keyboard Shortcuts… → search "Quick Look" → Custom → Space**
 
-If Space stops working in an existing Dolphin window after a colour-scheme
-change, try **right-click → Quick Look**. Dolphin can lose service-menu
-shortcut bindings when it reloads configuration; opening a new Dolphin
-window restores them. This is tracked upstream as
-[KDE bug 525749](https://bugs.kde.org/show_bug.cgi?id=525749).
-The QuickView daemon cannot restore a shortcut inside Dolphin; the upstream
-fix preserves bindings when Dolphin refreshes its service-menu actions.
-
+If Space stops working in Dolphin, **right-click → Quick Look** still works.
+Dolphin can lose service-menu shortcuts after some of its settings change,
+for example the list under **Configure Dolphin → Context Menu**; restarting
+Dolphin brings them back. This is a Dolphin bug, not something QuickView can
+fix — see [KDE bug 525749](https://bugs.kde.org/show_bug.cgi?id=525749).
 
 ## How it works
 
