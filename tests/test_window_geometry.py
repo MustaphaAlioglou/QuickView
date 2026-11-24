@@ -17,7 +17,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QRect, QSize  # noqa: E402
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize  # noqa: E402
 from PySide6.QtGui import QColor, QPainter, QPixmap  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -215,6 +215,63 @@ class WindowGeometry(unittest.TestCase):
         first = window.panel.geometry()
         window.set_panel_size(500, 500)
         self.assertEqual(window.panel.geometry(), first)
+
+    def test_wayland_first_panel_paint_waits_for_final_output_placement(self):
+        from PySide6.QtTest import QTest
+
+        window = self.window
+        painted_sizes = []
+
+        class PaintObserver(QObject):
+            def eventFilter(self, watched, event):
+                if event.type() == QEvent.Paint:
+                    painted_sizes.append(window.size())
+                return False
+
+        observer = PaintObserver(window)
+        window.panel.installEventFilter(observer)
+        with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"):
+            window.show_file("/nonexistent/quickview-placement.txt")
+            QApplication.processEvents()
+            self.assertTrue(window.panel.isHidden())
+            self.assertEqual(painted_sizes, [])
+            portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+            window._schedule_overlay_fit(portrait)
+            QApplication.processEvents()
+            self.assertEqual(painted_sizes, [])
+            QTest.qWait(100)
+            self.assertTrue(window.panel.isVisible())
+            self.assertTrue(painted_sizes)
+            self.assertTrue(all(size == QSize(1080, 1920) for size in painted_sizes))
+            self.assert_panel_centred()
+            window.dismiss()
+
+    def test_dismiss_cancels_a_pending_reveal(self):
+        from PySide6.QtTest import QTest
+
+        window = self.window
+        with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"):
+            window.show_file("/nonexistent/quickview-placement.txt")
+            self.assertTrue(window._placement_pending)
+            window.dismiss()
+            QTest.qWait(100)
+            self.assertFalse(window.isVisible())
+            self.assertFalse(window._placement_pending)
+            self.assertFalse(window._panel_reveal_timer.isActive())
+
+    def test_navigation_in_an_open_preview_does_not_hide_the_panel(self):
+        from PySide6.QtTest import QTest
+
+        window = self.window
+        with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"):
+            window.show_file("/nonexistent/quickview-first.txt")
+            QTest.qWait(100)
+            self.assertTrue(window.panel.isVisible())
+            window.show_file("/nonexistent/quickview-next.txt")
+            self.assertTrue(window.panel.isVisible())
+            self.assertFalse(window._placement_pending)
+            self.assertFalse(window._panel_reveal_timer.isActive())
+            window.dismiss()
 
 class ImageFitsViewport(unittest.TestCase):
     def setUp(self):

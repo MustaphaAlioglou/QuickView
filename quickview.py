@@ -1376,6 +1376,13 @@ class QuickView(QWidget):
         self._overlay_fit_timer = QTimer(self)
         self._overlay_fit_timer.setSingleShot(True)
         self._overlay_fit_timer.timeout.connect(self._fit_after_screen_change)
+        self._placement_pending = False
+        self._panel_reveal_timer = QTimer(self)
+        self._panel_reveal_timer.setSingleShot(True)
+        # Allow output-enter/configure events to settle before the first
+        # visible panel. The transparent overlay can map during this time.
+        self._panel_reveal_timer.setInterval(50)
+        self._panel_reveal_timer.timeout.connect(self._reveal_panel)
 
         self.titlebar = TitleBar(self)
         self.content = QStackedLayout()
@@ -1525,6 +1532,9 @@ class QuickView(QWidget):
             log.debug("dismissed (%s)", reason)
         self.clear_content()
         self.hide()
+        self._panel_reveal_timer.stop()
+        self._placement_pending = False
+        self.panel.show()
         if QGuiApplication.platformName().startswith("wayland"):
             # Clear native output state between previews, keeping workers
             # and the decoded-image cache resident.
@@ -1607,7 +1617,35 @@ class QuickView(QWidget):
 
     def _schedule_overlay_fit(self, screen):
         self._overlay_screen = screen
+        self._begin_overlay_placement()
         self._overlay_fit_timer.start(0)
+
+    def _begin_overlay_placement(self):
+        if QGuiApplication.platformName().startswith("wayland"):
+            self._placement_pending = True
+            self._panel_reveal_timer.stop()
+            self.panel.hide()
+            self._apply_mask()
+
+    def _reveal_panel(self):
+        if not self._placement_pending or not self.isVisible():
+            return
+        handle = self.windowHandle()
+        if handle is None or not handle.isExposed():
+            return  # The next native expose event restarts the settle timer.
+        if self._overlay_fit_timer.isActive() or handle.size() != self.size():
+            self._panel_reveal_timer.start()
+            return
+        self._place_panel()
+        self._placement_pending = False
+        self.panel.show()
+        self._apply_mask()
+
+    def eventFilter(self, watched, event):
+        if (watched is self._overlay_handle and event.type() == QEvent.Expose
+                and self._placement_pending and watched.isExposed()):
+            self._panel_reveal_timer.start()
+        return super().eventFilter(watched, event)
 
     def _fit_after_screen_change(self):
         # Qt reports the output after mapping. Remap with the final size
@@ -1628,8 +1666,11 @@ class QuickView(QWidget):
         handle = self.windowHandle()
         if handle is not None and handle is not self._overlay_handle:
             handle.screenChanged.connect(self._schedule_overlay_fit)
+            handle.installEventFilter(self)
             self._overlay_handle = handle
         self.fit_overlay()
+        if self._placement_pending:
+            self._panel_reveal_timer.start()
 
     def _place_panel(self):
         """Lay the panel out inside the overlay: centred unless dragged."""
@@ -1667,6 +1708,11 @@ class QuickView(QWidget):
         handle = self.windowHandle()
         if handle is None:
             return  # not created yet; _place_panel runs again after show()
+        if self._placement_pending:
+            # Keep the transparent placement window from intercepting clicks.
+            # An empty QRegion would instead reset the native input mask.
+            handle.setMask(QRegion(QRect(-1, -1, 1, 1)))
+            return
         left, top, right, bottom = self._margins
         # QWindow.setMask(), not QWidget.setMask(): the widget one clips
         # painting as well as input, so shrinking it left the previous,
@@ -1715,6 +1761,8 @@ class QuickView(QWidget):
         # The overlay follows the screen (resolution change, another output).
         super().resizeEvent(event)
         self._place_panel()
+        if self._placement_pending:
+            self._panel_reveal_timer.start()
         log.debug(
             "overlay %dx%d, panel %dx%d at %d,%d",
             self.width(), self.height(), self.panel.width(),
@@ -1835,6 +1883,8 @@ class QuickView(QWidget):
         self.show_file(self.selection[self.sel_index])
 
     def show_file(self, path: str):
+        if not self.isVisible():
+            self._begin_overlay_placement()
         remote = ipc.is_remote_url(path)
         if not remote:
             path = os.path.abspath(path)
