@@ -1,0 +1,487 @@
+# QuickView — a Quick Look style file previewer for KDE Plasma.
+# Copyright (C) 2026 Mustapha Alioglou
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation, either version 3 of the License, or (at your
+# option) any later version. This program is distributed WITHOUT ANY
+# WARRANTY; see the LICENSE file, or <https://www.gnu.org/licenses/>.
+
+"""Panel placement on outputs with different sizes and desktop offsets."""
+
+import os
+import sys
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtCore import QElapsedTimer, QEvent, QObject, QPoint, QRect, QSize  # noqa: E402
+from PySide6.QtGui import QColor, QImage, QMovie, QPainter, QPixmap  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+_app = QApplication.instance() or QApplication([sys.argv[0]])
+
+import quickview  # noqa: E402
+import renderers  # noqa: E402
+
+
+class WindowGeometry(unittest.TestCase):
+    def setUp(self):
+        with patch.dict(quickview.SETTINGS, panel_theme="quicklook"):
+            self.window = quickview.QuickView()
+        self.addCleanup(self.window.deleteLater)
+
+    def wait_for(self, predicate):
+        from PySide6.QtTest import QTest
+
+        elapsed = QElapsedTimer()
+        elapsed.start()
+        while not predicate() and elapsed.elapsed() < 1000:
+            QTest.qWait(5)
+        self.assertTrue(predicate())
+
+    def confirm_output(self, screen):
+        """Model a delayed output notification followed by frame callbacks."""
+        window = self.window
+        handle = window.windowHandle()
+        with patch.object(handle, "requestUpdate") as request:
+            self.wait_for(lambda: request.called)
+            window._schedule_overlay_fit(screen)
+            QApplication.processEvents()
+            QApplication.sendEvent(handle, QEvent(QEvent.UpdateRequest))
+            self.wait_for(lambda: request.call_count >= 2)
+            QApplication.sendEvent(handle, QEvent(QEvent.UpdateRequest))
+            self.wait_for(lambda: not window._placement_pending)
+
+    def screen(self, geometry):
+        return Mock(availableGeometry=Mock(return_value=geometry))
+
+    def assert_panel_fits(self):
+        window = self.window
+        panel = window.panel.geometry()
+        left, top, right, bottom = window._margins
+        self.assertGreaterEqual(panel.left(), left)
+        self.assertGreaterEqual(panel.top(), top)
+        self.assertLessEqual(panel.x() + panel.width() + right, window.width())
+        self.assertLessEqual(panel.y() + panel.height() + bottom, window.height())
+
+    def assert_panel_centred(self):
+        window = self.window
+        self.assertEqual(window.panel.x(), (window.width() - window.panel.width()) // 2)
+        self.assertEqual(window.panel.y(), (window.height() - window.panel.height()) // 2)
+        self.assert_panel_fits()
+
+    def test_centres_independently_of_global_window_position(self):
+        # Wayland may report (0, 0) even for an output at (-1080, -240).
+        # Assert that layout never needs that unreliable global mapping.
+        layouts = (
+            QRect(-1080, -240, 1080, 1920),
+            QRect(2560, -240, 1080, 1920),
+            QRect(0, -1920, 1080, 1920),
+            QRect(0, 30, 2560, 1410),
+        )
+        for geometry in layouts:
+            with self.subTest(geometry=geometry):
+                screen = self.screen(geometry)
+                with patch.object(self.window, "screen", return_value=screen), \
+                     patch.object(self.window, "mapFromGlobal", side_effect=AssertionError("global mapping")):
+                    self.window.fit_overlay()
+                    self.assertEqual(self.window.size(), geometry.size())
+                    self.assert_panel_centred()
+
+    def test_new_output_overrides_the_hidden_windows_old_screen(self):
+        primary = self.screen(QRect(0, 30, 2560, 1410))
+        portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+        window = self.window
+        with patch.object(window, "screen", return_value=primary):
+            window.fit_overlay()
+            window.set_panel_size(1800, 900)
+            # The signal's output takes precedence over the stale screen.
+            window.fit_overlay(portrait)
+        self.assertEqual(window.size(), QSize(1080, 1920))
+        self.assert_panel_centred()
+
+    def test_portrait_to_landscape_restores_requested_panel_size(self):
+        window = self.window
+        window._panel_size = QSize(1800, 1000)
+        window.fit_overlay(self.screen(QRect(-1080, -240, 1080, 1920)))
+        self.assert_panel_centred()
+        window.fit_overlay(self.screen(QRect(0, 30, 2560, 1410)))
+        self.assertEqual(window.panel.width(), 1800 - 48)
+        self.assert_panel_centred()
+
+    def test_drag_position_is_clamped_when_output_becomes_narrower(self):
+        window = self.window
+        window.fit_overlay(self.screen(QRect(0, 30, 2560, 1410)))
+        window.move_panel(QPoint(1700, 300))
+        window.fit_overlay(self.screen(QRect(-1080, -240, 1080, 1920)))
+        self.assertIsNotNone(window._panel_pos)
+        self.assert_panel_fits()
+
+    def test_refitting_repositions_even_without_a_resize_event(self):
+        window = self.window
+        screen = self.screen(QRect(-1080, -240, 1080, 1920))
+        window.fit_overlay(screen)
+        window.panel.move(0, 0)
+        window.fit_overlay(screen)
+        self.assert_panel_centred()
+
+    def test_show_refits_and_connects_screen_changes_only_once(self):
+        window = self.window
+        with patch.object(window, "fit_overlay", wraps=window.fit_overlay) as fit, \
+             patch.object(window, "_schedule_overlay_fit", wraps=window._schedule_overlay_fit) as scheduled:
+            window.show()
+            self.assertGreater(fit.call_count, 0)
+            window.hide()
+            window.show()
+            fit.reset_mock()
+            scheduled.reset_mock()
+            screen = QApplication.primaryScreen()
+            window.windowHandle().screenChanged.emit(screen)
+            scheduled.assert_called_once_with(screen)
+            QApplication.processEvents()
+            self.assertGreaterEqual(fit.call_count, 1)
+        window.hide()
+
+    def test_screen_change_refits_after_platform_restores_old_geometry(self):
+        window = self.window
+        window.show()
+        portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+        with patch.object(window, "screen", return_value=portrait):
+            window._schedule_overlay_fit(portrait)
+            # QtWayland finishes processing the output change after emitting
+            # the signal, and can overwrite a synchronous resize with the old
+            # landscape geometry. The queued fit must run after that step.
+            window.resize(2560, 1440)
+            self.assertEqual(window.size(), QSize(2560, 1440))
+            QApplication.processEvents()
+            self.assertEqual(window.size(), QSize(1080, 1920))
+            self.assert_panel_centred()
+        window.hide()
+
+    def test_non_wayland_output_change_keeps_the_open_content(self):
+        window = self.window
+        window.show_file("/nonexistent/keep-open.txt")
+        with patch.object(quickview.QGuiApplication, "platformName", return_value="xcb"), \
+             patch.object(window, "clear_content") as clear:
+            window._schedule_overlay_fit(QApplication.primaryScreen())
+            QApplication.processEvents()
+            clear.assert_not_called()
+            self.assertIsNone(window._pending_preview)
+            self.assertFalse(window._placement_pending)
+        window.hide()
+
+    def test_wayland_dismiss_recreates_native_window_but_keeps_warm_state(self):
+        window = self.window
+        window.show()
+        pool = window.pool
+        window._mem_cache["cached-preview"] = object()
+        window._overlay_fit_timer.start(0)
+        with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"):
+            window.dismiss()
+        self.assertIsNone(window.windowHandle())
+        self.assertIsNone(window._overlay_handle)
+        self.assertIsNone(window._overlay_screen)
+        self.assertFalse(window._overlay_fit_timer.isActive())
+        window.show()
+        self.assertIsNotNone(window.windowHandle())
+        self.assertIs(window._overlay_handle, window.windowHandle())
+        self.assertIs(window.pool, pool)
+        self.assertIn("cached-preview", window._mem_cache)
+        self.assert_panel_centred()
+        window.hide()
+
+    def test_wayland_remaps_with_the_final_native_size_after_output_assignment(self):
+        window = self.window
+        window.show()
+        portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+        with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"), \
+             patch.object(window, "hide", wraps=window.hide) as hide:
+            window._schedule_overlay_fit(portrait)
+            window.windowHandle().resize(2560, 1440)
+            QApplication.processEvents()
+            hide.assert_called_once_with()
+            self.assertTrue(window.isVisible())
+            self.assertEqual(window.size(), QSize(1080, 1920))
+            self.assertEqual(window.windowHandle().size(), QSize(1080, 1920))
+            self.assert_panel_centred()
+        window.hide()
+
+    def test_decode_box_uses_the_assigned_output_not_a_combined_monitor_box(self):
+        primary = self.screen(QRect(0, 0, 2560, 1440))
+        portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+        with patch.object(quickview.QGuiApplication, "screens", return_value=[primary, portrait]):
+            for assigned, previous, expected in (
+                (primary, portrait, (2128, 1128)),
+                (portrait, primary, (870, 1536)),
+                (primary, portrait, (2128, 1128)),
+            ):
+                self.window._overlay_screen = assigned
+                with patch.object(self.window, "screen", return_value=previous):
+                    self.assertEqual(self.window.image_fit_box(), expected)
+
+    def test_image_panel_shrinks_both_axes_to_match_the_image(self):
+        window = self.window
+        pix = QPixmap(1152, 1152)
+        pix.fill(QColor("red"))
+        for geometry in (QRect(-1080, -240, 1080, 1920), QRect(0, 0, 2560, 1440)):
+            with self.subTest(geometry=geometry):
+                with patch.object(window, "screen", return_value=self.screen(geometry)), \
+                     patch.object(window, "_prefetch_neighbors"):
+                    window.fit_overlay()
+                    window._display_image("/tmp/test.png", pix, "1200x1200")
+                    self.assertEqual(window.panel.width() - 24, window.panel.height() - 64)
+                    self.assertGreater(window.panel.width(), 800)
+                    self.assert_panel_centred()
+
+    def test_small_images_keep_the_original_minimum_panel_size(self):
+        window = self.window
+        pix = QPixmap(100, 100)
+        pix.fill(QColor("red"))
+        with patch.object(window, "_prefetch_neighbors"):
+            window.fit_overlay(self.screen(QRect(0, 0, 2560, 1440)))
+            window._display_image("/tmp/small.png", pix, "100x100")
+        self.assertEqual(window.panel.size(), QSize(480, 360))
+
+    def test_repeated_image_layout_is_independent_of_old_panel_request(self):
+        window = self.window
+        pix = QPixmap(1200, 1200)
+        pix.fill(QColor("red"))
+        with patch.object(window, "_prefetch_neighbors"):
+            window.fit_overlay(self.screen(QRect(-1080, -240, 1080, 1920)))
+            window._display_image("/tmp/square.png", pix, "1200x1200")
+        first = window.panel.geometry()
+        window.set_panel_size(500, 500)
+        self.assertEqual(window.panel.geometry(), first)
+
+    def test_wayland_first_panel_paint_waits_for_output_and_frame_acknowledgement(self):
+        from PySide6.QtTest import QTest
+
+        window = self.window
+        painted_sizes = []
+
+        class PaintObserver(QObject):
+            def eventFilter(self, watched, event):
+                if event.type() == QEvent.Paint:
+                    painted_sizes.append(window.size())
+                return False
+
+        observer = PaintObserver(window)
+        window.panel.installEventFilter(observer)
+        with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"):
+            window.show_file("/nonexistent/quickview-placement.txt")
+            handle = window.windowHandle()
+            # Hold the compositor acknowledgement beyond the former 50ms
+            # reveal delay, then assign the actual output before acknowledging.
+            with patch.object(handle, "requestUpdate") as request:
+                self.wait_for(lambda: request.called)
+                QTest.qWait(120)
+                self.assertTrue(window.panel.isHidden())
+                self.assertEqual(painted_sizes, [])
+                portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+                window._schedule_overlay_fit(portrait)
+                QApplication.processEvents()
+                QApplication.sendEvent(handle, QEvent(QEvent.UpdateRequest))
+                # The old frame must not release the new placement.
+                self.wait_for(lambda: request.call_count >= 2)
+                self.assertEqual(painted_sizes, [])
+                self.assertTrue(window.panel.isHidden())
+                QApplication.sendEvent(handle, QEvent(QEvent.UpdateRequest))
+                self.wait_for(lambda: window.panel.isVisible())
+                self.wait_for(lambda: bool(painted_sizes))
+                self.assertTrue(all(size == QSize(1080, 1920) for size in painted_sizes))
+                self.assert_panel_centred()
+            window.dismiss()
+
+    def test_dismiss_cancels_a_pending_reveal(self):
+        from PySide6.QtTest import QTest
+
+        window = self.window
+        with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"):
+            window.show_file("/nonexistent/quickview-placement.txt")
+            self.assertTrue(window._placement_pending)
+            window.dismiss()
+            QTest.qWait(100)
+            self.assertFalse(window.isVisible())
+            self.assertFalse(window._placement_pending)
+            self.assertFalse(window._placement_frame_timer.isActive())
+
+    def test_navigation_in_an_open_preview_does_not_hide_the_panel(self):
+        window = self.window
+        with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"):
+            window.show_file("/nonexistent/quickview-first.txt")
+            self.wait_for(lambda: window.panel.isVisible())
+            window.show_file("/nonexistent/quickview-next.txt")
+            self.assertTrue(window.panel.isVisible())
+            self.assertFalse(window._placement_pending)
+            self.assertFalse(window._placement_frame_timer.isActive())
+            window.dismiss()
+
+    def test_text_is_built_only_after_its_output_is_known(self):
+        window = self.window
+        primary = self.screen(QRect(0, 0, 2560, 1440))
+        portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "example.txt")
+            with open(path, "w") as source:
+                source.write("same text")
+            with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"), \
+                 patch.object(window, "screen", return_value=primary), \
+                 patch.object(window, "show_text", side_effect=lambda _path: window._show_text_widget("same text")) as renderer:
+                sizes = []
+                for _ in range(2):
+                    renderer.reset_mock()
+                    window.show_file(path)
+                    renderer.assert_not_called()
+                    self.confirm_output(portrait)
+                    renderer.assert_called_once_with(path)
+                    sizes.append(window.panel.size())
+                    window.dismiss()
+                self.assertEqual(sizes, [QSize(540, 1480), QSize(540, 1480)])
+
+    def test_pdf_render_width_uses_the_confirmed_output(self):
+        window = self.window
+        portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "example.pdf")
+            with open(path, "wb") as source:
+                source.write(b"%PDF-1.4\n")
+            with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"), \
+                 patch.object(quickview, "cache_read", return_value=None), \
+                 patch.object(window, "_fetch_outline"), \
+                 patch.object(window, "_pdf_render") as render:
+                window.show_file(path)
+                render.assert_not_called()
+                self.confirm_output(portrait)
+                self.assertEqual(render.call_args.args[2], 550)
+                window.dismiss()
+
+    def test_video_decoder_and_panel_use_the_confirmed_output(self):
+        window = self.window
+        portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+        bounds = []
+        mime = Mock()
+        mime.name.return_value = "video/mp4"
+
+        class Player(QObject):
+            def __init__(self, parent, path, max_w, max_h, handlers):
+                super().__init__(parent)
+                bounds.append((max_w, max_h))
+
+            def stop(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "example.mp4")
+            with open(path, "wb") as source:
+                source.write(b"video")
+            with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"), \
+                 patch.object(window.mime_db, "mimeTypeForFile", return_value=mime), \
+                 patch.object(quickview, "MediaSession", Player):
+                window.show_file(path)
+                self.assertEqual(bounds, [])
+                self.confirm_output(portrait)
+                self.assertEqual(bounds, [(648, 1248)])
+                self.assertEqual(window.panel.size(), QSize(648, 1288))
+                window.dismiss()
+
+    def test_only_latest_file_is_built_when_selection_changes_during_placement(self):
+        window = self.window
+        portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+        with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"), \
+             patch.object(window, "_build_preview", wraps=window._build_preview) as build:
+            window.show_file("/nonexistent/first.txt")
+            window.show_file("/nonexistent/latest.txt")
+            build.assert_not_called()
+            self.confirm_output(portrait)
+            build.assert_called_once_with("/nonexistent/latest.txt")
+            self.assertEqual(window.current_path, "/nonexistent/latest.txt")
+            window.dismiss()
+
+    def test_animation_keeps_frames_within_the_real_output_budget(self):
+        primary = self.screen(QRect(0, 0, 2560, 1440))
+        portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+        image = QImage(1600, 1600, QImage.Format.Format_RGB32)
+        image.fill(QColor("red"))
+
+        class Movie:
+            CacheMode = QMovie.CacheMode
+
+            def __init__(self, source):
+                pass
+
+            def isValid(self):
+                return True
+
+            def setCacheMode(self, mode):
+                pass
+
+            def frameCount(self):
+                return 40
+
+            def jumpToFrame(self, frame):
+                return True
+
+            def currentImage(self):
+                return image
+
+            def nextFrameDelay(self):
+                return 100
+
+            def jumpToNextFrame(self):
+                return True
+
+        with patch.object(quickview.QGuiApplication, "screens", return_value=[primary, portrait]), \
+             patch("PySide6.QtGui.QMovie", Movie), \
+             patch.object(renderers, "_encode", return_value=b"png"):
+            for assigned in (primary, portrait):
+                self.window._overlay_screen = assigned
+                width, height = self.window.image_fit_box()
+                frames = sum(1 for _ in renderers.render_anim(
+                    "generated", width, height, 512, 256 * 1024 * 1024
+                ))
+                self.assertEqual(frames, 40)
+
+
+class ImageFitsViewport(unittest.TestCase):
+    def setUp(self):
+        pix = QPixmap(200, 100)
+        pix.fill(QColor("red"))
+        painter = QPainter(pix)
+        painter.fillRect(100, 0, 100, 50, QColor("green"))
+        painter.fillRect(0, 50, 100, 50, QColor("blue"))
+        painter.fillRect(100, 50, 100, 50, QColor("yellow"))
+        painter.end()
+        self.label = quickview.ImageLabel()
+        self.label.setPixmap(pix)
+        self.addCleanup(self.label.deleteLater)
+
+    def assert_corners(self, points):
+        image = self.label.grab().toImage()
+        for point, colour in zip(points, ("red", "green", "blue", "yellow")):
+            self.assertEqual(image.pixelColor(*point), QColor(colour))
+
+    def test_narrow_portrait_view_keeps_all_four_image_corners(self):
+        self.label.resize(100, 200)
+        self.assert_corners(((20, 86), (80, 86), (20, 112), (80, 112)))
+
+    def test_reexpanding_uses_the_original_decoded_pixels(self):
+        self.label.resize(100, 200)
+        self.label.grab()
+        self.label.resize(200, 100)
+        self.assertEqual(self.label.pixmap().size(), QSize(200, 100))
+        self.assert_corners(((35, 20), (165, 20), (35, 80), (165, 80)))
+
+    def test_a_hidpi_image_keeps_its_logical_size(self):
+        pix = self.label.pixmap()
+        pix.setDevicePixelRatio(2)
+        self.label.setPixmap(pix)
+        self.label.resize(100, 100)
+        self.assert_corners(((20, 36), (80, 36), (20, 62), (80, 62)))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -336,6 +336,28 @@ PANEL_STYLE = Template("""
     """)
 
 
+class ImageLabel(QLabel):
+    """Fit decoded pixels to the actual viewport after output assignment."""
+
+    def __init__(self):
+        super().__init__()
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.setContentsMargins(12, 12, 12, 12)
+
+    def paintEvent(self, event):
+        pix = self.pixmap()
+        if pix is None or pix.isNull():
+            return
+        source_size = pix.deviceIndependentSize().toSize()
+        bounds = self.contentsRect().size().boundedTo(source_size)
+        size = source_size.scaled(bounds, Qt.KeepAspectRatio)
+        target = QRect(QPoint(), size)
+        target.moveCenter(self.contentsRect().center())
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.drawPixmap(target, pix)
+
+
 class SeekSlider(QSlider):
     """A slider that seeks to where you click, not one page nearer to it.
 
@@ -1349,6 +1371,22 @@ class QuickView(QWidget):
         self._margins = (24, 24, 24, 32)  # left, top, right, bottom
         self._panel_size = QSize(520 + 48, 320 + 56 + 40)
         self._panel_pos = None  # None = centred; a point once dragged
+        self._overlay_handle = None
+        self._overlay_screen = None
+        self._overlay_fit_timer = QTimer(self)
+        self._overlay_fit_timer.setSingleShot(True)
+        self._overlay_fit_timer.timeout.connect(self._fit_after_screen_change)
+        self._placement_pending = False
+        self._placement_generation = 0
+        self._placement_frame_generation = None
+        self._placement_finish_generation = None
+        self._pending_preview = None
+        self._placement_frame_timer = QTimer(self)
+        self._placement_frame_timer.setSingleShot(True)
+        self._placement_frame_timer.timeout.connect(self._request_placement_frame)
+        self._placement_finish_timer = QTimer(self)
+        self._placement_finish_timer.setSingleShot(True)
+        self._placement_finish_timer.timeout.connect(self._finish_placement)
 
         self.titlebar = TitleBar(self)
         self.content = QStackedLayout()
@@ -1498,6 +1536,21 @@ class QuickView(QWidget):
             log.debug("dismissed (%s)", reason)
         self.clear_content()
         self.hide()
+        self._placement_generation += 1
+        self._placement_frame_timer.stop()
+        self._placement_finish_timer.stop()
+        self._placement_frame_generation = None
+        self._placement_finish_generation = None
+        self._pending_preview = None
+        self._placement_pending = False
+        self.panel.show()
+        if QGuiApplication.platformName().startswith("wayland"):
+            # Clear native output state between previews, keeping workers
+            # and the decoded-image cache resident.
+            self.destroy()
+            self._overlay_handle = None
+            self._overlay_screen = None
+            self._overlay_fit_timer.stop()
         # The next preview starts centred again, whatever this one was
         # dragged to.
         self._panel_pos = None
@@ -1516,7 +1569,8 @@ class QuickView(QWidget):
     # ---------------------------------------------------------------- helpers
 
     def screen_avail(self) -> QSize:
-        screen = self.screen() or QGuiApplication.primaryScreen()
+        screen = (self._overlay_screen or self.screen()
+                  or QGuiApplication.primaryScreen())
         return screen.availableGeometry().size()
 
     def page_scale(self) -> float:
@@ -1556,17 +1610,149 @@ class QuickView(QWidget):
             avail.width(), avail.height(),
         )
 
-    def fit_overlay(self):
-        """Cover the work area. Only the size lands on Wayland; that is
-        enough, because the panel is centred against the screen below."""
-        screen = self.screen() or QGuiApplication.primaryScreen()
-        self.setGeometry(screen.availableGeometry())
+    def fit_overlay(self, screen=None):
+        """Size the overlay using local dimensions on Wayland."""
+        screen = (screen or self._overlay_screen or self.screen()
+                  or QGuiApplication.primaryScreen())
+        area = screen.availableGeometry()
+        if QGuiApplication.platformName().startswith("wayland"):
+            self.resize(area.size())
+            handle = self.windowHandle()
+            if handle is not None and handle.size() != area.size():
+                handle.resize(area.size())
+        else:
+            self.setGeometry(area)
+        self._place_panel()
+
+    def _schedule_overlay_fit(self, screen):
+        self._overlay_screen = screen
+        if (QGuiApplication.platformName().startswith("wayland")
+                and self.isVisible() and not self._placement_pending and self.current_path):
+            # An already open document also needs its renderer/layout to use
+            # the new output, rather than just resizing its outer overlay.
+            self._pending_preview = self.current_path
+            self.clear_content()
+        self._begin_overlay_placement()
+        self._overlay_fit_timer.start(0)
+
+    def _begin_overlay_placement(self):
+        if QGuiApplication.platformName().startswith("wayland"):
+            self._placement_pending = True
+            self._placement_generation += 1
+            self._placement_frame_timer.stop()
+            self._placement_finish_timer.stop()
+            self._placement_finish_generation = None
+            # Keep any outstanding update's generation until it arrives:
+            # QWindow coalesces requests, so an old acknowledgement must be
+            # consumed before requesting the new placement frame.
+            self.panel.hide()
+            self._apply_mask()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._placement_pending and self._placement_frame_generation is None:
+            # Queue after this transparent paint is flushed. On Wayland,
+            # requestUpdate is paced by that buffer's compositor callback.
+            if not self._placement_frame_timer.isActive():
+                self._placement_frame_timer.start(0)
+
+    def _request_placement_frame(self):
+        handle = self.windowHandle()
+        if (not self._placement_pending or not self.isVisible()
+                or handle is None or not handle.isExposed()
+                or self._overlay_fit_timer.isActive()
+                or self._placement_frame_generation is not None):
+            return
+        self._placement_frame_generation = self._placement_generation
+        handle.requestUpdate()
+
+    def _finish_placement(self):
+        generation = self._placement_finish_generation
+        self._placement_finish_generation = None
+        if (not self._placement_pending or not self.isVisible()
+                or generation != self._placement_generation):
+            return
+        handle = self.windowHandle()
+        if handle is None or not handle.isExposed() or self._overlay_fit_timer.isActive():
+            return
+        screen = self._overlay_screen or handle.screen()
+        area = screen.availableGeometry()
+        if handle.size() != area.size() or self.size() != area.size():
+            self.fit_overlay(screen)
+            self.update()  # Confirm the corrected geometry with a fresh frame.
+            return
+        self._overlay_screen = screen
+        path = self._pending_preview
+        if path is not None:
+            self._build_preview(path)
+            if (generation != self._placement_generation
+                    or self._pending_preview != path or not self.isVisible()):
+                if self._placement_pending and self.isVisible():
+                    self.update()
+                return
+            self._pending_preview = None
+        self._place_panel()
+        self._placement_frame_timer.stop()
+        self._placement_pending = False
+        self.panel.show()
+        self._apply_mask()
+
+    def eventFilter(self, watched, event):
+        if watched is self._overlay_handle:
+            if (event.type() == QEvent.Expose and self._placement_pending
+                    and watched.isExposed()):
+                self.update()  # Paint a transparent frame, not a timed guess.
+            elif event.type() == QEvent.UpdateRequest:
+                generation = self._placement_frame_generation
+                self._placement_frame_generation = None
+                if self._placement_pending and generation == self._placement_generation:
+                    # Deliver pending output/configure events before deciding
+                    # whether the acknowledged frame still matches placement.
+                    self._placement_finish_generation = generation
+                    self._placement_finish_timer.start(0)
+                elif self._placement_pending and generation is not None:
+                    self.update()  # An old frame cannot release a new preview.
+        return super().eventFilter(watched, event)
+
+    def _fit_after_screen_change(self):
+        # Qt reports the output after mapping. Remap with the final size
+        # already established, so the compositor centers that size rather
+        # than retaining the old output's initial placement.
+        remap = (self.isVisible()
+                 and QGuiApplication.platformName().startswith("wayland"))
+        if remap:
+            self.hide()
+        self.fit_overlay()
+        if remap:
+            self.show()
+            self.raise_()
+            self.activateWindow()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        handle = self.windowHandle()
+        if handle is not None and handle is not self._overlay_handle:
+            handle.screenChanged.connect(self._schedule_overlay_fit)
+            handle.installEventFilter(self)
+            self._overlay_handle = handle
+        self.fit_overlay()
 
     def _place_panel(self):
         """Lay the panel out inside the overlay: centred unless dragged."""
         left, top, right, bottom = self._margins
         pw = min(self._panel_size.width(), self.width()) - left - right
         ph = min(self._panel_size.height(), self.height()) - top - bottom
+        content = self.content.currentWidget()
+        pix = content.pixmap() if isinstance(content, ImageLabel) else None
+        if pix is not None and not pix.isNull():
+            # Keep the image panel's original padding and 40px titlebar,
+            # shrinking both image axes together on a narrower output.
+            bounds = QSize(max(int(self.width() * 0.85) - 24, 1),
+                           max(int(self.height() * 0.85) - 64, 1))
+            source_size = pix.deviceIndependentSize().toSize()
+            size = source_size.scaled(bounds.boundedTo(source_size), Qt.KeepAspectRatio)
+            pw = max(min(480, self.width() - left - right), size.width() + 24)
+            ph = max(min(360, self.height() - top - bottom), size.height() + 64)
         self.panel.resize(max(pw, 1), max(ph, 1))
         if self._panel_pos is None:
             self.center_panel()
@@ -1587,6 +1773,11 @@ class QuickView(QWidget):
         handle = self.windowHandle()
         if handle is None:
             return  # not created yet; _place_panel runs again after show()
+        if self._placement_pending:
+            # Keep the transparent placement window from intercepting clicks.
+            # An empty QRegion would instead reset the native input mask.
+            handle.setMask(QRegion(QRect(-1, -1, 1, 1)))
+            return
         left, top, right, bottom = self._margins
         # QWindow.setMask(), not QWidget.setMask(): the widget one clips
         # painting as well as input, so shrinking it left the previous,
@@ -1604,20 +1795,19 @@ class QuickView(QWidget):
         self.update()     # repaint the whole overlay, stale frame included
 
     def center_panel(self):
-        """Centre the panel on the screen itself and forget any drag.
+        """Centre within the overlay and forget any drag.
 
-        Centred in global coordinates, not in the overlay: a compositor
-        that puts the overlay somewhere other than the work-area origin
-        then still leaves the panel dead centre on screen.
+        The compositor places the work-area-sized overlay. Wayland can
+        report its global position as (0, 0), so mapping a screen's global
+        centre back into the window is unreliable on secondary outputs,
+        especially those to the left of or above the primary screen.
         """
         self._panel_pos = None
-        screen = self.screen() or QGuiApplication.primaryScreen()
-        geo = screen.availableGeometry()
         target = QPoint(
-            geo.x() + (geo.width() - self.panel.width()) // 2,
-            geo.y() + (geo.height() - self.panel.height()) // 2,
+            (self.width() - self.panel.width()) // 2,
+            (self.height() - self.panel.height()) // 2,
         )
-        self.panel.move(self._clamped(self.mapFromGlobal(target)))
+        self.panel.move(self._clamped(target))
 
     def move_panel(self, pos):
         """Move the panel within the overlay (a titlebar drag)."""
@@ -1756,6 +1946,26 @@ class QuickView(QWidget):
         self.show_file(self.selection[self.sel_index])
 
     def show_file(self, path: str):
+        if not ipc.is_remote_url(path):
+            path = os.path.abspath(path)
+        if (QGuiApplication.platformName().startswith("wayland")
+                and (not self.isVisible() or self._placement_pending)):
+            self.current_path = path  # A second invocation can still dismiss it.
+            self._pending_preview = path
+            self.clear_content()
+            self.set_title(os.path.basename(path) or path)
+            if not self._placement_pending:
+                self._begin_overlay_placement()
+        else:
+            self._build_preview(path)
+        self.fit_overlay()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _build_preview(self, path: str):
+        # On Wayland this runs only after the transparent frame confirms the
+        # assigned output. Every renderer and layout sees the same screen.
         remote = ipc.is_remote_url(path)
         if not remote:
             path = os.path.abspath(path)
@@ -1823,17 +2033,6 @@ class QuickView(QWidget):
             else:
                 self.show_fallback(path, mime)
 
-        # Transparent overlay the size of the work area, with the panel
-        # centred inside it: the one way to put a preview at a chosen spot
-        # under Wayland, which ignores move() outright. Deliberately *not*
-        # fullscreen — KWin lowers an inactive fullscreen window below the
-        # focused one, so a preview raised without an activation token
-        # (from the daemon, not a click) would vanish behind other windows.
-        self.fit_overlay()
-        self.show()
-        self.raise_()
-        self.activateWindow()
-
     def is_pdf(self, path: str) -> bool:
         """Does this file start with %PDF?
 
@@ -1858,6 +2057,8 @@ class QuickView(QWidget):
         self.set_panel_size(520, 320)
 
     def image_fit_box(self) -> tuple:
+        # Placement is confirmed before decoding, so use this output's
+        # bounds without combining dimensions from different monitors.
         avail = self.screen_avail()
         return int(avail.width() * 0.85) - 48, int(avail.height() * 0.85) - 96
 
@@ -1986,8 +2187,7 @@ class QuickView(QWidget):
 
     def _display_image(self, path: str, pix: QPixmap, dims: str):
         self.clear_content()
-        label = QLabel()
-        label.setAlignment(Qt.AlignCenter)
+        label = ImageLabel()
         label.setPixmap(pix)
         self.content.addWidget(label)
         self.set_panel_size(pix.width() + 24, pix.height() + 24)
@@ -2139,8 +2339,7 @@ class QuickView(QWidget):
 
     def _begin_anim(self, path: str, state: dict):
         """Show frame 0 and start the cycle; later frames join as they land."""
-        label = QLabel()
-        label.setAlignment(Qt.AlignCenter)
+        label = ImageLabel()
         pix, _delay = state["frames"][0]
         label.setPixmap(pix)
         self._clear_widgets()
