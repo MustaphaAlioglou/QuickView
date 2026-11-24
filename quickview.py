@@ -1349,6 +1349,7 @@ class QuickView(QWidget):
         self._margins = (24, 24, 24, 32)  # left, top, right, bottom
         self._panel_size = QSize(520 + 48, 320 + 56 + 40)
         self._panel_pos = None  # None = centred; a point once dragged
+        self._overlay_handle = None
 
         self.titlebar = TitleBar(self)
         self.content = QStackedLayout()
@@ -1556,11 +1557,23 @@ class QuickView(QWidget):
             avail.width(), avail.height(),
         )
 
-    def fit_overlay(self):
-        """Cover the work area. Only the size lands on Wayland; that is
-        enough, because the panel is centred against the screen below."""
-        screen = self.screen() or QGuiApplication.primaryScreen()
+    def fit_overlay(self, screen=None):
+        """Cover the current screen's work area, including after mapping.
+
+        Wayland chooses the output when the window is shown, which can be
+        different from the screen of the hidden resident window.
+        """
+        screen = screen or self.screen() or QGuiApplication.primaryScreen()
         self.setGeometry(screen.availableGeometry())
+        self._place_panel()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        handle = self.windowHandle()
+        if handle is not None and handle is not self._overlay_handle:
+            handle.screenChanged.connect(self.fit_overlay)
+            self._overlay_handle = handle
+        self.fit_overlay()
 
     def _place_panel(self):
         """Lay the panel out inside the overlay: centred unless dragged."""
@@ -1604,20 +1617,19 @@ class QuickView(QWidget):
         self.update()     # repaint the whole overlay, stale frame included
 
     def center_panel(self):
-        """Centre the panel on the screen itself and forget any drag.
+        """Centre within the overlay and forget any drag.
 
-        Centred in global coordinates, not in the overlay: a compositor
-        that puts the overlay somewhere other than the work-area origin
-        then still leaves the panel dead centre on screen.
+        The compositor places the work-area-sized overlay. Wayland can
+        report its global position as (0, 0), so mapping a screen's global
+        centre back into the window is unreliable on secondary outputs,
+        especially those to the left of or above the primary screen.
         """
         self._panel_pos = None
-        screen = self.screen() or QGuiApplication.primaryScreen()
-        geo = screen.availableGeometry()
         target = QPoint(
-            geo.x() + (geo.width() - self.panel.width()) // 2,
-            geo.y() + (geo.height() - self.panel.height()) // 2,
+            (self.width() - self.panel.width()) // 2,
+            (self.height() - self.panel.height()) // 2,
         )
-        self.panel.move(self._clamped(self.mapFromGlobal(target)))
+        self.panel.move(self._clamped(target))
 
     def move_panel(self, pos):
         """Move the panel within the overlay (a titlebar drag)."""
