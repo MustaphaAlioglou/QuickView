@@ -114,7 +114,24 @@ class WindowGeometry(unittest.TestCase):
             fit.reset_mock()
             screen = QApplication.primaryScreen()
             window.windowHandle().screenChanged.emit(screen)
-            fit.assert_called_once_with(screen)
+            QApplication.processEvents()
+            fit.assert_called_once_with()
+        window.hide()
+
+    def test_screen_change_refits_after_platform_restores_old_geometry(self):
+        window = self.window
+        window.show()
+        portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+        with patch.object(window, "screen", return_value=portrait):
+            window.windowHandle().screenChanged.emit(QApplication.primaryScreen())
+            # QtWayland finishes processing the output change after emitting
+            # the signal, and can overwrite a synchronous resize with the old
+            # landscape geometry. The queued fit must run after that step.
+            window.resize(2560, 1440)
+            self.assertEqual(window.size(), QSize(2560, 1440))
+            QApplication.processEvents()
+            self.assertEqual(window.size(), QSize(1080, 1920))
+            self.assert_panel_centred()
         window.hide()
 
 

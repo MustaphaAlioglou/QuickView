@@ -1350,6 +1350,9 @@ class QuickView(QWidget):
         self._panel_size = QSize(520 + 48, 320 + 56 + 40)
         self._panel_pos = None  # None = centred; a point once dragged
         self._overlay_handle = None
+        self._overlay_fit_timer = QTimer(self)
+        self._overlay_fit_timer.setSingleShot(True)
+        self._overlay_fit_timer.timeout.connect(self.fit_overlay)
 
         self.titlebar = TitleBar(self)
         self.content = QStackedLayout()
@@ -1567,11 +1570,18 @@ class QuickView(QWidget):
         self.setGeometry(screen.availableGeometry())
         self._place_panel()
 
+    def _schedule_overlay_fit(self, _screen):
+        # QtWayland emits screenChanged before finishing its own geometry
+        # update. Resizing synchronously in that signal can be overwritten
+        # by the old geometry when Qt resumes. Fit on the next event turn,
+        # once the platform has finished switching outputs.
+        self._overlay_fit_timer.start(0)
+
     def showEvent(self, event):
         super().showEvent(event)
         handle = self.windowHandle()
         if handle is not None and handle is not self._overlay_handle:
-            handle.screenChanged.connect(self.fit_overlay)
+            handle.screenChanged.connect(self._schedule_overlay_fit)
             self._overlay_handle = handle
         self.fit_overlay()
 
