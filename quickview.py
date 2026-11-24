@@ -336,6 +336,28 @@ PANEL_STYLE = Template("""
     """)
 
 
+class ImageLabel(QLabel):
+    """Fit decoded pixels to the actual viewport after output assignment."""
+
+    def __init__(self):
+        super().__init__()
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.setContentsMargins(12, 12, 12, 12)
+
+    def paintEvent(self, event):
+        pix = self.pixmap()
+        if pix is None or pix.isNull():
+            return
+        source_size = pix.deviceIndependentSize().toSize()
+        bounds = self.contentsRect().size().boundedTo(source_size)
+        size = source_size.scaled(bounds, Qt.KeepAspectRatio)
+        target = QRect(QPoint(), size)
+        target.moveCenter(self.contentsRect().center())
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.drawPixmap(target, pix)
+
+
 class SeekSlider(QSlider):
     """A slider that seeks to where you click, not one page nearer to it.
 
@@ -1350,9 +1372,10 @@ class QuickView(QWidget):
         self._panel_size = QSize(520 + 48, 320 + 56 + 40)
         self._panel_pos = None  # None = centred; a point once dragged
         self._overlay_handle = None
+        self._overlay_screen = None
         self._overlay_fit_timer = QTimer(self)
         self._overlay_fit_timer.setSingleShot(True)
-        self._overlay_fit_timer.timeout.connect(self.fit_overlay)
+        self._overlay_fit_timer.timeout.connect(self._fit_after_screen_change)
 
         self.titlebar = TitleBar(self)
         self.content = QStackedLayout()
@@ -1502,6 +1525,13 @@ class QuickView(QWidget):
             log.debug("dismissed (%s)", reason)
         self.clear_content()
         self.hide()
+        if QGuiApplication.platformName().startswith("wayland"):
+            # Clear native output state between previews, keeping workers
+            # and the decoded-image cache resident.
+            self.destroy()
+            self._overlay_handle = None
+            self._overlay_screen = None
+            self._overlay_fit_timer.stop()
         # The next preview starts centred again, whatever this one was
         # dragged to.
         self._panel_pos = None
@@ -1520,7 +1550,8 @@ class QuickView(QWidget):
     # ---------------------------------------------------------------- helpers
 
     def screen_avail(self) -> QSize:
-        screen = self.screen() or QGuiApplication.primaryScreen()
+        screen = (self._overlay_screen or self.screen()
+                  or QGuiApplication.primaryScreen())
         return screen.availableGeometry().size()
 
     def page_scale(self) -> float:
@@ -1561,21 +1592,36 @@ class QuickView(QWidget):
         )
 
     def fit_overlay(self, screen=None):
-        """Cover the current screen's work area, including after mapping.
-
-        Wayland chooses the output when the window is shown, which can be
-        different from the screen of the hidden resident window.
-        """
-        screen = screen or self.screen() or QGuiApplication.primaryScreen()
-        self.setGeometry(screen.availableGeometry())
+        """Size the overlay using local dimensions on Wayland."""
+        screen = (screen or self._overlay_screen or self.screen()
+                  or QGuiApplication.primaryScreen())
+        area = screen.availableGeometry()
+        if QGuiApplication.platformName().startswith("wayland"):
+            self.resize(area.size())
+            handle = self.windowHandle()
+            if handle is not None and handle.size() != area.size():
+                handle.resize(area.size())
+        else:
+            self.setGeometry(area)
         self._place_panel()
 
-    def _schedule_overlay_fit(self, _screen):
-        # QtWayland emits screenChanged before finishing its own geometry
-        # update. Resizing synchronously in that signal can be overwritten
-        # by the old geometry when Qt resumes. Fit on the next event turn,
-        # once the platform has finished switching outputs.
+    def _schedule_overlay_fit(self, screen):
+        self._overlay_screen = screen
         self._overlay_fit_timer.start(0)
+
+    def _fit_after_screen_change(self):
+        # Qt reports the output after mapping. Remap with the final size
+        # already established, so the compositor centers that size rather
+        # than retaining the old output's initial placement.
+        remap = (self.isVisible()
+                 and QGuiApplication.platformName().startswith("wayland"))
+        if remap:
+            self.hide()
+        self.fit_overlay()
+        if remap:
+            self.show()
+            self.raise_()
+            self.activateWindow()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1590,6 +1636,17 @@ class QuickView(QWidget):
         left, top, right, bottom = self._margins
         pw = min(self._panel_size.width(), self.width()) - left - right
         ph = min(self._panel_size.height(), self.height()) - top - bottom
+        content = self.content.currentWidget()
+        pix = content.pixmap() if isinstance(content, ImageLabel) else None
+        if pix is not None and not pix.isNull():
+            # Keep the image panel's original padding and 40px titlebar,
+            # shrinking both image axes together on a narrower output.
+            bounds = QSize(max(int(self.width() * 0.85) - 24, 1),
+                           max(int(self.height() * 0.85) - 64, 1))
+            source_size = pix.deviceIndependentSize().toSize()
+            size = source_size.scaled(bounds.boundedTo(source_size), Qt.KeepAspectRatio)
+            pw = max(min(480, self.width() - left - right), size.width() + 24)
+            ph = max(min(360, self.height() - top - bottom), size.height() + 64)
         self.panel.resize(max(pw, 1), max(ph, 1))
         if self._panel_pos is None:
             self.center_panel()
@@ -1880,8 +1937,13 @@ class QuickView(QWidget):
         self.set_panel_size(520, 320)
 
     def image_fit_box(self) -> tuple:
-        avail = self.screen_avail()
-        return int(avail.width() * 0.85) - 48, int(avail.height() * 0.85) - 96
+        # Decode once at a size suitable for every attached display. The
+        # visible image and its panel fit the assigned output after mapping,
+        # so the first preview after switching has the same size as repeats.
+        screens = QGuiApplication.screens()
+        width = max(screen.availableGeometry().width() for screen in screens)
+        height = max(screen.availableGeometry().height() for screen in screens)
+        return int(width * 0.85) - 48, int(height * 0.85) - 96
 
     def show_image(self, path: str):
         max_w, max_h = self.image_fit_box()
@@ -2008,8 +2070,7 @@ class QuickView(QWidget):
 
     def _display_image(self, path: str, pix: QPixmap, dims: str):
         self.clear_content()
-        label = QLabel()
-        label.setAlignment(Qt.AlignCenter)
+        label = ImageLabel()
         label.setPixmap(pix)
         self.content.addWidget(label)
         self.set_panel_size(pix.width() + 24, pix.height() + 24)
@@ -2161,8 +2222,7 @@ class QuickView(QWidget):
 
     def _begin_anim(self, path: str, state: dict):
         """Show frame 0 and start the cycle; later frames join as they land."""
-        label = QLabel()
-        label.setAlignment(Qt.AlignCenter)
+        label = ImageLabel()
         pix, _delay = state["frames"][0]
         label.setPixmap(pix)
         self._clear_widgets()
