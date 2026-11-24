@@ -11,19 +11,21 @@
 
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize  # noqa: E402
-from PySide6.QtGui import QColor, QPainter, QPixmap  # noqa: E402
+from PySide6.QtCore import QElapsedTimer, QEvent, QObject, QPoint, QRect, QSize  # noqa: E402
+from PySide6.QtGui import QColor, QImage, QMovie, QPainter, QPixmap  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 _app = QApplication.instance() or QApplication([sys.argv[0]])
 
 import quickview  # noqa: E402
+import renderers  # noqa: E402
 
 
 class WindowGeometry(unittest.TestCase):
@@ -31,6 +33,28 @@ class WindowGeometry(unittest.TestCase):
         with patch.dict(quickview.SETTINGS, panel_theme="quicklook"):
             self.window = quickview.QuickView()
         self.addCleanup(self.window.deleteLater)
+
+    def wait_for(self, predicate):
+        from PySide6.QtTest import QTest
+
+        elapsed = QElapsedTimer()
+        elapsed.start()
+        while not predicate() and elapsed.elapsed() < 1000:
+            QTest.qWait(5)
+        self.assertTrue(predicate())
+
+    def confirm_output(self, screen):
+        """Model a delayed output notification followed by frame callbacks."""
+        window = self.window
+        handle = window.windowHandle()
+        with patch.object(handle, "requestUpdate") as request:
+            self.wait_for(lambda: request.called)
+            window._schedule_overlay_fit(screen)
+            QApplication.processEvents()
+            QApplication.sendEvent(handle, QEvent(QEvent.UpdateRequest))
+            self.wait_for(lambda: request.call_count >= 2)
+            QApplication.sendEvent(handle, QEvent(QEvent.UpdateRequest))
+            self.wait_for(lambda: not window._placement_pending)
 
     def screen(self, geometry):
         return Mock(availableGeometry=Mock(return_value=geometry))
@@ -138,6 +162,18 @@ class WindowGeometry(unittest.TestCase):
             self.assert_panel_centred()
         window.hide()
 
+    def test_non_wayland_output_change_keeps_the_open_content(self):
+        window = self.window
+        window.show_file("/nonexistent/keep-open.txt")
+        with patch.object(quickview.QGuiApplication, "platformName", return_value="xcb"), \
+             patch.object(window, "clear_content") as clear:
+            window._schedule_overlay_fit(QApplication.primaryScreen())
+            QApplication.processEvents()
+            clear.assert_not_called()
+            self.assertIsNone(window._pending_preview)
+            self.assertFalse(window._placement_pending)
+        window.hide()
+
     def test_wayland_dismiss_recreates_native_window_but_keeps_warm_state(self):
         window = self.window
         window.show()
@@ -174,13 +210,18 @@ class WindowGeometry(unittest.TestCase):
             self.assert_panel_centred()
         window.hide()
 
-    def test_decode_box_does_not_depend_on_the_previously_used_output(self):
+    def test_decode_box_uses_the_assigned_output_not_a_combined_monitor_box(self):
         primary = self.screen(QRect(0, 0, 2560, 1440))
         portrait = self.screen(QRect(-1080, -240, 1080, 1920))
         with patch.object(quickview.QGuiApplication, "screens", return_value=[primary, portrait]):
-            for previous in (primary, portrait, primary):
+            for assigned, previous, expected in (
+                (primary, portrait, (2128, 1128)),
+                (portrait, primary, (870, 1536)),
+                (primary, portrait, (2128, 1128)),
+            ):
+                self.window._overlay_screen = assigned
                 with patch.object(self.window, "screen", return_value=previous):
-                    self.assertEqual(self.window.image_fit_box(), (2128, 1536))
+                    self.assertEqual(self.window.image_fit_box(), expected)
 
     def test_image_panel_shrinks_both_axes_to_match_the_image(self):
         window = self.window
@@ -216,7 +257,7 @@ class WindowGeometry(unittest.TestCase):
         window.set_panel_size(500, 500)
         self.assertEqual(window.panel.geometry(), first)
 
-    def test_wayland_first_panel_paint_waits_for_final_output_placement(self):
+    def test_wayland_first_panel_paint_waits_for_output_and_frame_acknowledgement(self):
         from PySide6.QtTest import QTest
 
         window = self.window
@@ -232,18 +273,27 @@ class WindowGeometry(unittest.TestCase):
         window.panel.installEventFilter(observer)
         with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"):
             window.show_file("/nonexistent/quickview-placement.txt")
-            QApplication.processEvents()
-            self.assertTrue(window.panel.isHidden())
-            self.assertEqual(painted_sizes, [])
-            portrait = self.screen(QRect(-1080, -240, 1080, 1920))
-            window._schedule_overlay_fit(portrait)
-            QApplication.processEvents()
-            self.assertEqual(painted_sizes, [])
-            QTest.qWait(100)
-            self.assertTrue(window.panel.isVisible())
-            self.assertTrue(painted_sizes)
-            self.assertTrue(all(size == QSize(1080, 1920) for size in painted_sizes))
-            self.assert_panel_centred()
+            handle = window.windowHandle()
+            # Hold the compositor acknowledgement beyond the former 50ms
+            # reveal delay, then assign the actual output before acknowledging.
+            with patch.object(handle, "requestUpdate") as request:
+                self.wait_for(lambda: request.called)
+                QTest.qWait(120)
+                self.assertTrue(window.panel.isHidden())
+                self.assertEqual(painted_sizes, [])
+                portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+                window._schedule_overlay_fit(portrait)
+                QApplication.processEvents()
+                QApplication.sendEvent(handle, QEvent(QEvent.UpdateRequest))
+                # The old frame must not release the new placement.
+                self.wait_for(lambda: request.call_count >= 2)
+                self.assertEqual(painted_sizes, [])
+                self.assertTrue(window.panel.isHidden())
+                QApplication.sendEvent(handle, QEvent(QEvent.UpdateRequest))
+                self.wait_for(lambda: window.panel.isVisible())
+                self.wait_for(lambda: bool(painted_sizes))
+                self.assertTrue(all(size == QSize(1080, 1920) for size in painted_sizes))
+                self.assert_panel_centred()
             window.dismiss()
 
     def test_dismiss_cancels_a_pending_reveal(self):
@@ -257,21 +307,144 @@ class WindowGeometry(unittest.TestCase):
             QTest.qWait(100)
             self.assertFalse(window.isVisible())
             self.assertFalse(window._placement_pending)
-            self.assertFalse(window._panel_reveal_timer.isActive())
+            self.assertFalse(window._placement_frame_timer.isActive())
 
     def test_navigation_in_an_open_preview_does_not_hide_the_panel(self):
-        from PySide6.QtTest import QTest
-
         window = self.window
         with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"):
             window.show_file("/nonexistent/quickview-first.txt")
-            QTest.qWait(100)
-            self.assertTrue(window.panel.isVisible())
+            self.wait_for(lambda: window.panel.isVisible())
             window.show_file("/nonexistent/quickview-next.txt")
             self.assertTrue(window.panel.isVisible())
             self.assertFalse(window._placement_pending)
-            self.assertFalse(window._panel_reveal_timer.isActive())
+            self.assertFalse(window._placement_frame_timer.isActive())
             window.dismiss()
+
+    def test_text_is_built_only_after_its_output_is_known(self):
+        window = self.window
+        primary = self.screen(QRect(0, 0, 2560, 1440))
+        portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "example.txt")
+            with open(path, "w") as source:
+                source.write("same text")
+            with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"), \
+                 patch.object(window, "screen", return_value=primary), \
+                 patch.object(window, "show_text", side_effect=lambda _path: window._show_text_widget("same text")) as renderer:
+                sizes = []
+                for _ in range(2):
+                    renderer.reset_mock()
+                    window.show_file(path)
+                    renderer.assert_not_called()
+                    self.confirm_output(portrait)
+                    renderer.assert_called_once_with(path)
+                    sizes.append(window.panel.size())
+                    window.dismiss()
+                self.assertEqual(sizes, [QSize(540, 1480), QSize(540, 1480)])
+
+    def test_pdf_render_width_uses_the_confirmed_output(self):
+        window = self.window
+        portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "example.pdf")
+            with open(path, "wb") as source:
+                source.write(b"%PDF-1.4\n")
+            with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"), \
+                 patch.object(quickview, "cache_read", return_value=None), \
+                 patch.object(window, "_fetch_outline"), \
+                 patch.object(window, "_pdf_render") as render:
+                window.show_file(path)
+                render.assert_not_called()
+                self.confirm_output(portrait)
+                self.assertEqual(render.call_args.args[2], 550)
+                window.dismiss()
+
+    def test_video_decoder_and_panel_use_the_confirmed_output(self):
+        window = self.window
+        portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+        bounds = []
+        mime = Mock()
+        mime.name.return_value = "video/mp4"
+
+        class Player(QObject):
+            def __init__(self, parent, path, max_w, max_h, handlers):
+                super().__init__(parent)
+                bounds.append((max_w, max_h))
+
+            def stop(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "example.mp4")
+            with open(path, "wb") as source:
+                source.write(b"video")
+            with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"), \
+                 patch.object(window.mime_db, "mimeTypeForFile", return_value=mime), \
+                 patch.object(quickview, "MediaSession", Player):
+                window.show_file(path)
+                self.assertEqual(bounds, [])
+                self.confirm_output(portrait)
+                self.assertEqual(bounds, [(648, 1248)])
+                self.assertEqual(window.panel.size(), QSize(648, 1288))
+                window.dismiss()
+
+    def test_only_latest_file_is_built_when_selection_changes_during_placement(self):
+        window = self.window
+        portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+        with patch.object(quickview.QGuiApplication, "platformName", return_value="wayland"), \
+             patch.object(window, "_build_preview", wraps=window._build_preview) as build:
+            window.show_file("/nonexistent/first.txt")
+            window.show_file("/nonexistent/latest.txt")
+            build.assert_not_called()
+            self.confirm_output(portrait)
+            build.assert_called_once_with("/nonexistent/latest.txt")
+            self.assertEqual(window.current_path, "/nonexistent/latest.txt")
+            window.dismiss()
+
+    def test_animation_keeps_frames_within_the_real_output_budget(self):
+        primary = self.screen(QRect(0, 0, 2560, 1440))
+        portrait = self.screen(QRect(-1080, -240, 1080, 1920))
+        image = QImage(1600, 1600, QImage.Format.Format_RGB32)
+        image.fill(QColor("red"))
+
+        class Movie:
+            CacheMode = QMovie.CacheMode
+
+            def __init__(self, source):
+                pass
+
+            def isValid(self):
+                return True
+
+            def setCacheMode(self, mode):
+                pass
+
+            def frameCount(self):
+                return 40
+
+            def jumpToFrame(self, frame):
+                return True
+
+            def currentImage(self):
+                return image
+
+            def nextFrameDelay(self):
+                return 100
+
+            def jumpToNextFrame(self):
+                return True
+
+        with patch.object(quickview.QGuiApplication, "screens", return_value=[primary, portrait]), \
+             patch("PySide6.QtGui.QMovie", Movie), \
+             patch.object(renderers, "_encode", return_value=b"png"):
+            for assigned in (primary, portrait):
+                self.window._overlay_screen = assigned
+                width, height = self.window.image_fit_box()
+                frames = sum(1 for _ in renderers.render_anim(
+                    "generated", width, height, 512, 256 * 1024 * 1024
+                ))
+                self.assertEqual(frames, 40)
+
 
 class ImageFitsViewport(unittest.TestCase):
     def setUp(self):
